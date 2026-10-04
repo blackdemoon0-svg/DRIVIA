@@ -1,4 +1,4 @@
-import DRIVIA_SYSTEM_PROMPT from "../server/driviaSystemPrompt";
+import DRIVIA_SYSTEM_PROMPT from "../server/driviaSystemPrompt.js";
 
 type ConversationMessage = {
   role: "user" | "assistant";
