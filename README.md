@@ -35,6 +35,19 @@ DRIVIA_DEPLOYMENT_URL=https://your-preview.vercel.app node scripts/verify-vercel
 
 The check expects `/api/chat` to return its method-specific `405` JSON response to a GET request. A static page/HTML fallback or a missing function will fail this check. This repository cannot set Vercel dashboard settings, create the remote Vercel project, add secrets, or confirm a remote deployment by itself.
 
+## Vercel Web Analytics
+
+The app mounts Vercel's official `@vercel/analytics` React component from `src/main.tsx`. Once Web Analytics is enabled for the Vercel project and this code is deployed, Vercel can collect site visits and page views and show traffic breakdowns in the project dashboard. No API key, frontend secret, or extra environment variable is needed. The integration does not change the AI chat or DRIVIA Battle UI/behavior.
+
+To activate and verify it for Production:
+
+1. In the Vercel dashboard, open the DRIVIA project, select **Analytics**, and click **Enable** for Web Analytics.
+2. After the code is approved for release, deploy it to Production using the project's usual deployment flow. Vercel provisions the Analytics routes on a subsequent deployment; this repository change alone does not affect the already-live deployment.
+3. Open the Production site and use browser DevTools → **Network**. Filter for `insights` or `view`; the Analytics script should load and a page-view request should complete successfully. Ad blockers may block these requests.
+4. In the project's **Analytics** dashboard, review visitors, page views, referrers, and available browser/device/location breakdowns. Allow for real visitor traffic to arrive before expecting useful reports.
+
+DRIVIA currently uses one URL for its AI and Battle views, so basic page-view reporting treats the app as one page; switching between those in-app views does not create a separate URL page view.
+
 ## Live AI smoke test
 
 With the API route running and a real server-side provider key configured, run:
