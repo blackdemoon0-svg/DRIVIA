@@ -31,6 +31,7 @@ type ProviderMessage = {
 type ApiRequest = {
   method?: string;
   body?: unknown;
+  headers?: Record<string, string | string[] | undefined>;
 };
 
 type ApiResponse = {
@@ -76,6 +77,155 @@ export const config = {
   },
 };
 
+const REQUEST_RATE_LIMITS = [
+  { windowMs: 60_000, maxRequests: 10 },
+  { windowMs: 60 * 60_000, maxRequests: 60 },
+] as const;
+const RATE_LIMIT_RETENTION_MS = 60 * 60_000;
+const RATE_LIMIT_BUCKET_CLEANUP_INTERVAL_MS = 60_000;
+const MAX_RATE_LIMIT_CLIENTS = 5_000;
+const MAX_CONCURRENT_REQUESTS_PER_CLIENT = 2;
+const MAX_CONCURRENT_REQUESTS_PER_INSTANCE = 12;
+const BUSY_RETRY_AFTER_SECONDS = 5;
+
+type RequestBucket = {
+  requestTimestamps: number[];
+  activeRequests: number;
+};
+
+type RequestAdmissionError = {
+  status: 429 | 503;
+  message: string;
+  retryAfterSeconds: number;
+};
+
+type RequestAdmission =
+  | { error: RequestAdmissionError }
+  | { release: () => void };
+
+// Process-local best-effort limits: they reset on cold starts and are not a global quota.
+const requestBuckets = new Map<string, RequestBucket>();
+let activeRequestCount = 0;
+let lastBucketCleanupAt = 0;
+
+function getClientIdentifier(request: ApiRequest) {
+  const forwardedFor = request.headers?.["x-forwarded-for"];
+  const rawForwardedFor = Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor;
+  const forwardedClient = rawForwardedFor?.split(",")[0]?.trim();
+  if (forwardedClient && forwardedClient.length <= 64) return forwardedClient;
+
+  const realIp = request.headers?.["x-real-ip"];
+  const rawRealIp = Array.isArray(realIp) ? realIp[0] : realIp;
+  const realClient = rawRealIp?.trim();
+  return realClient && realClient.length <= 64 ? realClient : "unknown";
+}
+
+function cleanRequestBuckets(now: number) {
+  for (const [clientId, bucket] of requestBuckets) {
+    bucket.requestTimestamps = bucket.requestTimestamps.filter(
+      (timestamp) => now - timestamp < RATE_LIMIT_RETENTION_MS,
+    );
+    if (bucket.requestTimestamps.length === 0 && bucket.activeRequests === 0) {
+      requestBuckets.delete(clientId);
+    }
+  }
+  lastBucketCleanupAt = now;
+}
+
+function admitChatRequest(request: ApiRequest, now = Date.now()): RequestAdmission {
+  if (now - lastBucketCleanupAt >= RATE_LIMIT_BUCKET_CLEANUP_INTERVAL_MS) {
+    cleanRequestBuckets(now);
+  }
+
+  const clientId = getClientIdentifier(request);
+  let bucket = requestBuckets.get(clientId);
+  if (!bucket && requestBuckets.size >= MAX_RATE_LIMIT_CLIENTS) {
+    cleanRequestBuckets(now);
+  }
+  if (!bucket) {
+    while (requestBuckets.size >= MAX_RATE_LIMIT_CLIENTS) {
+      let oldestIdleClient: string | undefined;
+      for (const [existingClientId, entry] of requestBuckets) {
+        if (entry.activeRequests === 0) {
+          oldestIdleClient = existingClientId;
+          break;
+        }
+      }
+      if (!oldestIdleClient) {
+        return {
+          error: {
+            status: 503,
+            message: "DRIVIA is handling many requests right now. Please retry shortly.",
+            retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
+          },
+        };
+      }
+      requestBuckets.delete(oldestIdleClient);
+    }
+    bucket = { requestTimestamps: [], activeRequests: 0 };
+    requestBuckets.set(clientId, bucket);
+  } else {
+    requestBuckets.delete(clientId);
+    requestBuckets.set(clientId, bucket);
+  }
+
+  bucket.requestTimestamps = bucket.requestTimestamps.filter(
+    (timestamp) => now - timestamp < RATE_LIMIT_RETENTION_MS,
+  );
+  for (const limit of REQUEST_RATE_LIMITS) {
+    const recentRequests = bucket.requestTimestamps.filter(
+      (timestamp) => now - timestamp < limit.windowMs,
+    );
+    if (recentRequests.length >= limit.maxRequests) {
+      const requestToExpire = recentRequests[recentRequests.length - limit.maxRequests];
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil((requestToExpire + limit.windowMs - now) / 1_000),
+      );
+      return {
+        error: {
+          status: 429,
+          message: "Too many chat requests. Please wait before trying again.",
+          retryAfterSeconds,
+        },
+      };
+    }
+  }
+
+  if (bucket.activeRequests >= MAX_CONCURRENT_REQUESTS_PER_CLIENT) {
+    return {
+      error: {
+        status: 429,
+        message: "Too many simultaneous requests from this client. Please wait for one to finish.",
+        retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
+      },
+    };
+  }
+  if (activeRequestCount >= MAX_CONCURRENT_REQUESTS_PER_INSTANCE) {
+    return {
+      error: {
+        status: 503,
+        message: "DRIVIA is handling many requests right now. Please retry shortly.",
+        retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
+      },
+    };
+  }
+
+  bucket.requestTimestamps.push(now);
+  bucket.activeRequests += 1;
+  activeRequestCount += 1;
+  let released = false;
+
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      bucket!.activeRequests = Math.max(0, bucket!.activeRequests - 1);
+      activeRequestCount = Math.max(0, activeRequestCount - 1);
+    },
+  };
+}
+
 function isConversationMessage(value: unknown): value is ConversationMessage {
   if (typeof value !== "object" || value === null) return false;
   const message = value as Record<string, unknown>;
@@ -115,14 +265,23 @@ function getConversation(body: unknown): ConversationMessage[] {
   return history;
 }
 
-function getAttachments(body: unknown): { attachments: DocumentAttachment[]; error?: string } {
+function getAttachments(
+  body: unknown,
+): { attachments: DocumentAttachment[]; error?: string; status?: 400 | 413 } {
   if (typeof body !== "object" || body === null || !("attachments" in body)) {
     return { attachments: [] };
   }
 
   const rawAttachments = (body as { attachments?: unknown }).attachments;
-  if (!Array.isArray(rawAttachments) || rawAttachments.length === 0 || rawAttachments.length > MAX_ATTACHMENTS) {
-    return { attachments: [], error: "The attached document is invalid or contains too many pages." };
+  if (!Array.isArray(rawAttachments) || rawAttachments.length === 0) {
+    return { attachments: [], error: "The attached document is invalid.", status: 400 };
+  }
+  if (rawAttachments.length > MAX_ATTACHMENTS) {
+    return {
+      attachments: [],
+      error: `The attached document exceeds the limit of ${MAX_ATTACHMENTS} items.`,
+      status: 413,
+    };
   }
 
   const attachments: DocumentAttachment[] = [];
@@ -130,7 +289,7 @@ function getAttachments(body: unknown): { attachments: DocumentAttachment[]; err
 
   for (const value of rawAttachments) {
     if (typeof value !== "object" || value === null) {
-      return { attachments: [], error: "The attached document is invalid." };
+      return { attachments: [], error: "The attached document is invalid.", status: 400 };
     }
 
     const attachment = value as Record<string, unknown>;
@@ -141,10 +300,16 @@ function getAttachments(body: unknown): { attachments: DocumentAttachment[]; err
         !name ||
         attachment.mimeType !== "application/pdf" ||
         typeof attachment.text !== "string" ||
-        attachment.text.trim().length === 0 ||
-        attachment.text.length > MAX_ATTACHMENT_TEXT_CHARACTERS
+        attachment.text.trim().length === 0
       ) {
-        return { attachments: [], error: "The attached PDF text is invalid or too large." };
+        return { attachments: [], error: "The attached PDF text is invalid.", status: 400 };
+      }
+      if (attachment.text.length > MAX_ATTACHMENT_TEXT_CHARACTERS) {
+        return {
+          attachments: [],
+          error: `The extracted PDF text exceeds the ${MAX_ATTACHMENT_TEXT_CHARACTERS.toLocaleString()} character limit.`,
+          status: 413,
+        };
       }
 
       totalCharacters += attachment.text.length;
@@ -162,12 +327,22 @@ function getAttachments(body: unknown): { attachments: DocumentAttachment[]; err
         !name ||
         typeof attachment.mimeType !== "string" ||
         !SUPPORTED_IMAGE_TYPES.has(attachment.mimeType) ||
-        typeof attachment.dataUrl !== "string" ||
-        attachment.dataUrl.length > MAX_IMAGE_DATA_URL_CHARACTERS ||
+        typeof attachment.dataUrl !== "string"
+      ) {
+        return { attachments: [], error: "The attached image is invalid.", status: 400 };
+      }
+      if (attachment.dataUrl.length > MAX_IMAGE_DATA_URL_CHARACTERS) {
+        return {
+          attachments: [],
+          error: "The attached image exceeds the size limit. Choose a smaller photo or PDF.",
+          status: 413,
+        };
+      }
+      if (
         !attachment.dataUrl.startsWith(`data:${attachment.mimeType};base64,`) ||
         !/^[A-Za-z0-9+/]+={0,2}$/.test(attachment.dataUrl.slice(attachment.dataUrl.indexOf(",") + 1))
       ) {
-        return { attachments: [], error: "The attached image is invalid or too large." };
+        return { attachments: [], error: "The attached image is invalid.", status: 400 };
       }
 
       totalCharacters += attachment.dataUrl.length;
@@ -180,11 +355,15 @@ function getAttachments(body: unknown): { attachments: DocumentAttachment[]; err
       continue;
     }
 
-    return { attachments: [], error: "The attached document format is not supported." };
+    return { attachments: [], error: "The attached document format is not supported.", status: 400 };
   }
 
   if (totalCharacters > MAX_ATTACHMENT_CHARACTERS) {
-    return { attachments: [], error: "The attached document is too large to analyze." };
+    return {
+      attachments: [],
+      error: "The attached document exceeds the combined size limit. Reduce the image or number of pages and try again.",
+      status: 413,
+    };
   }
 
   return { attachments };
@@ -275,6 +454,20 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     return response.status(405).json({ error: "Only POST requests are supported." });
   }
 
+  const admission = admitChatRequest(request);
+  if ("error" in admission) {
+    response.setHeader("Retry-After", String(admission.error.retryAfterSeconds));
+    return response.status(admission.error.status).json({ error: admission.error.message });
+  }
+
+  try {
+    return await handleChatPost(request, response);
+  } finally {
+    admission.release();
+  }
+}
+
+async function handleChatPost(request: ApiRequest, response: ApiResponse) {
   let requestBody: unknown;
   try {
     requestBody = request.body;
@@ -288,8 +481,10 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     return response.status(400).json({ error: "A user message is required." });
   }
 
-  const { attachments, error: attachmentError } = getAttachments(requestBody);
-  if (attachmentError) return response.status(400).json({ error: attachmentError });
+  const { attachments, error: attachmentError, status: attachmentStatus } = getAttachments(requestBody);
+  if (attachmentError) {
+    return response.status(attachmentStatus ?? 400).json({ error: attachmentError });
+  }
 
   const rawTask =
     typeof requestBody === "object" && requestBody !== null && "task" in requestBody

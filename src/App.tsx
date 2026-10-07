@@ -777,10 +777,16 @@ export default function App() {
       });
 
       if (isQuoteAnalysis) {
-        if (error instanceof DriviaApiError && error.status === 429) {
-          setChatError("Le service d'analyse est momentanément limité. Réessayez dans un instant.");
+        if (error instanceof DriviaApiError && error.status === 413) {
+          setChatError("La pièce jointe dépasse une limite d'envoi. Réduisez la taille de la photo ou le nombre de pages du PDF, puis réessayez.");
+        } else if (error instanceof DriviaApiError && error.status === 429) {
+          setChatError("Trop de demandes ont été envoyées. Attendez quelques minutes avant de réessayer.");
         } else if (error instanceof DriviaApiError && error.status === 503) {
-          setChatError("L'analyse IA de DRIVIA n'est pas configurée sur le serveur. Le document n'a pas pu être analysé.");
+          setChatError(
+            error.message.toLowerCase().includes("not configured")
+              ? "L'analyse IA de DRIVIA n'est pas configurée sur le serveur. Le document n'a pas pu être analysé."
+              : "Le service d'analyse est momentanément très sollicité. Réessayez dans quelques secondes.",
+          );
         } else if (error instanceof DriviaApiError && error.status === 404) {
           setChatError("Le service /api/chat est indisponible. Déployez la fonction serveur DRIVIA pour analyser le document.");
         } else if (error instanceof DriviaApiError && error.status === 0) {
@@ -789,9 +795,13 @@ export default function App() {
           setChatError("DRIVIA n'a pas pu analyser ce document. Vérifiez le fichier ou réessayez plus tard.");
         }
       } else if (error instanceof DriviaApiError && error.status === 429) {
-        setChatError("DRIVIA is at the AI provider's request limit. Wait a moment and try again.");
+        setChatError("DRIVIA is receiving too many requests right now. Please wait before trying again.");
       } else if (error instanceof DriviaApiError && error.status === 503) {
-        setChatError("DRIVIA AI is not configured. Set DRIVIA_AI_API_KEY as a server environment variable and deploy api/chat.ts to connect a real model.");
+        setChatError(
+          error.message.toLowerCase().includes("not configured")
+            ? "DRIVIA AI is not configured. Set DRIVIA_AI_API_KEY as a server environment variable and deploy api/chat.ts to connect a real model."
+            : "DRIVIA's chat service is handling many requests right now. Please try again shortly.",
+        );
       } else if (error instanceof DriviaApiError && error.status === 404) {
         setChatError("DRIVIA's /api/chat function is unavailable. Deploy the repository root to Vercel with vercel.json and set DRIVIA_AI_API_KEY in the server environment. Static-only previews cannot run the AI endpoint.");
       } else if (error instanceof DriviaApiError && error.status === 0) {
