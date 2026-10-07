@@ -3,6 +3,26 @@ export type DriviaMessage = {
   content: string;
 };
 
+export type DriviaAttachment =
+  | {
+      type: "image";
+      name: string;
+      mimeType: "image/jpeg" | "image/png" | "image/webp";
+      dataUrl: string;
+    }
+  | {
+      type: "text";
+      name: string;
+      mimeType: "application/pdf";
+      text: string;
+    };
+
+type StreamOptions = {
+  signal?: AbortSignal;
+  attachments?: DriviaAttachment[];
+  task?: "garage-quote";
+};
+
 type StreamPayload = {
   delta?: unknown;
   error?: unknown;
@@ -64,8 +84,9 @@ function parseSseEvent(frame: string, onDelta: (delta: string) => void): boolean
 export async function streamDriviaResponse(
   messages: DriviaMessage[],
   onDelta: (delta: string) => void,
-  signal?: AbortSignal,
+  options: StreamOptions = {},
 ): Promise<void> {
+  const { signal, attachments } = options;
   const history = messages
     .slice(-24)
     .map((message) => ({ ...message, content: message.content.trim().slice(0, 4_000) }))
@@ -81,7 +102,11 @@ export async function streamDriviaResponse(
     response = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ messages: history }),
+      body: JSON.stringify({
+        messages: history,
+        ...(attachments?.length ? { attachments } : {}),
+        ...(options.task ? { task: options.task } : {}),
+      }),
       signal,
     });
   } catch {

@@ -3,20 +3,51 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type DragEvent,
   type FormEvent,
   type KeyboardEvent,
   type RefObject,
 } from "react";
-import { DriviaApiError, streamDriviaResponse, type DriviaMessage } from "./lib/driviaApi";
+import {
+  DriviaApiError,
+  streamDriviaResponse,
+  type DriviaAttachment,
+  type DriviaMessage,
+} from "./lib/driviaApi";
+import { prepareQuoteDocument } from "./lib/quoteDocument";
 
 type View = "ai" | "battle";
 
 const QUICK_PROMPTS = [
-  { label: "Compare two cars", prompt: "Compare the BMW M3 and Mercedes-AMG C 63." },
-  { label: "Find my next car", prompt: "Help me find the right car for my needs. Ask me one question at a time." },
-  { label: "Explain a technology", prompt: "Explain how a turbocharger works, in simple terms." },
-  { label: "Help me buy a car", prompt: "What should I check before buying a used car?" },
+  { label: "Comparer deux voitures", prompt: "Compare la BMW M3 et la Mercedes-AMG C 63." },
+  { label: "Trouver ma prochaine voiture", prompt: "Aide-moi à trouver la voiture adaptée à mes besoins. Pose-moi une question à la fois." },
+  { label: "Comprendre une technologie", prompt: "Explique-moi simplement le fonctionnement d'un turbocompresseur." },
+  { label: "Préparer un achat", prompt: "Que dois-je vérifier avant d'acheter une voiture d'occasion ?" },
 ];
+
+const HOME_ACTIONS = [
+  {
+    number: "01",
+    title: "Analyser mon devis",
+    description: "Vérifie mon devis de garage",
+    prompt: "Je souhaite faire vérifier un devis de garage. Voici les réparations, les pièces et les tarifs indiqués :",
+    icon: "quote",
+  },
+  {
+    number: "02",
+    title: "Scanner un voyant ou un bruit",
+    description: "Analyse une photo d'un voyant ou un court audio",
+    prompt: "J'aimerais comprendre un voyant ou un bruit sur ma voiture. Voici le modèle du véhicule et les détails observés :",
+    icon: "alert",
+  },
+  {
+    number: "03",
+    title: "Analyser une voiture d'occasion",
+    description: "Vérifie une voiture avant achat",
+    prompt: "Je souhaite vérifier une voiture d'occasion avant achat. Voici les informations de l'annonce (marque, modèle, année, kilométrage et prix) :",
+    icon: "car",
+  },
+] as const;
 
 type Vehicle = {
   id: string;
@@ -159,6 +190,36 @@ function ArrowIcon({ diagonal = false }: { diagonal?: boolean }) {
   );
 }
 
+function HomeActionIcon({ icon }: { icon: (typeof HOME_ACTIONS)[number]["icon"] }) {
+  if (icon === "quote") {
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none">
+        <path d="M7 3.75h7.7L18 7.1v8.15" />
+        <path d="M14.5 3.9v3.65h3.2M7 3.75v16.5h5.1" />
+        <path d="M9.8 10h5.1M9.8 13h3.2" />
+        <path d="m15.1 17.2 3.95-3.95 2.15 2.15-3.95 3.95-2.75.65.6-2.8Z" />
+      </svg>
+    );
+  }
+
+  if (icon === "alert") {
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none">
+        <path d="m12 3.7 9 15.6H3l9-15.6Z" />
+        <path d="M12 9v4.6M12 17.1h.01" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" fill="none">
+      <path d="m4.1 14.9 1.6-5.25a2 2 0 0 1 1.9-1.4h8.8a2 2 0 0 1 1.9 1.4l1.6 5.25" />
+      <path d="M3.5 14.8h17v4.1a1.5 1.5 0 0 1-1.5 1.5h-14a1.5 1.5 0 0 1-1.5-1.5v-4.1Z" />
+      <path d="M6.7 16.9h.01M17.3 16.9h.01M6.5 8.3l1.1-3h8.8l1.1 3" />
+    </svg>
+  );
+}
+
 function Composer({
   variant,
   value,
@@ -171,24 +232,24 @@ function Composer({
   return (
     <form className={`composer composer-${variant}`} onSubmit={onSubmit}>
       <label className="sr-only" htmlFor={`drivia-prompt-${variant}`}>
-        Ask DRIVIA anything about cars
+        {variant === "hero" ? "Posez votre question à DRIVIA" : "Ask DRIVIA anything about cars"}
       </label>
       <textarea
         id={`drivia-prompt-${variant}`}
         ref={textareaRef}
         rows={1}
         maxLength={2000}
-        placeholder="Ask DRIVIA anything about cars..."
+        placeholder={variant === "hero" ? "Posez votre question à DRIVIA..." : "Ask DRIVIA anything about cars..."}
         value={value}
         onChange={onChange}
         onKeyDown={onKeyDown}
-        aria-label="Ask DRIVIA anything about cars"
+        aria-label={variant === "hero" ? "Posez votre question à DRIVIA" : "Ask DRIVIA anything about cars"}
       />
       <div className="composer-controls">
         <span className="composer-hint">
           {variant === "hero" ? (
             <>
-              Press <kbd>Enter</kbd> to send <span className="hint-divider">·</span> Shift + Enter for a new line
+              Appuyez sur <kbd>Entrée</kbd> pour envoyer <span className="hint-divider">·</span> Maj + Entrée pour un retour à la ligne
             </>
           ) : (
             "DRIVIA can make mistakes. Verify important details."
@@ -198,7 +259,7 @@ function Composer({
           type="submit"
           className="send-button"
           disabled={!value.trim() || isLoading}
-          aria-label="Send message"
+          aria-label={variant === "hero" ? "Envoyer le message" : "Send message"}
         >
           <ArrowIcon />
         </button>
@@ -466,6 +527,180 @@ function AboutDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
+function formatFileSize(bytes: number) {
+  return bytes < 1024 * 1024
+    ? `${Math.max(1, Math.round(bytes / 1024))} Ko`
+    : `${(bytes / (1024 * 1024)).toFixed(1)} Mo`;
+}
+
+function QuoteUploadDialog({
+  onClose,
+  onAnalyze,
+}: {
+  onClose: () => void;
+  onAnalyze: (file: File, attachments: DriviaAttachment[]) => void;
+}) {
+  const [file, setFile] = useState<File | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [isPreparing, setIsPreparing] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape" && !isPreparing) onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [isPreparing, onClose]);
+
+  const selectFile = (candidate: File | undefined) => {
+    if (!candidate || isPreparing) return;
+    const isPdf = candidate.type === "application/pdf" || candidate.name.toLowerCase().endsWith(".pdf");
+    const isImage =
+      ["image/jpeg", "image/png", "image/webp", "image/avif", "image/heic", "image/heif"].includes(candidate.type.toLowerCase()) ||
+      /\.(jpe?g|png|webp|avif|heic|heif)$/i.test(candidate.name);
+
+    if (candidate.size === 0) {
+      setFile(null);
+      setFileError("Le fichier sélectionné est vide.");
+    } else if (candidate.size > 12 * 1024 * 1024) {
+      setFile(null);
+      setFileError("Le fichier dépasse la limite de 12 Mo.");
+    } else if (!isPdf && !isImage) {
+      setFile(null);
+      setFileError("Format non pris en charge. Importez une photo JPG, PNG, WebP, HEIC ou AVIF, ou un PDF.");
+    } else {
+      setFile(candidate);
+      setFileError(null);
+    }
+  };
+
+  const clearFile = () => {
+    setFile(null);
+    setFileError(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleAnalyze = async () => {
+    if (!file || isPreparing) return;
+    setIsPreparing(true);
+    setFileError(null);
+
+    try {
+      const attachments = await prepareQuoteDocument(file);
+      setIsPreparing(false);
+      onAnalyze(file, attachments);
+    } catch (error) {
+      setFileError(error instanceof Error ? error.message : "Impossible de préparer ce document.");
+      setIsPreparing(false);
+    }
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setIsDragging(false);
+    selectFile(event.dataTransfer.files[0]);
+  };
+
+  return (
+    <div className="dialog-backdrop" onMouseDown={() => !isPreparing && onClose()}>
+      <section
+        className="about-dialog quote-upload-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="quote-upload-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <button
+          className="dialog-close"
+          type="button"
+          autoFocus
+          aria-label="Fermer l'analyse du devis"
+          onClick={onClose}
+          disabled={isPreparing}
+        >
+          <span />
+          <span />
+        </button>
+
+        <p className="eyebrow quote-upload-eyebrow"><span className="eyebrow-dot" /> ANALYSE DE DEVIS</p>
+        <h2 id="quote-upload-title">Importez votre devis ou votre facture.</h2>
+        <p className="quote-upload-intro">Ajoutez une photo nette ou un PDF lisible pour obtenir une première lecture des lignes et des montants.</p>
+
+        <input
+          ref={fileInputRef}
+          className="sr-only"
+          id="quote-document-file"
+          type="file"
+          accept=".pdf,application/pdf,image/jpeg,image/png,image/webp,image/avif,image/heic,image/heif"
+          onChange={(event) => {
+            selectFile(event.currentTarget.files?.[0]);
+            event.currentTarget.value = "";
+          }}
+          disabled={isPreparing}
+        />
+
+        <div
+          className={`quote-dropzone${isDragging ? " is-dragging" : ""}${file ? " has-file" : ""}`}
+          onDragOver={(event) => {
+            event.preventDefault();
+            setIsDragging(true);
+          }}
+          onDragLeave={(event) => {
+            if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) {
+              setIsDragging(false);
+            }
+          }}
+          onDrop={handleDrop}
+        >
+          {file ? (
+            <div className="quote-file-summary">
+              <span className="quote-file-badge" aria-hidden="true">
+                {file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf") ? "PDF" : "IMG"}
+              </span>
+              <span className="quote-file-meta">
+                <strong title={file.name}>{file.name}</strong>
+                <small>{formatFileSize(file.size)} · prêt à analyser</small>
+              </span>
+              <span className="quote-file-actions">
+                <label className="quote-replace-file" htmlFor="quote-document-file">Remplacer</label>
+                <button className="quote-remove-file" type="button" onClick={clearFile} disabled={isPreparing}>
+                  Retirer
+                </button>
+              </span>
+            </div>
+          ) : (
+            <div className="quote-drop-prompt">
+              <span className="quote-upload-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none">
+                  <path d="M12 15V4m0 0L7.5 8.5M12 4l4.5 4.5" />
+                  <path d="M5 14.5v4.25c0 .69.56 1.25 1.25 1.25h11.5c.69 0 1.25-.56 1.25-1.25V14.5" />
+                </svg>
+              </span>
+              <span className="quote-drop-copy"><strong>Glissez votre document ici</strong><small>ou choisissez un fichier depuis votre appareil</small></span>
+              <label className="quote-select-file" htmlFor="quote-document-file">Choisir un fichier</label>
+            </div>
+          )}
+        </div>
+
+        <p className="quote-format-note">JPG, PNG, WebP, HEIC/HEIF, AVIF ou PDF · 12 Mo maximum · PDF jusqu'à 12 pages. Pour un PDF scanné, jusqu'à 4 pages peuvent être transmises.</p>
+        {fileError && <p className="quote-upload-error" role="alert">{fileError}</p>}
+
+        <div className="quote-safety-note">
+          <span className="quote-safety-mark" aria-hidden="true">i</span>
+          <p>Le document est transmis au fournisseur IA configuré. DRIVIA fournit une aide à la lecture, pas un diagnostic professionnel; vérifiez les données personnelles avant l'envoi. Les incertitudes seront signalées.</p>
+        </div>
+
+        <button className="quote-analyze-button" type="button" disabled={!file || isPreparing} onClick={handleAnalyze}>
+          {isPreparing ? "Préparation du document…" : "Analyser le document"}
+          {!isPreparing && <ArrowIcon diagonal />}
+        </button>
+      </section>
+    </div>
+  );
+}
+
 export default function App() {
   const [view, setView] = useState<View>("ai");
   const [messages, setMessages] = useState<DriviaMessage[]>([]);
@@ -473,6 +708,8 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [quoteDialogOpen, setQuoteDialogOpen] = useState(false);
+  const [quoteRetryAvailable, setQuoteRetryAvailable] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const conversationEndRef = useRef<HTMLDivElement>(null);
   const isChatting = view === "ai" && messages.length > 0;
@@ -503,13 +740,12 @@ export default function App() {
     }
   };
 
-  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const content = draft.trim();
-    if (!content || isLoading) return;
-
-    const userMessage: DriviaMessage = { role: "user", content };
-    const conversation = [...messages, userMessage];
+  const runConversation = async (
+    conversation: DriviaMessage[],
+    options: { attachments?: DriviaAttachment[]; task?: "garage-quote" } = {},
+  ) => {
+    const isQuoteAnalysis = options.task === "garage-quote";
+    setQuoteRetryAvailable(false);
     setMessages([...conversation, { role: "assistant", content: "" }]);
     setDraft("");
     setView("ai");
@@ -518,16 +754,21 @@ export default function App() {
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
     try {
-      await streamDriviaResponse(conversation, (delta) => {
-        setMessages((current) => {
-          const lastMessage = current[current.length - 1];
-          if (lastMessage?.role === "assistant") {
-            return [...current.slice(0, -1), { ...lastMessage, content: lastMessage.content + delta }];
-          }
-          return [...current, { role: "assistant", content: delta }];
-        });
-      });
+      await streamDriviaResponse(
+        conversation,
+        (delta) => {
+          setMessages((current) => {
+            const lastMessage = current[current.length - 1];
+            if (lastMessage?.role === "assistant") {
+              return [...current.slice(0, -1), { ...lastMessage, content: lastMessage.content + delta }];
+            }
+            return [...current, { role: "assistant", content: delta }];
+          });
+        },
+        options,
+      );
     } catch (error) {
+      if (isQuoteAnalysis) setQuoteRetryAvailable(true);
       setMessages((current) => {
         const lastMessage = current[current.length - 1];
         return lastMessage?.role === "assistant" && !lastMessage.content
@@ -535,10 +776,32 @@ export default function App() {
           : current;
       });
 
-      if (error instanceof DriviaApiError && error.status === 429) {
-        setChatError("DRIVIA is at the AI provider's request limit. Wait a moment and try again.");
+      if (isQuoteAnalysis) {
+        if (error instanceof DriviaApiError && error.status === 413) {
+          setChatError("La pièce jointe dépasse une limite d'envoi. Réduisez la taille de la photo ou le nombre de pages du PDF, puis réessayez.");
+        } else if (error instanceof DriviaApiError && error.status === 429) {
+          setChatError("Trop de demandes ont été envoyées. Attendez quelques minutes avant de réessayer.");
+        } else if (error instanceof DriviaApiError && error.status === 503) {
+          setChatError(
+            error.message.toLowerCase().includes("not configured")
+              ? "L'analyse IA de DRIVIA n'est pas configurée sur le serveur. Le document n'a pas pu être analysé."
+              : "Le service d'analyse est momentanément très sollicité. Réessayez dans quelques secondes.",
+          );
+        } else if (error instanceof DriviaApiError && error.status === 404) {
+          setChatError("Le service /api/chat est indisponible. Déployez la fonction serveur DRIVIA pour analyser le document.");
+        } else if (error instanceof DriviaApiError && error.status === 0) {
+          setChatError("Le service d'analyse n'est pas joignable pour le moment. Réessayez plus tard.");
+        } else {
+          setChatError("DRIVIA n'a pas pu analyser ce document. Vérifiez le fichier ou réessayez plus tard.");
+        }
+      } else if (error instanceof DriviaApiError && error.status === 429) {
+        setChatError("DRIVIA is receiving too many requests right now. Please wait before trying again.");
       } else if (error instanceof DriviaApiError && error.status === 503) {
-        setChatError("DRIVIA AI is not configured. Set DRIVIA_AI_API_KEY as a server environment variable and deploy api/chat.ts to connect a real model.");
+        setChatError(
+          error.message.toLowerCase().includes("not configured")
+            ? "DRIVIA AI is not configured. Set DRIVIA_AI_API_KEY as a server environment variable and deploy api/chat.ts to connect a real model."
+            : "DRIVIA's chat service is handling many requests right now. Please try again shortly.",
+        );
       } else if (error instanceof DriviaApiError && error.status === 404) {
         setChatError("DRIVIA's /api/chat function is unavailable. Deploy the repository root to Vercel with vercel.json and set DRIVIA_AI_API_KEY in the server environment. Static-only previews cannot run the AI endpoint.");
       } else if (error instanceof DriviaApiError && error.status === 0) {
@@ -549,6 +812,25 @@ export default function App() {
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const content = draft.trim();
+    if (!content || isLoading) return;
+
+    await runConversation([...messages, { role: "user", content }]);
+  };
+
+  const handleQuoteAnalysis = (file: File, attachments: DriviaAttachment[]) => {
+    if (isLoading) return;
+    setQuoteDialogOpen(false);
+    const userMessage: DriviaMessage = {
+      role: "user",
+      content: `Analyser mon devis de garage : ${file.name}`,
+    };
+    const previousMessages = quoteRetryAvailable ? [] : messages;
+    void runConversation([...previousMessages, userMessage], { attachments, task: "garage-quote" });
   };
 
   const fillPrompt = (prompt: string) => {
@@ -606,6 +888,11 @@ export default function App() {
 
       {view === "battle" ? (
         <BattleMode />
+      ) : quoteDialogOpen ? (
+        <QuoteUploadDialog
+          onClose={() => setQuoteDialogOpen(false)}
+          onAnalyze={handleQuoteAnalysis}
+        />
       ) : isChatting ? (
         <main className="chat-stage" aria-label="DRIVIA conversation">
           <div className="conversation-scroll">
@@ -620,7 +907,16 @@ export default function App() {
               );
             })}
             {isLoading && messages[messages.length - 1]?.content === "" && <LoadingMessage />}
-            {chatError && <div className="connection-note" role="alert">{chatError}</div>}
+            {chatError && (
+              <div className="connection-note" role="alert">
+                {chatError}
+                {quoteRetryAvailable && (
+                  <button className="quote-retry-button" type="button" onClick={() => setQuoteDialogOpen(true)}>
+                    Réimporter le document <ArrowIcon diagonal />
+                  </button>
+                )}
+              </div>
+            )}
             <div ref={conversationEndRef} />
           </div>
           <div className="chat-composer-wrap">
@@ -638,10 +934,52 @@ export default function App() {
       ) : (
         <main className="hero-stage" id="ai">
           <div className="hero-content">
-            <p className="eyebrow hero-eyebrow"><span className="eyebrow-dot" /> AUTOMOTIVE INTELLIGENCE, IN YOUR CORNER</p>
+            <p className="eyebrow hero-eyebrow"><span className="eyebrow-dot" /> VOTRE COMPAGNON AUTOMOBILE AU QUOTIDIEN</p>
             <h1 className="hero-brand">DRIVIA<span>.</span></h1>
-            <h2 className="hero-statement">Your AI automotive companion.</h2>
-            <p className="hero-description">Ask questions. Explore cars. Understand automotive technology.</p>
+            <h2 className="hero-statement">L'automobile, en toute clarté.</h2>
+            <p className="hero-description">Un devis de garage, un voyant ou une voiture à vérifier ? Choisissez un point de départ ou échangez directement avec DRIVIA.</p>
+
+            <section className="home-action-section" aria-labelledby="home-action-title">
+              <div className="home-action-heading">
+                <div>
+                  <span className="home-action-kicker">CHOISISSEZ VOTRE BESOIN</span>
+                  <h2 className="home-action-title" id="home-action-title">Que souhaitez-vous faire aujourd'hui ?</h2>
+                </div>
+                <span className="home-action-count">01—03</span>
+              </div>
+
+              <div className="home-action-grid">
+                {HOME_ACTIONS.map((action) => (
+                  <button
+                    className="home-action-card"
+                    key={action.number}
+                    type="button"
+                    onClick={() => {
+                      if (action.icon === "quote") setQuoteDialogOpen(true);
+                      else fillPrompt(action.prompt);
+                    }}
+                  >
+                    <span className="home-action-card-head">
+                      <span className="home-action-icon"><HomeActionIcon icon={action.icon} /></span>
+                      <span className="home-action-number">{action.number}</span>
+                    </span>
+                    <span className="home-action-card-title">{action.title}</span>
+                    <span className="home-action-card-description">{action.description}</span>
+                    <ArrowIcon diagonal />
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            <div className="home-chat-choice">
+              <div className="home-chat-copy">
+                <span className="home-chat-title">Une question plus générale ?</span>
+                <span className="home-chat-description">Discutez librement avec DRIVIA.</span>
+              </div>
+              <button className="home-chat-button" type="button" onClick={openChat}>
+                Parler à DRIVIA <ArrowIcon diagonal />
+              </button>
+            </div>
 
             <Composer
               variant="hero"
@@ -654,7 +992,7 @@ export default function App() {
             />
 
             <div className="quick-prompts">
-              <span className="quick-prompts-label">A GOOD PLACE TO START</span>
+              <span className="quick-prompts-label">QUELQUES IDÉES POUR COMMENCER</span>
               <div className="quick-prompts-list">
                 {QUICK_PROMPTS.map((item) => (
                   <button key={item.label} type="button" onClick={() => fillPrompt(item.prompt)}>
