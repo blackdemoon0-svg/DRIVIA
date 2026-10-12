@@ -5,8 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "build": "vite build && node scripts/generate-seo.mjs",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "check:seo": "node scripts/check-seo-build.mjs",
+    "verify": "npm run typecheck && npm run build && npm run check:seo"
   },
   "dependencies": {
     "@vercel/analytics": "^2.0.1",
