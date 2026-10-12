@@ -35,6 +35,69 @@ DRIVIA_DEPLOYMENT_URL=https://your-preview.vercel.app node scripts/verify-vercel
 
 The check expects `/api/chat` to return its method-specific `405` JSON response to a GET request. A static page/HTML fallback or a missing function will fail this check. This repository cannot set Vercel dashboard settings, create the remote Vercel project, add secrets, or confirm a remote deployment by itself.
 
+## SEO and Google Search Console
+
+DRIVIA is a single-page app with one crawlable URL, so the crawl surface is small: the HTML
+document, `robots.txt` and `sitemap.xml`.
+
+`index.html` (repository root, the Vite entry document) carries, in this order:
+
+- `<meta name="google-site-verification" …>` — the Search Console HTML-tag method. It is
+  committed to Git and survives `vite build` byte for byte; it must stay the **first**
+  verification-related tag in `<head>` and must not be injected from React.
+- `<meta name="robots" content="index, follow, …">` — explicitly allows indexing.
+- `<meta name="description">`, Open Graph and Twitter Card tags.
+- `<html lang="fr">`, matching the French UI copy.
+
+**Never add `<link rel="canonical" href="/">` to `index.html`.** Vite's HTML asset pipeline
+resolves a `href="/…"` on a `<link>` against the project root, so `href="/"` aborts the build
+with `EISDIR: illegal operation on a directory`. The canonical tag is injected into
+`dist/index.html` after the build by `scripts/generate-seo.mjs` instead.
+
+### Generated crawl assets
+
+`npm run build` runs `vite build` and then `scripts/generate-seo.mjs`, which writes into
+`dist/`:
+
+- `robots.txt` — `Allow: /`, `Disallow: /api/`, plus a `Sitemap:` line when the origin is known.
+- `sitemap.xml` — one entry for the homepage, with an absolute `<loc>`.
+- absolute `og:image` / `twitter:image` URLs and the `<link rel="canonical">` tag.
+
+The site origin is resolved at build time so no domain is ever hard-coded or guessed:
+
+1. `DRIVIA_SITE_URL` (explicit override, wins everywhere)
+2. `VERCEL_URL` on preview builds
+3. `VERCEL_PROJECT_PRODUCTION_URL` (Vercel's production domain)
+4. `VERCEL_URL`
+
+When no origin is available (a plain local build) the script writes the relative canonical,
+leaves `og:image` relative, skips `sitemap.xml` and omits the `Sitemap:` line, so a wrong URL
+is never published. Nothing in this step can fail the build.
+
+### Verifying a deployment
+
+```sh
+npm run verify          # typecheck + build + 25 publish-readiness assertions
+npm run check:seo       # assertions only, against an existing dist/
+```
+
+`scripts/check-seo-build.mjs` reads `dist/` — the exact bytes Vercel publishes — and asserts
+the verification tag is present once inside `<head>`, there is no `noindex`, there is exactly
+one canonical, `robots.txt` and `sitemap.xml` are well formed, and no API-key-shaped string
+leaked into the bundle.
+
+Against a live deployment (substitute the project's production domain):
+
+```sh
+curl -s https://<production-domain>/ | grep -o '<meta name="google-site-verification"[^>]*>'
+curl -sI https://<production-domain>/robots.txt
+curl -s  https://<production-domain>/sitemap.xml
+```
+
+Vercel deployment URLs of the form `<project>-<hash>-<scope>.vercel.app` are **immutable**:
+they keep serving the build they were created from forever. Always check the production
+alias, not an old deployment URL, before concluding a change is missing.
+
 ## Vercel Web Analytics
 
 The app mounts Vercel's official `@vercel/analytics` React component from `src/main.tsx`. Once Web Analytics is enabled for the Vercel project and this code is deployed, Vercel can collect site visits and page views and show traffic breakdowns in the project dashboard. No API key, frontend secret, or extra environment variable is needed. The integration does not change the AI chat or DRIVIA Battle UI/behavior.
