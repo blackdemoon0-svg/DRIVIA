@@ -26,6 +26,9 @@ type StreamOptions = {
 type StreamPayload = {
   delta?: unknown;
   error?: unknown;
+  code?: unknown;
+  truncated?: unknown;
+  finishReason?: unknown;
   choices?: Array<{ delta?: { content?: unknown } }>;
 };
 
@@ -33,6 +36,7 @@ export class DriviaApiError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    public readonly code?: string,
   ) {
     super(message);
     this.name = "DriviaApiError";
@@ -44,8 +48,12 @@ function parseServerError(payload: unknown, status: number): DriviaApiError {
     typeof payload === "object" && payload !== null && "error" in payload
       ? (payload as { error?: unknown }).error
       : null;
+  const code =
+    typeof payload === "object" && payload !== null && "code" in payload
+      ? (payload as { code?: unknown }).code
+      : null;
   const message = typeof error === "string" ? error : "The DRIVIA AI service returned an error.";
-  return new DriviaApiError(status, message);
+  return new DriviaApiError(status, message, typeof code === "string" ? code : undefined);
 }
 
 function parseSseEvent(frame: string, onDelta: (delta: string) => void): boolean {
@@ -66,11 +74,16 @@ function parseSseEvent(frame: string, onDelta: (delta: string) => void): boolean
   try {
     payload = JSON.parse(data) as StreamPayload;
   } catch {
-    throw new DriviaApiError(502, "The DRIVIA AI service returned an invalid stream.");
+    throw new DriviaApiError(502, "The DRIVIA AI service returned an invalid stream.", "provider_error");
   }
 
   if (eventName === "error" || typeof payload.error === "string") {
-    throw new DriviaApiError(502, "DRIVIA AI is temporarily unavailable.");
+    const message =
+      typeof payload.error === "string" && payload.error.trim().length > 0
+        ? payload.error
+        : "DRIVIA AI is temporarily unavailable.";
+    const code = typeof payload.code === "string" ? payload.code : "provider_error";
+    throw new DriviaApiError(502, message, code);
   }
 
   const delta =
@@ -162,9 +175,13 @@ export async function streamDriviaResponse(
   }
 
   if (!receivedText) {
-    throw new DriviaApiError(502, "The DRIVIA AI service returned an empty response.");
+    throw new DriviaApiError(502, "The DRIVIA AI service returned an empty response.", "empty_response");
   }
   if (!complete) {
-    throw new DriviaApiError(0, "The DRIVIA AI stream ended before the response was complete.");
+    throw new DriviaApiError(
+      0,
+      "La réponse IA a été interrompue avant la fin. / The DRIVIA AI stream ended before the response was complete.",
+      "incomplete_stream",
+    );
   }
 }
