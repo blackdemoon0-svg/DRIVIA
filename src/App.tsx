@@ -740,6 +740,58 @@ export default function App() {
     }
   };
 
+  const formatChatError = (error: unknown, isQuoteAnalysis: boolean): string => {
+    if (error instanceof DriviaApiError) {
+      const code = error.code;
+
+      if (error.status === 413) {
+        return "La pièce jointe dépasse la limite d'envoi. Réduisez la taille de la photo ou le nombre de pages du PDF. / Attachment exceeds the size limit. Reduce the image size or PDF page count.";
+      }
+      if (code === "missing_api_key" || (error.status === 503 && error.message.toLowerCase().includes("not configured"))) {
+        return isQuoteAnalysis
+          ? "L'IA DRIVIA n'est pas configurée sur le serveur (DRIVIA_AI_API_KEY manquante). / DRIVIA AI is not configured on the server (set DRIVIA_AI_API_KEY)."
+          : "L'IA DRIVIA n'est pas configurée : définissez DRIVIA_AI_API_KEY sur le serveur et déployez api/chat.ts. / DRIVIA AI is not configured: set DRIVIA_AI_API_KEY as a server environment variable and deploy api/chat.ts.";
+      }
+      if (code === "invalid_api_key") {
+        return "Clé API invalide ou rejetée par le fournisseur IA. Vérifiez DRIVIA_AI_API_KEY sur le serveur. / Invalid API key rejected by the AI provider. Check DRIVIA_AI_API_KEY on the server.";
+      }
+      if (code === "access_denied") {
+        return "Accès refusé par le fournisseur IA. Vérifiez les permissions de la clé API et du projet. / Access denied by the AI provider. Check API key and project permissions.";
+      }
+      if (code === "model_unavailable") {
+        return "Le modèle IA configuré est indisponible ou non autorisé pour ce compte. Vérifiez DRIVIA_AI_MODEL. / The configured AI model is unavailable or not enabled for this account. Check DRIVIA_AI_MODEL.";
+      }
+      if (code === "insufficient_quota") {
+        return "Quota API insuffisant ou facturation non activée sur le compte du fournisseur IA. / Insufficient API quota or inactive billing on the AI provider account.";
+      }
+      if (code === "rate_limited" || error.status === 429) {
+        return "Trop de requêtes envoyées (limite de débit atteinte). Patientez quelques instants avant de réessayer. / Rate limit reached. Please wait a moment before trying again.";
+      }
+      if (error.status === 503 || code === "busy") {
+        return "Le service DRIVIA traite actuellement de nombreuses demandes. Réessayez dans quelques secondes. / DRIVIA's chat service is handling many requests right now. Please try again shortly.";
+      }
+      if (code === "timeout" || error.status === 504) {
+        return "Le fournisseur IA a mis trop de temps à répondre. Veuillez réessayer. / The AI provider took too long to respond. Please try again.";
+      }
+      if (code === "incomplete_stream") {
+        return "La réponse a été interrompue avant la fin. Vous pouvez relancer votre demande. / The AI response was interrupted before completion. Please try again.";
+      }
+      if (code === "empty_response") {
+        return "Le fournisseur IA a renvoyé une réponse vide. Veuillez réessayer. / The AI provider returned an empty response. Please try again.";
+      }
+      if (error.status === 404) {
+        return "La fonction serveur /api/chat est indisponible. Déployez la racine du dépôt sur Vercel avec vercel.json. / DRIVIA's /api/chat function is unavailable. Deploy the repository root to Vercel with vercel.json.";
+      }
+      if (error.status === 0) {
+        return "Le service /api/chat est injoignable. Vérifiez votre connexion ou que le serveur est démarré. / The /api/chat server could not be reached. Check your connection or make sure the server is running.";
+      }
+    }
+
+    return isQuoteAnalysis
+      ? "DRIVIA n'a pas pu analyser ce document (erreur serveur du fournisseur IA). Réessayez plus tard. / DRIVIA could not analyze this document due to an AI provider server error."
+      : "Erreur serveur du fournisseur IA. Vérifiez la configuration serveur (fournisseur, modèle, clé API) et réessayez. / AI provider server error. Check the server-side provider, model and API key settings, then try again.";
+  };
+
   const runConversation = async (
     conversation: DriviaMessage[],
     options: { attachments?: DriviaAttachment[]; task?: "garage-quote" } = {},
@@ -775,40 +827,7 @@ export default function App() {
           ? current.slice(0, -1)
           : current;
       });
-
-      if (isQuoteAnalysis) {
-        if (error instanceof DriviaApiError && error.status === 413) {
-          setChatError("La pièce jointe dépasse une limite d'envoi. Réduisez la taille de la photo ou le nombre de pages du PDF, puis réessayez.");
-        } else if (error instanceof DriviaApiError && error.status === 429) {
-          setChatError("Trop de demandes ont été envoyées. Attendez quelques minutes avant de réessayer.");
-        } else if (error instanceof DriviaApiError && error.status === 503) {
-          setChatError(
-            error.message.toLowerCase().includes("not configured")
-              ? "L'analyse IA de DRIVIA n'est pas configurée sur le serveur. Le document n'a pas pu être analysé."
-              : "Le service d'analyse est momentanément très sollicité. Réessayez dans quelques secondes.",
-          );
-        } else if (error instanceof DriviaApiError && error.status === 404) {
-          setChatError("Le service /api/chat est indisponible. Déployez la fonction serveur DRIVIA pour analyser le document.");
-        } else if (error instanceof DriviaApiError && error.status === 0) {
-          setChatError("Le service d'analyse n'est pas joignable pour le moment. Réessayez plus tard.");
-        } else {
-          setChatError("DRIVIA n'a pas pu analyser ce document. Vérifiez le fichier ou réessayez plus tard.");
-        }
-      } else if (error instanceof DriviaApiError && error.status === 429) {
-        setChatError("DRIVIA is receiving too many requests right now. Please wait before trying again.");
-      } else if (error instanceof DriviaApiError && error.status === 503) {
-        setChatError(
-          error.message.toLowerCase().includes("not configured")
-            ? "DRIVIA AI is not configured. Set DRIVIA_AI_API_KEY as a server environment variable and deploy api/chat.ts to connect a real model."
-            : "DRIVIA's chat service is handling many requests right now. Please try again shortly.",
-        );
-      } else if (error instanceof DriviaApiError && error.status === 404) {
-        setChatError("DRIVIA's /api/chat function is unavailable. Deploy the repository root to Vercel with vercel.json and set DRIVIA_AI_API_KEY in the server environment. Static-only previews cannot run the AI endpoint.");
-      } else if (error instanceof DriviaApiError && error.status === 0) {
-        setChatError("DRIVIA AI is temporarily unavailable. Make sure the /api/chat server is running and try again.");
-      } else {
-        setChatError("DRIVIA AI is temporarily unavailable. Check the server-side provider, model and API key settings, then try again.");
-      }
+      setChatError(formatChatError(error, isQuoteAnalysis));
     } finally {
       setIsLoading(false);
     }

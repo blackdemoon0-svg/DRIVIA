@@ -48,8 +48,22 @@ type ProviderStreamChunk = {
   error?: unknown;
   choices?: Array<{
     delta?: { content?: unknown };
+    finish_reason?: string | null;
   }>;
 };
+
+type ApiErrorCode =
+  | "missing_api_key"
+  | "invalid_api_key"
+  | "access_denied"
+  | "model_unavailable"
+  | "insufficient_quota"
+  | "rate_limited"
+  | "busy"
+  | "timeout"
+  | "empty_response"
+  | "incomplete_stream"
+  | "provider_error";
 
 const MAX_HISTORY_MESSAGES = 24;
 const MAX_HISTORY_CHARACTERS = 24_000;
@@ -95,6 +109,7 @@ type RequestBucket = {
 
 type RequestAdmissionError = {
   status: 429 | 503;
+  code: "rate_limited" | "busy";
   message: string;
   retryAfterSeconds: number;
 };
@@ -155,6 +170,7 @@ function admitChatRequest(request: ApiRequest, now = Date.now()): RequestAdmissi
         return {
           error: {
             status: 503,
+            code: "busy",
             message: "DRIVIA is handling many requests right now. Please retry shortly.",
             retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
           },
@@ -185,6 +201,7 @@ function admitChatRequest(request: ApiRequest, now = Date.now()): RequestAdmissi
       return {
         error: {
           status: 429,
+          code: "rate_limited",
           message: "Too many chat requests. Please wait before trying again.",
           retryAfterSeconds,
         },
@@ -196,6 +213,7 @@ function admitChatRequest(request: ApiRequest, now = Date.now()): RequestAdmissi
     return {
       error: {
         status: 429,
+        code: "rate_limited",
         message: "Too many simultaneous requests from this client. Please wait for one to finish.",
         retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
       },
@@ -205,6 +223,7 @@ function admitChatRequest(request: ApiRequest, now = Date.now()): RequestAdmissi
     return {
       error: {
         status: 503,
+        code: "busy",
         message: "DRIVIA is handling many requests right now. Please retry shortly.",
         retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
       },
@@ -418,18 +437,116 @@ async function writeEvent(response: ApiResponse, event: string, payload: unknown
   }
 }
 
+function usesReasoningParameterProfile(provider: string, model: string): boolean {
+  if (provider === "gemini") return false;
+  const normalized = model.trim().toLowerCase();
+  return /^(gpt-5|gpt-6|o1|o3|o4)($|[-.])/.test(normalized);
+}
+
+function classifyProviderHttpError(
+  status: number,
+  payload: unknown,
+): { status: number; code: ApiErrorCode; error: string } {
+  const rawError =
+    typeof payload === "object" && payload !== null && "error" in payload
+      ? (payload as { error?: unknown }).error
+      : null;
+  const errorObj =
+    typeof rawError === "object" && rawError !== null
+      ? (rawError as Record<string, unknown>)
+      : null;
+  const upstreamCode = typeof errorObj?.code === "string" ? errorObj.code.toLowerCase() : "";
+  const upstreamType = typeof errorObj?.type === "string" ? errorObj.type.toLowerCase() : "";
+  const upstreamMessage = typeof errorObj?.message === "string" ? errorObj.message.toLowerCase() : "";
+
+  if (
+    status === 402 ||
+    upstreamCode === "insufficient_quota" ||
+    upstreamType === "insufficient_quota" ||
+    upstreamCode === "billing_hard_limit_reached" ||
+    (status === 429 && (upstreamMessage.includes("quota") || upstreamMessage.includes("billing")))
+  ) {
+    return {
+      status: 429,
+      code: "insufficient_quota",
+      error:
+        "Quota API insuffisant ou facturation non activée sur le compte du fournisseur IA. / Insufficient API quota or inactive billing on the AI provider account.",
+    };
+  }
+
+  if (status === 429 || upstreamCode === "rate_limit_exceeded" || upstreamType === "rate_limit_error") {
+    return {
+      status: 429,
+      code: "rate_limited",
+      error:
+        "Limite de débit atteinte auprès du fournisseur IA. Réessayez dans quelques instants. / The AI provider is rate limited. Try again shortly.",
+    };
+  }
+
+  if (status === 401 || upstreamCode === "invalid_api_key") {
+    return {
+      status: 502,
+      code: "invalid_api_key",
+      error:
+        "Clé API invalide ou rejetée par le fournisseur IA. Vérifiez DRIVIA_AI_API_KEY sur le serveur. / The AI provider rejected its API key. Check DRIVIA_AI_API_KEY on the server.",
+    };
+  }
+
+  if (
+    status === 404 ||
+    upstreamCode === "model_not_found" ||
+    (status === 400 && upstreamMessage.includes("model") && upstreamMessage.includes("not exist"))
+  ) {
+    return {
+      status: 502,
+      code: "model_unavailable",
+      error:
+        "Le modèle IA configuré est indisponible ou introuvable. Vérifiez DRIVIA_AI_MODEL et les accès du projet. / The configured AI model is unavailable or not found. Check DRIVIA_AI_MODEL.",
+    };
+  }
+
+  if (
+    status === 403 ||
+    upstreamCode === "insufficient_permissions" ||
+    upstreamCode === "access_terminated" ||
+    upstreamType === "permission_error"
+  ) {
+    if (upstreamMessage.includes("model")) {
+      return {
+        status: 502,
+        code: "model_unavailable",
+        error:
+          "Ce compte ou projet n'a pas accès au modèle IA configuré. Vérifiez DRIVIA_AI_MODEL et les droits du projet. / This account or project does not have access to the configured AI model.",
+      };
+    }
+    return {
+      status: 502,
+      code: "access_denied",
+      error:
+        "Accès refusé par le fournisseur IA. Vérifiez les permissions de la clé API et du projet. / Access denied by the AI provider. Check API key and project permissions.",
+    };
+  }
+
+  return {
+    status: 502,
+    code: "provider_error",
+    error:
+      "Le fournisseur IA n'a pas pu traiter la requête. Vérifiez la configuration du fournisseur et du modèle. / The AI provider could not complete the request. Check the provider and model configuration.",
+  };
+}
+
 async function consumeProviderFrame(
   frame: string,
   response: ApiResponse,
-): Promise<{ complete: boolean; hasText: boolean }> {
+): Promise<{ complete: boolean; hasText: boolean; finishReason: string | null }> {
   const dataLines = frame
     .split("\n")
     .filter((line) => line.startsWith("data:"))
     .map((line) => line.slice(5).trimStart());
 
-  if (dataLines.length === 0) return { complete: false, hasText: false };
+  if (dataLines.length === 0) return { complete: false, hasText: false, finishReason: null };
   const data = dataLines.join("\n");
-  if (data === "[DONE]") return { complete: true, hasText: false };
+  if (data === "[DONE]") return { complete: true, hasText: false, finishReason: null };
 
   let chunk: ProviderStreamChunk;
   try {
@@ -440,13 +557,15 @@ async function consumeProviderFrame(
 
   if (chunk.error) throw new Error("The AI provider returned a stream error.");
 
-  const delta = chunk.choices?.[0]?.delta?.content;
+  const choice = chunk.choices?.[0];
+  const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : null;
+  const delta = choice?.delta?.content;
   if (typeof delta === "string" && delta.length > 0) {
     await writeEvent(response, "delta", { delta });
-    return { complete: false, hasText: true };
+    return { complete: false, hasText: true, finishReason };
   }
 
-  return { complete: false, hasText: false };
+  return { complete: false, hasText: false, finishReason };
 }
 
 export default async function handler(request: ApiRequest, response: ApiResponse) {
@@ -457,7 +576,9 @@ export default async function handler(request: ApiRequest, response: ApiResponse
   const admission = admitChatRequest(request);
   if ("error" in admission) {
     response.setHeader("Retry-After", String(admission.error.retryAfterSeconds));
-    return response.status(admission.error.status).json({ error: admission.error.message });
+    return response
+      .status(admission.error.status)
+      .json({ error: admission.error.message, code: admission.error.code });
   }
 
   try {
@@ -501,16 +622,20 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
     return response.status(400).json({ error: "Document attachments are only supported for garage quote analysis." });
   }
 
-  const apiKey = process.env.DRIVIA_AI_API_KEY;
+  const apiKey = process.env.DRIVIA_AI_API_KEY?.trim();
   if (!apiKey) {
     return response.status(503).json({
+      code: "missing_api_key",
       error: "DRIVIA's AI provider is not configured. Set DRIVIA_AI_API_KEY on the server.",
     });
   }
 
   const provider = (process.env.DRIVIA_AI_PROVIDER || "openai").trim().toLowerCase();
   if (provider !== "openai" && provider !== "gemini" && provider !== "openai-compatible") {
-    return response.status(500).json({ error: "Unsupported DRIVIA_AI_PROVIDER configuration." });
+    return response.status(500).json({
+      code: "provider_error",
+      error: "Unsupported DRIVIA_AI_PROVIDER configuration.",
+    });
   }
 
   const defaultBaseUrl =
@@ -519,7 +644,15 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
       : "https://api.openai.com/v1";
   const baseUrl = (process.env.DRIVIA_AI_BASE_URL || defaultBaseUrl).replace(/\/+$/, "");
   const defaultModel = provider === "gemini" ? "gemini-3.8-flash" : "gpt-4.1-mini";
-  const model = process.env.DRIVIA_AI_MODEL || defaultModel;
+  const model = (process.env.DRIVIA_AI_MODEL || defaultModel).trim();
+  const isReasoningModel = usesReasoningParameterProfile(provider, model);
+  const maxCompletionTokens = isReasoningModel
+    ? attachments.length > 0
+      ? 3200
+      : 2400
+    : attachments.length > 0
+      ? 1800
+      : 1400;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 45_000);
   let streamStarted = false;
@@ -535,28 +668,26 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
         model,
         messages: getProviderMessages(messages, attachments, task),
         stream: true,
-        ...(provider === "gemini" ? {} : { max_completion_tokens: attachments.length > 0 ? 1800 : 1400 }),
-        temperature: attachments.length > 0 ? 0.2 : 0.7,
+        ...(provider === "gemini" ? {} : { max_completion_tokens: maxCompletionTokens }),
+        ...(isReasoningModel ? {} : { temperature: attachments.length > 0 ? 0.2 : 0.7 }),
       }),
       signal: controller.signal,
     });
 
     if (!providerResponse.ok) {
-      if (providerResponse.status === 429) {
-        return response.status(429).json({ error: "The AI provider is rate limited. Try again shortly." });
-      }
-      if ([401, 403].includes(providerResponse.status)) {
-        return response.status(502).json({
-          error: "The AI provider rejected its credentials. Check DRIVIA_AI_API_KEY and the selected model.",
-        });
-      }
-      return response.status(502).json({
-        error: "The AI provider could not complete the request. Check the provider and model configuration.",
+      const errorPayload = await providerResponse.json().catch(() => null);
+      const classified = classifyProviderHttpError(providerResponse.status, errorPayload);
+      return response.status(classified.status).json({
+        code: classified.code,
+        error: classified.error,
       });
     }
 
     if (!providerResponse.body) {
-      return response.status(502).json({ error: "The AI provider did not return a response stream." });
+      return response.status(502).json({
+        code: "provider_error",
+        error: "The AI provider did not return a response stream.",
+      });
     }
 
     response.status(200);
@@ -571,6 +702,7 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
     let buffer = "";
     let complete = false;
     let didStreamText = false;
+    let finishReason: string | null = null;
 
     try {
       while (!complete) {
@@ -585,6 +717,7 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
           const result = await consumeProviderFrame(frame, response);
           complete = result.complete;
           didStreamText ||= result.hasText;
+          if (result.finishReason) finishReason = result.finishReason;
           if (complete) break;
           separatorIndex = buffer.indexOf("\n\n");
         }
@@ -594,6 +727,7 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
             const result = await consumeProviderFrame(buffer, response);
             complete = result.complete;
             didStreamText ||= result.hasText;
+            if (result.finishReason) finishReason = result.finishReason;
           }
           break;
         }
@@ -603,7 +737,29 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
     }
 
     if (!didStreamText) {
-      await writeEvent(response, "error", { error: "The AI provider returned an empty response." });
+      await writeEvent(response, "error", {
+        code: "empty_response",
+        error: "Le fournisseur IA a renvoyé une réponse vide. / The AI provider returned an empty response.",
+      });
+      response.end();
+      return;
+    }
+
+    if (!complete && !finishReason) {
+      await writeEvent(response, "error", {
+        code: "incomplete_stream",
+        error: "La réponse IA a été interrompue avant la fin. / The AI response was interrupted before completion.",
+      });
+      response.end();
+      return;
+    }
+
+    if (finishReason === "length") {
+      await writeEvent(response, "delta", {
+        delta:
+          "\n\n[Note : réponse tronquée car la limite de longueur maximale a été atteinte. / Response truncated due to maximum output length.]",
+      });
+      await writeEvent(response, "done", { truncated: true, finishReason: "length" });
       response.end();
       return;
     }
@@ -614,9 +770,10 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
     if (streamStarted) {
       try {
         await writeEvent(response, "error", {
+          code: controller.signal.aborted ? "timeout" : "incomplete_stream",
           error: controller.signal.aborted
-            ? "DRIVIA AI took too long to respond. Please try again."
-            : "DRIVIA AI is temporarily unavailable.",
+            ? "Le fournisseur IA a mis trop de temps à répondre. Veuillez réessayer. / DRIVIA AI took too long to respond. Please try again."
+            : "La réponse IA a été interrompue. Veuillez réessayer. / DRIVIA AI stream was interrupted. Please try again.",
         });
         response.end();
       } catch {
@@ -626,9 +783,15 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
     }
 
     if (controller.signal.aborted) {
-      return response.status(504).json({ error: "The AI provider took too long to respond. Please try again." });
+      return response.status(504).json({
+        code: "timeout",
+        error: "Le fournisseur IA a mis trop de temps à répondre. Veuillez réessayer. / The AI provider took too long to respond. Please try again.",
+      });
     }
-    return response.status(502).json({ error: "The AI provider is temporarily unavailable." });
+    return response.status(502).json({
+      code: "provider_error",
+      error: "Le fournisseur IA est temporairement indisponible. / The AI provider is temporarily unavailable.",
+    });
   } finally {
     clearTimeout(timeoutId);
   }
