@@ -1,5 +1,5 @@
 /**
- * DRIVIA — post-build SEO / publish-readiness check.
+ * VEYDRIVO — post-build SEO / publish-readiness check.
  *
  * Run after `npm run build`:  node scripts/check-seo-build.mjs
  *
@@ -112,7 +112,7 @@ if (robots === null) {
 /* ---------- 6. sitemap.xml ---------- */
 if (sitemap === null) {
   console.warn("note: dist/sitemap.xml was not generated (site origin unknown at build time).");
-  console.warn("      On Vercel, VERCEL_PROJECT_PRODUCTION_URL normally provides it; or set DRIVIA_SITE_URL.");
+  console.warn("      On Vercel, VERCEL_PROJECT_PRODUCTION_URL normally provides it; or set VEYDRIVO_SITE_URL.");
 } else {
   check("dist/sitemap.xml exists", true);
   check("sitemap declares the sitemap 0.9 namespace", sitemap.includes("http://www.sitemaps.org/schemas/sitemap/0.9"));
@@ -127,8 +127,20 @@ for (const { name, re } of SECRET_PATTERNS) {
   check(`no ${name} leaked into dist/index.html`, !re.test(html));
 }
 
+/* ---------- 8. Rebrand guard (DRIVIA → VEYDRIVO) ---------- */
+check("title mentions VEYDRIVO", /veydrivo/i.test(title), `"${title}"`);
+const ogSiteName = head.match(/<meta\s+property="og:site_name"\s+content="([^"]*)"/i)?.[1] ?? "";
+check("og:site_name is VEYDRIVO", ogSiteName === "VEYDRIVO", ogSiteName || "og:site_name missing");
+check("no leftover DRIVIA brand reference in dist/index.html", !/drivia/i.test(html));
+if (robots !== null) {
+  check("no leftover DRIVIA brand reference in robots.txt", !/drivia/i.test(robots));
+}
+if (sitemap !== null) {
+  check("no leftover DRIVIA brand reference in sitemap.xml", !/drivia/i.test(sitemap));
+}
+
 /* ---------- report ---------- */
-console.log("\nDRIVIA post-build SEO check");
+console.log("\nVEYDRIVO post-build SEO check");
 console.log("=".repeat(72));
 for (const { label, ok, detail } of results) {
   console.log(`${ok ? "PASS" : "FAIL"}  ${label}${detail ? `  [${detail}]` : ""}`);

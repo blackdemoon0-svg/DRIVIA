@@ -1,9 +1,9 @@
-export type DriviaMessage = {
+export type VeydrivoMessage = {
   role: "user" | "assistant";
   content: string;
 };
 
-export type DriviaAttachment =
+export type VeydrivoAttachment =
   | {
       type: "image";
       name: string;
@@ -19,7 +19,7 @@ export type DriviaAttachment =
 
 type StreamOptions = {
   signal?: AbortSignal;
-  attachments?: DriviaAttachment[];
+  attachments?: VeydrivoAttachment[];
   task?: "garage-quote";
 };
 
@@ -32,18 +32,18 @@ type StreamPayload = {
   choices?: Array<{ delta?: { content?: unknown } }>;
 };
 
-export class DriviaApiError extends Error {
+export class VeydrivoApiError extends Error {
   constructor(
     public readonly status: number,
     message: string,
     public readonly code?: string,
   ) {
     super(message);
-    this.name = "DriviaApiError";
+    this.name = "VeydrivoApiError";
   }
 }
 
-function parseServerError(payload: unknown, status: number): DriviaApiError {
+function parseServerError(payload: unknown, status: number): VeydrivoApiError {
   const error =
     typeof payload === "object" && payload !== null && "error" in payload
       ? (payload as { error?: unknown }).error
@@ -52,8 +52,8 @@ function parseServerError(payload: unknown, status: number): DriviaApiError {
     typeof payload === "object" && payload !== null && "code" in payload
       ? (payload as { code?: unknown }).code
       : null;
-  const message = typeof error === "string" ? error : "The DRIVIA AI service returned an error.";
-  return new DriviaApiError(status, message, typeof code === "string" ? code : undefined);
+  const message = typeof error === "string" ? error : "The VEYDRIVO AI service returned an error.";
+  return new VeydrivoApiError(status, message, typeof code === "string" ? code : undefined);
 }
 
 function parseSseEvent(frame: string, onDelta: (delta: string) => void): boolean {
@@ -74,16 +74,16 @@ function parseSseEvent(frame: string, onDelta: (delta: string) => void): boolean
   try {
     payload = JSON.parse(data) as StreamPayload;
   } catch {
-    throw new DriviaApiError(502, "The DRIVIA AI service returned an invalid stream.", "provider_error");
+    throw new VeydrivoApiError(502, "The VEYDRIVO AI service returned an invalid stream.", "provider_error");
   }
 
   if (eventName === "error" || typeof payload.error === "string") {
     const message =
       typeof payload.error === "string" && payload.error.trim().length > 0
         ? payload.error
-        : "DRIVIA AI is temporarily unavailable.";
+        : "VEYDRIVO AI is temporarily unavailable.";
     const code = typeof payload.code === "string" ? payload.code : "provider_error";
-    throw new DriviaApiError(502, message, code);
+    throw new VeydrivoApiError(502, message, code);
   }
 
   const delta =
@@ -94,8 +94,8 @@ function parseSseEvent(frame: string, onDelta: (delta: string) => void): boolean
   return eventName === "done";
 }
 
-export async function streamDriviaResponse(
-  messages: DriviaMessage[],
+export async function streamVeydrivoResponse(
+  messages: VeydrivoMessage[],
   onDelta: (delta: string) => void,
   options: StreamOptions = {},
 ): Promise<void> {
@@ -123,7 +123,7 @@ export async function streamDriviaResponse(
       signal,
     });
   } catch {
-    throw new DriviaApiError(0, "The DRIVIA AI service could not be reached.");
+    throw new VeydrivoApiError(0, "The VEYDRIVO AI service could not be reached.");
   }
 
   if (!response.ok) {
@@ -132,7 +132,7 @@ export async function streamDriviaResponse(
   }
 
   if (!response.headers.get("content-type")?.includes("text/event-stream") || !response.body) {
-    throw new DriviaApiError(404, "The /api/chat endpoint did not return a response stream.");
+    throw new VeydrivoApiError(404, "The /api/chat endpoint did not return a response stream.");
   }
 
   const reader = response.body.getReader();
@@ -168,19 +168,19 @@ export async function streamDriviaResponse(
     }
   } catch (error) {
     await reader.cancel().catch(() => undefined);
-    if (error instanceof DriviaApiError) throw error;
-    throw new DriviaApiError(0, "The DRIVIA AI stream was interrupted.");
+    if (error instanceof VeydrivoApiError) throw error;
+    throw new VeydrivoApiError(0, "The VEYDRIVO AI stream was interrupted.");
   } finally {
     reader.releaseLock();
   }
 
   if (!receivedText) {
-    throw new DriviaApiError(502, "The DRIVIA AI service returned an empty response.", "empty_response");
+    throw new VeydrivoApiError(502, "The VEYDRIVO AI service returned an empty response.", "empty_response");
   }
   if (!complete) {
-    throw new DriviaApiError(
+    throw new VeydrivoApiError(
       0,
-      "La réponse IA a été interrompue avant la fin. / The DRIVIA AI stream ended before the response was complete.",
+      "La réponse IA a été interrompue avant la fin. / The VEYDRIVO AI stream ended before the response was complete.",
       "incomplete_stream",
     );
   }

@@ -1,4 +1,17 @@
-import DRIVIA_SYSTEM_PROMPT from "../server/driviaSystemPrompt.js";
+import VEYDRIVO_SYSTEM_PROMPT from "../server/veydrivoSystemPrompt.js";
+
+/**
+ * Rebrand support: VEYDRIVO_* variables are the canonical names, with a
+ * read-only fallback to the legacy DRIVIA_* names so a deployment configured
+ * before the rename keeps working without any server-side change.
+ */
+function readEnvVar(...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
 
 type ConversationMessage = {
   role: "user" | "assistant";
@@ -171,7 +184,7 @@ function admitChatRequest(request: ApiRequest, now = Date.now()): RequestAdmissi
           error: {
             status: 503,
             code: "busy",
-            message: "DRIVIA is handling many requests right now. Please retry shortly.",
+            message: "VEYDRIVO is handling many requests right now. Please retry shortly.",
             retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
           },
         };
@@ -224,7 +237,7 @@ function admitChatRequest(request: ApiRequest, now = Date.now()): RequestAdmissi
       error: {
         status: 503,
         code: "busy",
-        message: "DRIVIA is handling many requests right now. Please retry shortly.",
+        message: "VEYDRIVO is handling many requests right now. Please retry shortly.",
         retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
       },
     };
@@ -394,7 +407,7 @@ function getProviderMessages(
   task?: "garage-quote",
 ): ProviderMessage[] {
   const providerMessages: ProviderMessage[] = [
-    { role: "system", content: DRIVIA_SYSTEM_PROMPT },
+    { role: "system", content: VEYDRIVO_SYSTEM_PROMPT },
     ...messages.map((message) => ({ role: message.role, content: message.content })),
   ];
 
@@ -488,7 +501,7 @@ function classifyProviderHttpError(
       status: 502,
       code: "invalid_api_key",
       error:
-        "Clé API invalide ou rejetée par le fournisseur IA. Vérifiez DRIVIA_AI_API_KEY sur le serveur. / The AI provider rejected its API key. Check DRIVIA_AI_API_KEY on the server.",
+        "Clé API invalide ou rejetée par le fournisseur IA. Vérifiez VEYDRIVO_AI_API_KEY sur le serveur. / The AI provider rejected its API key. Check VEYDRIVO_AI_API_KEY on the server.",
     };
   }
 
@@ -501,7 +514,7 @@ function classifyProviderHttpError(
       status: 502,
       code: "model_unavailable",
       error:
-        "Le modèle IA configuré est indisponible ou introuvable. Vérifiez DRIVIA_AI_MODEL et les accès du projet. / The configured AI model is unavailable or not found. Check DRIVIA_AI_MODEL.",
+        "Le modèle IA configuré est indisponible ou introuvable. Vérifiez VEYDRIVO_AI_MODEL et les accès du projet. / The configured AI model is unavailable or not found. Check VEYDRIVO_AI_MODEL.",
     };
   }
 
@@ -516,7 +529,7 @@ function classifyProviderHttpError(
         status: 502,
         code: "model_unavailable",
         error:
-          "Ce compte ou projet n'a pas accès au modèle IA configuré. Vérifiez DRIVIA_AI_MODEL et les droits du projet. / This account or project does not have access to the configured AI model.",
+          "Ce compte ou projet n'a pas accès au modèle IA configuré. Vérifiez VEYDRIVO_AI_MODEL et les droits du projet. / This account or project does not have access to the configured AI model.",
       };
     }
     return {
@@ -622,19 +635,19 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
     return response.status(400).json({ error: "Document attachments are only supported for garage quote analysis." });
   }
 
-  const apiKey = process.env.DRIVIA_AI_API_KEY?.trim();
+  const apiKey = readEnvVar("VEYDRIVO_AI_API_KEY", "DRIVIA_AI_API_KEY");
   if (!apiKey) {
     return response.status(503).json({
       code: "missing_api_key",
-      error: "DRIVIA's AI provider is not configured. Set DRIVIA_AI_API_KEY on the server.",
+      error: "VEYDRIVO's AI provider is not configured. Set VEYDRIVO_AI_API_KEY on the server.",
     });
   }
 
-  const provider = (process.env.DRIVIA_AI_PROVIDER || "openai").trim().toLowerCase();
+  const provider = (readEnvVar("VEYDRIVO_AI_PROVIDER", "DRIVIA_AI_PROVIDER") || "openai").toLowerCase();
   if (provider !== "openai" && provider !== "gemini" && provider !== "openai-compatible") {
     return response.status(500).json({
       code: "provider_error",
-      error: "Unsupported DRIVIA_AI_PROVIDER configuration.",
+      error: "Unsupported VEYDRIVO_AI_PROVIDER configuration.",
     });
   }
 
@@ -642,9 +655,9 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
     provider === "gemini"
       ? "https://generativelanguage.googleapis.com/v1beta/openai"
       : "https://api.openai.com/v1";
-  const baseUrl = (process.env.DRIVIA_AI_BASE_URL || defaultBaseUrl).replace(/\/+$/, "");
+  const baseUrl = (readEnvVar("VEYDRIVO_AI_BASE_URL", "DRIVIA_AI_BASE_URL") || defaultBaseUrl).replace(/\/+$/, "");
   const defaultModel = provider === "gemini" ? "gemini-3.8-flash" : "gpt-4.1-mini";
-  const model = (process.env.DRIVIA_AI_MODEL || defaultModel).trim();
+  const model = (readEnvVar("VEYDRIVO_AI_MODEL", "DRIVIA_AI_MODEL") || defaultModel).trim();
   const isReasoningModel = usesReasoningParameterProfile(provider, model);
   const maxCompletionTokens = isReasoningModel
     ? attachments.length > 0
@@ -772,8 +785,8 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
         await writeEvent(response, "error", {
           code: controller.signal.aborted ? "timeout" : "incomplete_stream",
           error: controller.signal.aborted
-            ? "Le fournisseur IA a mis trop de temps à répondre. Veuillez réessayer. / DRIVIA AI took too long to respond. Please try again."
-            : "La réponse IA a été interrompue. Veuillez réessayer. / DRIVIA AI stream was interrupted. Please try again.",
+            ? "Le fournisseur IA a mis trop de temps à répondre. Veuillez réessayer. / VEYDRIVO AI took too long to respond. Please try again."
+            : "La réponse IA a été interrompue. Veuillez réessayer. / VEYDRIVO AI stream was interrupted. Please try again.",
         });
         response.end();
       } catch {
