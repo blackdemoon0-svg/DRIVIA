@@ -1,5 +1,5 @@
 /**
- * VEYDRIVO — SEO asset generator (runs as part of `npm run build`).
+ * VEYVRO — SEO asset generator (runs as part of `npm run build`).
  *
  * Why this script exists
  * ----------------------
@@ -8,7 +8,7 @@
  * Vercel Production deployment. Hard-coding one of them would silently publish a
  * wrong Sitemap/og:image URL. So the origin is resolved at build time instead:
  *
- *   1. VEYDRIVO_SITE_URL                (explicit override, wins everywhere)
+ *   1. VEYVRO_SITE_URL                (explicit override, wins everywhere)
  *   2. VERCEL_URL on preview builds   (self-consistent preview sitemap)
  *   3. VERCEL_PROJECT_PRODUCTION_URL  (the real production domain, no protocol)
  *   4. VERCEL_URL                     (any other Vercel build)
@@ -37,11 +37,15 @@ const warn = (message) => console.warn(`[generate-seo] ${message}`);
 const info = (message) => console.log(`[generate-seo] ${message}`);
 
 function resolveSiteOrigin() {
-  // Canonical name first; the legacy DRIVIA_SITE_URL is still honored so
-  // existing build pipelines keep working during the rename.
-  const explicit = process.env.VEYDRIVO_SITE_URL?.trim() || process.env.DRIVIA_SITE_URL?.trim();
+  // Canonical name first; the previous VEYDRIVO_SITE_URL and original
+  // DRIVIA_SITE_URL are still honored so existing build pipelines keep
+  // working during the rename.
+  const explicit =
+    process.env.VEYVRO_SITE_URL?.trim() ||
+    process.env.VEYDRIVO_SITE_URL?.trim() ||
+    process.env.DRIVIA_SITE_URL?.trim();
   if (explicit) {
-    return { origin: normalizeOrigin(explicit), source: "VEYDRIVO_SITE_URL" };
+    return { origin: normalizeOrigin(explicit), source: "VEYVRO_SITE_URL (or legacy SEO origin variable)" };
   }
 
   const vercelEnv = process.env.VERCEL_ENV;
@@ -100,11 +104,11 @@ function absolutizeHtmlMetaTags(html, origin) {
   // Only these two attributes carry a document-relative image path, and social
   // crawlers do not resolve relative og:image / twitter:image URLs.
   // vite-plugin-singlefile forces a relative base, so the built HTML contains
-  // "./veydrivo-hero.jpg"; the plain "/veydrivo-hero.jpg" form is matched too in
+  // "./veyvro-hero.jpg"; the plain "/veyvro-hero.jpg" form is matched too in
   // case the base config changes.
   return html.replace(
-    /content="\.?\/veydrivo-hero\.jpg"/g,
-    `content="${origin}/veydrivo-hero.jpg"`
+    /content="\.?\/veyvro-hero\.jpg"/g,
+    `content="${origin}/veyvro-hero.jpg"`
   );
 }
 
@@ -150,8 +154,8 @@ function main() {
     writeFileSync(resolve(distDir, "sitemap.xml"), buildSitemapXml(origin), "utf8");
     info(`Wrote dist/sitemap.xml for ${origin} [origin from ${source}]`);
   } else {
-    warn(`No site origin found (VEYDRIVO_SITE_URL / VERCEL_PROJECT_PRODUCTION_URL / VERCEL_URL). Skipping sitemap.xml.`);
-    warn("On Vercel this is normally set automatically; set VEYDRIVO_SITE_URL to force one.");
+    warn(`No site origin found (VEYVRO_SITE_URL / VERCEL_PROJECT_PRODUCTION_URL / VERCEL_URL). Skipping sitemap.xml.`);
+    warn("On Vercel this is normally set automatically; set VEYVRO_SITE_URL to force one.");
   }
 
   // 3. Absolute og:image / twitter:image in the built single-file HTML.
@@ -177,7 +181,7 @@ function main() {
   let after = injectCanonical(before, origin);
   if (origin) {
     after = absolutizeHtmlMetaTags(after, origin);
-    info(`Absolutized og:image / twitter:image to ${origin}/veydrivo-hero.jpg`);
+    info(`Absolutized og:image / twitter:image to ${origin}/veyvro-hero.jpg`);
   }
 
   if (after === before) {

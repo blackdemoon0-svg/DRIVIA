@@ -102,7 +102,7 @@ select:focus-visible {
   background-image:
     linear-gradient(90deg, rgba(5, 8, 12, 0.95) 0%, rgba(5, 8, 12, 0.83) 36%, rgba(5, 8, 12, 0.46) 63%, rgba(5, 8, 12, 0.16) 100%),
     linear-gradient(0deg, rgba(5, 8, 12, 0.83) 0%, rgba(5, 8, 12, 0.15) 39%, rgba(5, 8, 12, 0.34) 100%),
-    url("/veydrivo-hero.jpg");
+    url("/veyvro-hero.jpg");
   background-repeat: no-repeat;
   background-size: cover;
   background-position: center, center, 62% center;
@@ -121,7 +121,7 @@ select:focus-visible {
   background-image:
     linear-gradient(90deg, rgba(5, 8, 12, 0.94) 0%, rgba(5, 8, 12, 0.88) 42%, rgba(5, 8, 12, 0.68) 100%),
     linear-gradient(0deg, rgba(5, 8, 12, 0.9), rgba(5, 8, 12, 0.18)),
-    url("/veydrivo-hero.jpg");
+    url("/veyvro-hero.jpg");
 }
 
 .site-shell.is-chatting::after {
@@ -1753,7 +1753,7 @@ select:focus-visible {
     background-image:
       linear-gradient(90deg, rgba(5, 8, 12, 0.89) 0%, rgba(5, 8, 12, 0.74) 57%, rgba(5, 8, 12, 0.61) 100%),
       linear-gradient(0deg, rgba(5, 8, 12, 0.93) 0%, rgba(5, 8, 12, 0.5) 47%, rgba(5, 8, 12, 0.35) 100%),
-      url("/veydrivo-hero.jpg");
+      url("/veyvro-hero.jpg");
     background-size: cover;
     background-position: center, center, 67% center;
   }
@@ -1762,7 +1762,7 @@ select:focus-visible {
     background-image:
       linear-gradient(90deg, rgba(5, 8, 12, 0.9) 0%, rgba(5, 8, 12, 0.78) 100%),
       linear-gradient(0deg, rgba(5, 8, 12, 0.88), rgba(5, 8, 12, 0.38)),
-      url("/veydrivo-hero.jpg");
+      url("/veyvro-hero.jpg");
     background-position: center, center, 67% center;
   }
 

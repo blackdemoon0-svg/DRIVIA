@@ -1,4 +1,8 @@
-const endpoint = process.env.VEYDRIVO_CHAT_TEST_URL || process.env.DRIVIA_CHAT_TEST_URL || "http://localhost:3000/api/chat";
+const endpoint =
+  process.env.VEYVRO_CHAT_TEST_URL ||
+  process.env.VEYDRIVO_CHAT_TEST_URL ||
+  process.env.DRIVIA_CHAT_TEST_URL ||
+  "http://localhost:3000/api/chat";
 
 const questions = [
   {
@@ -115,7 +119,7 @@ try {
       throw new Error(`The response did not address the topic in: "${prompt}"`);
     }
     replies.push(reply);
-    console.log(`\nQ: ${prompt}\nVEYDRIVO: ${reply}`);
+    console.log(`\nQ: ${prompt}\nVEYVRO: ${reply}`);
   }
 
   const uniqueReplies = new Set(replies.map((reply) => reply.toLowerCase().replace(/\s+/g, " ")));
@@ -140,7 +144,7 @@ try {
   if (!/BMW|M3/i.test(followUp) || !/Mercedes|C\s?63|AMG/i.test(followUp)) {
     throw new Error("The follow-up response did not retain the M3 vs C63 context.");
   }
-  console.log(`\nContext check: "Is it reliable?" -> M3, then C63\nVEYDRIVO: ${followUp}`);
+  console.log(`\nContext check: "Is it reliable?" -> M3, then C63\nVEYVRO: ${followUp}`);
   console.log("\nPASS: eight different live answers and the conversation-context check succeeded.");
 } catch (error) {
   console.error(`\nFAIL: ${error instanceof Error ? error.message : "AI smoke test failed."}`);

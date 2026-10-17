@@ -86,5 +86,5 @@ const server = http.createServer(async (req, res) => {
 
 await stat(path.join(distDir, "index.html"));
 server.listen(port, "0.0.0.0", () => {
-  console.log(`VEYDRIVO local preview ready on http://0.0.0.0:${port} (static dist/ + real /api/chat handler)`);
+  console.log(`VEYVRO local preview ready on http://0.0.0.0:${port} (static dist/ + real /api/chat handler)`);
 });

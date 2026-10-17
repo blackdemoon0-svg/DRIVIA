@@ -8,8 +8,26 @@
       "maxDuration": 60
     }
   },
-  "rewrites": [
-    { "source": "/drivia-hero.jpg", "destination": "/veydrivo-hero.jpg" },
-    { "source": "/drivia-mark.svg", "destination": "/veydrivo-mark.svg" }
+  "redirects": [
+    {
+      "source": "/veydrivo-hero.jpg",
+      "destination": "/veyvro-hero.jpg",
+      "permanent": true
+    },
+    {
+      "source": "/veydrivo-mark.svg",
+      "destination": "/veyvro-mark.svg",
+      "permanent": true
+    },
+    {
+      "source": "/drivia-hero.jpg",
+      "destination": "/veyvro-hero.jpg",
+      "permanent": true
+    },
+    {
+      "source": "/drivia-mark.svg",
+      "destination": "/veyvro-mark.svg",
+      "permanent": true
+    }
   ]
 }
