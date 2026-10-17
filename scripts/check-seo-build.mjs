@@ -1,5 +1,5 @@
 /**
- * VEYDRIVO — post-build SEO / publish-readiness check.
+ * VEYVRO — post-build SEO / publish-readiness check.
  *
  * Run after `npm run build`:  node scripts/check-seo-build.mjs
  *
@@ -112,7 +112,7 @@ if (robots === null) {
 /* ---------- 6. sitemap.xml ---------- */
 if (sitemap === null) {
   console.warn("note: dist/sitemap.xml was not generated (site origin unknown at build time).");
-  console.warn("      On Vercel, VERCEL_PROJECT_PRODUCTION_URL normally provides it; or set VEYDRIVO_SITE_URL.");
+  console.warn("      On Vercel, VERCEL_PROJECT_PRODUCTION_URL normally provides it; or set VEYVRO_SITE_URL.");
 } else {
   check("dist/sitemap.xml exists", true);
   check("sitemap declares the sitemap 0.9 namespace", sitemap.includes("http://www.sitemaps.org/schemas/sitemap/0.9"));
@@ -127,20 +127,30 @@ for (const { name, re } of SECRET_PATTERNS) {
   check(`no ${name} leaked into dist/index.html`, !re.test(html));
 }
 
-/* ---------- 8. Rebrand guard (DRIVIA → VEYDRIVO) ---------- */
-check("title mentions VEYDRIVO", /veydrivo/i.test(title), `"${title}"`);
+/* ---------- 8. Brand guard (VEYVRO) ---------- */
+check("title mentions VEYVRO", /veyvro/i.test(title), `"${title}"`);
 const ogSiteName = head.match(/<meta\s+property="og:site_name"\s+content="([^"]*)"/i)?.[1] ?? "";
-check("og:site_name is VEYDRIVO", ogSiteName === "VEYDRIVO", ogSiteName || "og:site_name missing");
-check("no leftover DRIVIA brand reference in dist/index.html", !/drivia/i.test(html));
+check("og:site_name is VEYVRO", ogSiteName === "VEYVRO", ogSiteName || "og:site_name missing");
+const appName = head.match(/<meta\s+name="application-name"\s+content="([^"]*)"/i)?.[1] ?? "";
+check("application-name is VEYVRO", appName === "VEYVRO", appName || "application-name missing");
+
+// Deployment origins (canonical, og:image, sitemap) may legitimately still
+// contain the project's historical slug, so strip absolute URLs before
+// looking for leftover brand copy.
+const withoutUrls = (text) => text.replace(/https?:\/\/[^\s"'<>]+/g, "");
+check(
+  "no leftover legacy brand (DRIVIA / VEYDRIVO) in dist/index.html",
+  !/(drivia|veydrivo)/i.test(withoutUrls(html))
+);
 if (robots !== null) {
-  check("no leftover DRIVIA brand reference in robots.txt", !/drivia/i.test(robots));
+  check("no leftover legacy brand in robots.txt", !/(drivia|veydrivo)/i.test(withoutUrls(robots)));
 }
 if (sitemap !== null) {
-  check("no leftover DRIVIA brand reference in sitemap.xml", !/drivia/i.test(sitemap));
+  check("no leftover legacy brand in sitemap.xml", !/(drivia|veydrivo)/i.test(withoutUrls(sitemap)));
 }
 
 /* ---------- report ---------- */
-console.log("\nVEYDRIVO post-build SEO check");
+console.log("\nVEYVRO post-build SEO check");
 console.log("=".repeat(72));
 for (const { label, ok, detail } of results) {
   console.log(`${ok ? "PASS" : "FAIL"}  ${label}${detail ? `  [${detail}]` : ""}`);

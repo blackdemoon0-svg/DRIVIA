@@ -1,9 +1,9 @@
-export type VeydrivoMessage = {
+export type VeyvroMessage = {
   role: "user" | "assistant";
   content: string;
 };
 
-export type VeydrivoAttachment =
+export type VeyvroAttachment =
   | {
       type: "image";
       name: string;
@@ -19,7 +19,7 @@ export type VeydrivoAttachment =
 
 type StreamOptions = {
   signal?: AbortSignal;
-  attachments?: VeydrivoAttachment[];
+  attachments?: VeyvroAttachment[];
   task?: "garage-quote";
 };
 
@@ -32,18 +32,18 @@ type StreamPayload = {
   choices?: Array<{ delta?: { content?: unknown } }>;
 };
 
-export class VeydrivoApiError extends Error {
+export class VeyvroApiError extends Error {
   constructor(
     public readonly status: number,
     message: string,
     public readonly code?: string,
   ) {
     super(message);
-    this.name = "VeydrivoApiError";
+    this.name = "VeyvroApiError";
   }
 }
 
-function parseServerError(payload: unknown, status: number): VeydrivoApiError {
+function parseServerError(payload: unknown, status: number): VeyvroApiError {
   const error =
     typeof payload === "object" && payload !== null && "error" in payload
       ? (payload as { error?: unknown }).error
@@ -52,8 +52,8 @@ function parseServerError(payload: unknown, status: number): VeydrivoApiError {
     typeof payload === "object" && payload !== null && "code" in payload
       ? (payload as { code?: unknown }).code
       : null;
-  const message = typeof error === "string" ? error : "The VEYDRIVO AI service returned an error.";
-  return new VeydrivoApiError(status, message, typeof code === "string" ? code : undefined);
+  const message = typeof error === "string" ? error : "The VEYVRO AI service returned an error.";
+  return new VeyvroApiError(status, message, typeof code === "string" ? code : undefined);
 }
 
 function parseSseEvent(frame: string, onDelta: (delta: string) => void): boolean {
@@ -74,16 +74,16 @@ function parseSseEvent(frame: string, onDelta: (delta: string) => void): boolean
   try {
     payload = JSON.parse(data) as StreamPayload;
   } catch {
-    throw new VeydrivoApiError(502, "The VEYDRIVO AI service returned an invalid stream.", "provider_error");
+    throw new VeyvroApiError(502, "The VEYVRO AI service returned an invalid stream.", "provider_error");
   }
 
   if (eventName === "error" || typeof payload.error === "string") {
     const message =
       typeof payload.error === "string" && payload.error.trim().length > 0
         ? payload.error
-        : "VEYDRIVO AI is temporarily unavailable.";
+        : "VEYVRO AI is temporarily unavailable.";
     const code = typeof payload.code === "string" ? payload.code : "provider_error";
-    throw new VeydrivoApiError(502, message, code);
+    throw new VeyvroApiError(502, message, code);
   }
 
   const delta =
@@ -94,8 +94,8 @@ function parseSseEvent(frame: string, onDelta: (delta: string) => void): boolean
   return eventName === "done";
 }
 
-export async function streamVeydrivoResponse(
-  messages: VeydrivoMessage[],
+export async function streamVeyvroResponse(
+  messages: VeyvroMessage[],
   onDelta: (delta: string) => void,
   options: StreamOptions = {},
 ): Promise<void> {
@@ -123,7 +123,7 @@ export async function streamVeydrivoResponse(
       signal,
     });
   } catch {
-    throw new VeydrivoApiError(0, "The VEYDRIVO AI service could not be reached.");
+    throw new VeyvroApiError(0, "The VEYVRO AI service could not be reached.");
   }
 
   if (!response.ok) {
@@ -132,7 +132,7 @@ export async function streamVeydrivoResponse(
   }
 
   if (!response.headers.get("content-type")?.includes("text/event-stream") || !response.body) {
-    throw new VeydrivoApiError(404, "The /api/chat endpoint did not return a response stream.");
+    throw new VeyvroApiError(404, "The /api/chat endpoint did not return a response stream.");
   }
 
   const reader = response.body.getReader();
@@ -168,19 +168,19 @@ export async function streamVeydrivoResponse(
     }
   } catch (error) {
     await reader.cancel().catch(() => undefined);
-    if (error instanceof VeydrivoApiError) throw error;
-    throw new VeydrivoApiError(0, "The VEYDRIVO AI stream was interrupted.");
+    if (error instanceof VeyvroApiError) throw error;
+    throw new VeyvroApiError(0, "The VEYVRO AI stream was interrupted.");
   } finally {
     reader.releaseLock();
   }
 
   if (!receivedText) {
-    throw new VeydrivoApiError(502, "The VEYDRIVO AI service returned an empty response.", "empty_response");
+    throw new VeyvroApiError(502, "The VEYVRO AI service returned an empty response.", "empty_response");
   }
   if (!complete) {
-    throw new VeydrivoApiError(
+    throw new VeyvroApiError(
       0,
-      "La réponse IA a été interrompue avant la fin. / The VEYDRIVO AI stream ended before the response was complete.",
+      "La réponse IA a été interrompue avant la fin. / The VEYVRO AI stream ended before the response was complete.",
       "incomplete_stream",
     );
   }

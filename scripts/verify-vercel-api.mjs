@@ -1,7 +1,10 @@
-const deploymentUrl = process.env.VEYDRIVO_DEPLOYMENT_URL || process.env.DRIVIA_DEPLOYMENT_URL;
+const deploymentUrl =
+  process.env.VEYVRO_DEPLOYMENT_URL ||
+  process.env.VEYDRIVO_DEPLOYMENT_URL ||
+  process.env.DRIVIA_DEPLOYMENT_URL;
 
 if (!deploymentUrl) {
-  console.error("Set VEYDRIVO_DEPLOYMENT_URL to a reachable Vercel deployment URL.");
+  console.error("Set VEYVRO_DEPLOYMENT_URL to a reachable Vercel deployment URL.");
   console.error("This check sends GET /api/chat and does not call the AI provider or require an API key.");
   process.exit(1);
 }
@@ -34,7 +37,7 @@ try {
     contentType.includes("application/json") &&
     payload?.error === "Only POST requests are supported."
   ) {
-    console.log(`PASS: ${endpoint} is handled by the VEYDRIVO serverless function.`);
+    console.log(`PASS: ${endpoint} is handled by the VEYVRO serverless function.`);
     console.log("The 405 response is expected for GET; POST requests continue to the configured AI provider.");
     process.exit(0);
   }
