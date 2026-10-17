@@ -9,11 +9,11 @@ import {
   type RefObject,
 } from "react";
 import {
-  DriviaApiError,
-  streamDriviaResponse,
-  type DriviaAttachment,
-  type DriviaMessage,
-} from "./lib/driviaApi";
+  VeydrivoApiError,
+  streamVeydrivoResponse,
+  type VeydrivoAttachment,
+  type VeydrivoMessage,
+} from "./lib/veydrivoApi";
 import { prepareQuoteDocument } from "./lib/quoteDocument";
 
 type View = "ai" | "battle";
@@ -168,7 +168,7 @@ function BrandMark({ small = false }: { small?: boolean }) {
     >
       <path d="M8 5.5h8a10.5 10.5 0 1 1-9.1 5.3" />
       <path d="M6 4.5v7h7" />
-      <path className="brand-mark-accent" d="M13 11.5h3.2a4.5 4.5 0 0 1 0 9H13" />
+      <path className="brand-mark-accent" d="M12.4 11.5 16 20.5 19.6 11.5" />
     </svg>
   );
 }
@@ -231,19 +231,19 @@ function Composer({
 }: ComposerProps) {
   return (
     <form className={`composer composer-${variant}`} onSubmit={onSubmit}>
-      <label className="sr-only" htmlFor={`drivia-prompt-${variant}`}>
-        {variant === "hero" ? "Posez votre question à DRIVIA" : "Ask DRIVIA anything about cars"}
+      <label className="sr-only" htmlFor={`veydrivo-prompt-${variant}`}>
+        {variant === "hero" ? "Posez votre question à VEYDRIVO" : "Ask VEYDRIVO anything about cars"}
       </label>
       <textarea
-        id={`drivia-prompt-${variant}`}
+        id={`veydrivo-prompt-${variant}`}
         ref={textareaRef}
         rows={1}
         maxLength={2000}
-        placeholder={variant === "hero" ? "Posez votre question à DRIVIA..." : "Ask DRIVIA anything about cars..."}
+        placeholder={variant === "hero" ? "Posez votre question à VEYDRIVO..." : "Ask VEYDRIVO anything about cars..."}
         value={value}
         onChange={onChange}
         onKeyDown={onKeyDown}
-        aria-label={variant === "hero" ? "Posez votre question à DRIVIA" : "Ask DRIVIA anything about cars"}
+        aria-label={variant === "hero" ? "Posez votre question à VEYDRIVO" : "Ask VEYDRIVO anything about cars"}
       />
       <div className="composer-controls">
         <span className="composer-hint">
@@ -252,7 +252,7 @@ function Composer({
               Appuyez sur <kbd>Entrée</kbd> pour envoyer <span className="hint-divider">·</span> Maj + Entrée pour un retour à la ligne
             </>
           ) : (
-            "DRIVIA can make mistakes. Verify important details."
+            "VEYDRIVO can make mistakes. Verify important details."
           )}
         </span>
         <button
@@ -270,12 +270,12 @@ function Composer({
 
 function LoadingMessage() {
   return (
-    <div className="assistant-turn loading-turn" role="status" aria-label="DRIVIA is thinking">
+    <div className="assistant-turn loading-turn" role="status" aria-label="VEYDRIVO is thinking">
       <div className="assistant-avatar">
         <BrandMark small />
       </div>
       <div className="assistant-message-content">
-        <div className="assistant-name">DRIVIA</div>
+        <div className="assistant-name">VEYDRIVO</div>
         <div className="thinking-label">is thinking...</div>
         <div className="typing-dots" aria-hidden="true">
           <span />
@@ -287,7 +287,7 @@ function LoadingMessage() {
   );
 }
 
-function ChatMessage({ message, isStreaming = false }: { message: DriviaMessage; isStreaming?: boolean }) {
+function ChatMessage({ message, isStreaming = false }: { message: VeydrivoMessage; isStreaming?: boolean }) {
   if (message.role === "user") {
     return (
       <article className="user-turn">
@@ -302,7 +302,7 @@ function ChatMessage({ message, isStreaming = false }: { message: DriviaMessage;
         <BrandMark small />
       </div>
       <div className="assistant-message-content">
-        <div className="assistant-name">DRIVIA</div>
+        <div className="assistant-name">VEYDRIVO</div>
         <AssistantText content={message.content} />
         {isStreaming && <span className="stream-cursor" aria-hidden="true" />}
       </div>
@@ -377,7 +377,7 @@ function BattleMode() {
     <main className="battle-stage" id="battle">
       <div className="battle-intro">
         <p className="eyebrow"><span className="eyebrow-dot" /> THE COMPARISON, CLEARED UP</p>
-        <h1>DRIVIA <span>Battle</span></h1>
+        <h1>VEYDRIVO <span>Battle</span></h1>
         <p className="battle-subtitle">Two cars. Every detail that matters.</p>
       </div>
 
@@ -516,7 +516,7 @@ function AboutDialog({ onClose }: { onClose: () => void }) {
         <p className="eyebrow">BUILT FOR THE WAY YOU DRIVE</p>
         <h2 id="about-title">Cars, made clearer.</h2>
         <p className="about-copy">
-          DRIVIA is an AI automotive companion for curious drivers. Ask a question in your own words and get a clear, useful answer, without the noise.
+          VEYDRIVO is an AI automotive companion for curious drivers. Ask a question in your own words and get a clear, useful answer, without the noise.
         </p>
         <div className="about-divider" />
         <p className="about-footnote">
@@ -538,7 +538,7 @@ function QuoteUploadDialog({
   onAnalyze,
 }: {
   onClose: () => void;
-  onAnalyze: (file: File, attachments: DriviaAttachment[]) => void;
+  onAnalyze: (file: File, attachments: VeydrivoAttachment[]) => void;
 }) {
   const [file, setFile] = useState<File | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
@@ -689,7 +689,7 @@ function QuoteUploadDialog({
 
         <div className="quote-safety-note">
           <span className="quote-safety-mark" aria-hidden="true">i</span>
-          <p>Le document est transmis au fournisseur IA configuré. DRIVIA fournit une aide à la lecture, pas un diagnostic professionnel; vérifiez les données personnelles avant l'envoi. Les incertitudes seront signalées.</p>
+          <p>Le document est transmis au fournisseur IA configuré. VEYDRIVO fournit une aide à la lecture, pas un diagnostic professionnel; vérifiez les données personnelles avant l'envoi. Les incertitudes seront signalées.</p>
         </div>
 
         <button className="quote-analyze-button" type="button" disabled={!file || isPreparing} onClick={handleAnalyze}>
@@ -703,7 +703,7 @@ function QuoteUploadDialog({
 
 export default function App() {
   const [view, setView] = useState<View>("ai");
-  const [messages, setMessages] = useState<DriviaMessage[]>([]);
+  const [messages, setMessages] = useState<VeydrivoMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
@@ -741,7 +741,7 @@ export default function App() {
   };
 
   const formatChatError = (error: unknown, isQuoteAnalysis: boolean): string => {
-    if (error instanceof DriviaApiError) {
+    if (error instanceof VeydrivoApiError) {
       const code = error.code;
 
       if (error.status === 413) {
@@ -749,17 +749,17 @@ export default function App() {
       }
       if (code === "missing_api_key" || (error.status === 503 && error.message.toLowerCase().includes("not configured"))) {
         return isQuoteAnalysis
-          ? "L'IA DRIVIA n'est pas configurée sur le serveur (DRIVIA_AI_API_KEY manquante). / DRIVIA AI is not configured on the server (set DRIVIA_AI_API_KEY)."
-          : "L'IA DRIVIA n'est pas configurée : définissez DRIVIA_AI_API_KEY sur le serveur et déployez api/chat.ts. / DRIVIA AI is not configured: set DRIVIA_AI_API_KEY as a server environment variable and deploy api/chat.ts.";
+          ? "L'IA VEYDRIVO n'est pas configurée sur le serveur (VEYDRIVO_AI_API_KEY manquante). / VEYDRIVO AI is not configured on the server (set VEYDRIVO_AI_API_KEY)."
+          : "L'IA VEYDRIVO n'est pas configurée : définissez VEYDRIVO_AI_API_KEY sur le serveur et déployez api/chat.ts. / VEYDRIVO AI is not configured: set VEYDRIVO_AI_API_KEY as a server environment variable and deploy api/chat.ts.";
       }
       if (code === "invalid_api_key") {
-        return "Clé API invalide ou rejetée par le fournisseur IA. Vérifiez DRIVIA_AI_API_KEY sur le serveur. / Invalid API key rejected by the AI provider. Check DRIVIA_AI_API_KEY on the server.";
+        return "Clé API invalide ou rejetée par le fournisseur IA. Vérifiez VEYDRIVO_AI_API_KEY sur le serveur. / Invalid API key rejected by the AI provider. Check VEYDRIVO_AI_API_KEY on the server.";
       }
       if (code === "access_denied") {
         return "Accès refusé par le fournisseur IA. Vérifiez les permissions de la clé API et du projet. / Access denied by the AI provider. Check API key and project permissions.";
       }
       if (code === "model_unavailable") {
-        return "Le modèle IA configuré est indisponible ou non autorisé pour ce compte. Vérifiez DRIVIA_AI_MODEL. / The configured AI model is unavailable or not enabled for this account. Check DRIVIA_AI_MODEL.";
+        return "Le modèle IA configuré est indisponible ou non autorisé pour ce compte. Vérifiez VEYDRIVO_AI_MODEL. / The configured AI model is unavailable or not enabled for this account. Check VEYDRIVO_AI_MODEL.";
       }
       if (code === "insufficient_quota") {
         return "Quota API insuffisant ou facturation non activée sur le compte du fournisseur IA. / Insufficient API quota or inactive billing on the AI provider account.";
@@ -768,7 +768,7 @@ export default function App() {
         return "Trop de requêtes envoyées (limite de débit atteinte). Patientez quelques instants avant de réessayer. / Rate limit reached. Please wait a moment before trying again.";
       }
       if (error.status === 503 || code === "busy") {
-        return "Le service DRIVIA traite actuellement de nombreuses demandes. Réessayez dans quelques secondes. / DRIVIA's chat service is handling many requests right now. Please try again shortly.";
+        return "Le service VEYDRIVO traite actuellement de nombreuses demandes. Réessayez dans quelques secondes. / VEYDRIVO's chat service is handling many requests right now. Please try again shortly.";
       }
       if (code === "timeout" || error.status === 504) {
         return "Le fournisseur IA a mis trop de temps à répondre. Veuillez réessayer. / The AI provider took too long to respond. Please try again.";
@@ -780,7 +780,7 @@ export default function App() {
         return "Le fournisseur IA a renvoyé une réponse vide. Veuillez réessayer. / The AI provider returned an empty response. Please try again.";
       }
       if (error.status === 404) {
-        return "La fonction serveur /api/chat est indisponible. Déployez la racine du dépôt sur Vercel avec vercel.json. / DRIVIA's /api/chat function is unavailable. Deploy the repository root to Vercel with vercel.json.";
+        return "La fonction serveur /api/chat est indisponible. Déployez la racine du dépôt sur Vercel avec vercel.json. / VEYDRIVO's /api/chat function is unavailable. Deploy the repository root to Vercel with vercel.json.";
       }
       if (error.status === 0) {
         return "Le service /api/chat est injoignable. Vérifiez votre connexion ou que le serveur est démarré. / The /api/chat server could not be reached. Check your connection or make sure the server is running.";
@@ -788,13 +788,13 @@ export default function App() {
     }
 
     return isQuoteAnalysis
-      ? "DRIVIA n'a pas pu analyser ce document (erreur serveur du fournisseur IA). Réessayez plus tard. / DRIVIA could not analyze this document due to an AI provider server error."
+      ? "VEYDRIVO n'a pas pu analyser ce document (erreur serveur du fournisseur IA). Réessayez plus tard. / VEYDRIVO could not analyze this document due to an AI provider server error."
       : "Erreur serveur du fournisseur IA. Vérifiez la configuration serveur (fournisseur, modèle, clé API) et réessayez. / AI provider server error. Check the server-side provider, model and API key settings, then try again.";
   };
 
   const runConversation = async (
-    conversation: DriviaMessage[],
-    options: { attachments?: DriviaAttachment[]; task?: "garage-quote" } = {},
+    conversation: VeydrivoMessage[],
+    options: { attachments?: VeydrivoAttachment[]; task?: "garage-quote" } = {},
   ) => {
     const isQuoteAnalysis = options.task === "garage-quote";
     setQuoteRetryAvailable(false);
@@ -806,7 +806,7 @@ export default function App() {
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
     try {
-      await streamDriviaResponse(
+      await streamVeydrivoResponse(
         conversation,
         (delta) => {
           setMessages((current) => {
@@ -841,10 +841,10 @@ export default function App() {
     await runConversation([...messages, { role: "user", content }]);
   };
 
-  const handleQuoteAnalysis = (file: File, attachments: DriviaAttachment[]) => {
+  const handleQuoteAnalysis = (file: File, attachments: VeydrivoAttachment[]) => {
     if (isLoading) return;
     setQuoteDialogOpen(false);
-    const userMessage: DriviaMessage = {
+    const userMessage: VeydrivoMessage = {
       role: "user",
       content: `Analyser mon devis de garage : ${file.name}`,
     };
@@ -873,9 +873,9 @@ export default function App() {
   return (
     <div className={`site-shell${isChatting ? " is-chatting" : ""}`}>
       <header className="site-header">
-        <button className="brand-button" type="button" aria-label="DRIVIA home" onClick={showAI}>
+        <button className="brand-button" type="button" aria-label="VEYDRIVO home" onClick={showAI}>
           <BrandMark />
-          <span>DRIVIA</span>
+          <span>VEYDRIVO</span>
         </button>
 
         <nav className="main-nav" aria-label="Main navigation">
@@ -913,7 +913,7 @@ export default function App() {
           onAnalyze={handleQuoteAnalysis}
         />
       ) : isChatting ? (
-        <main className="chat-stage" aria-label="DRIVIA conversation">
+        <main className="chat-stage" aria-label="VEYDRIVO conversation">
           <div className="conversation-scroll">
             {messages.map((message, index) => {
               if (message.role === "assistant" && !message.content) return null;
@@ -953,10 +953,10 @@ export default function App() {
       ) : (
         <main className="hero-stage" id="ai">
           <div className="hero-content">
-            <p className="eyebrow hero-eyebrow"><span className="eyebrow-dot" /> VOTRE COMPAGNON AUTOMOBILE AU QUOTIDIEN</p>
-            <h1 className="hero-brand">DRIVIA<span>.</span></h1>
+            <p className="eyebrow hero-eyebrow"><span className="eyebrow-dot" /> VOTRE INTELLIGENCE ARTIFICIELLE AUTOMOBILE</p>
+            <h1 className="hero-brand">VEYDRIVO<span>.</span></h1>
             <h2 className="hero-statement">L'automobile, en toute clarté.</h2>
-            <p className="hero-description">Un devis de garage, un voyant ou une voiture à vérifier ? Choisissez un point de départ ou échangez directement avec DRIVIA.</p>
+            <p className="hero-description">Un devis de garage, un voyant ou une voiture à vérifier ? Choisissez un point de départ ou échangez directement avec VEYDRIVO, votre IA dédiée à l'automobile.</p>
 
             <section className="home-action-section" aria-labelledby="home-action-title">
               <div className="home-action-heading">
@@ -993,10 +993,10 @@ export default function App() {
             <div className="home-chat-choice">
               <div className="home-chat-copy">
                 <span className="home-chat-title">Une question plus générale ?</span>
-                <span className="home-chat-description">Discutez librement avec DRIVIA.</span>
+                <span className="home-chat-description">Discutez librement avec VEYDRIVO.</span>
               </div>
               <button className="home-chat-button" type="button" onClick={openChat}>
-                Parler à DRIVIA <ArrowIcon diagonal />
+                Parler à VEYDRIVO <ArrowIcon diagonal />
               </button>
             </div>
 

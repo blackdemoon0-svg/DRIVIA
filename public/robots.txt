@@ -1,4 +1,4 @@
-# DRIVIA — crawler policy
+# VEYDRIVO — crawler policy
 # This file is the static fallback shipped with the source tree.
 # `npm run build` regenerates dist/robots.txt with an absolute Sitemap line
 # when the site origin is known (see scripts/generate-seo.mjs).

@@ -7,5 +7,9 @@
     "api/chat.ts": {
       "maxDuration": 60
     }
-  }
+  },
+  "rewrites": [
+    { "source": "/drivia-hero.jpg", "destination": "/veydrivo-hero.jpg" },
+    { "source": "/drivia-mark.svg", "destination": "/veydrivo-mark.svg" }
+  ]
 }

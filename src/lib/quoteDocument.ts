@@ -1,6 +1,6 @@
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import type { DriviaAttachment } from "./driviaApi";
+import type { VeydrivoAttachment } from "./veydrivoApi";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -110,7 +110,7 @@ async function loadImage(file: File) {
   };
 }
 
-async function prepareImage(file: File, name = file.name, maxCharacters = MAX_PHOTO_DATA_URL_CHARACTERS): Promise<DriviaAttachment> {
+async function prepareImage(file: File, name = file.name, maxCharacters = MAX_PHOTO_DATA_URL_CHARACTERS): Promise<VeydrivoAttachment> {
   let image: Awaited<ReturnType<typeof loadImage>> | undefined;
   try {
     image = await loadImage(file);
@@ -166,7 +166,7 @@ async function renderPdfPageAsImage(pdf: Awaited<ReturnType<typeof getDocument>[
   return dataUrl;
 }
 
-async function preparePdf(file: File): Promise<DriviaAttachment[]> {
+async function preparePdf(file: File): Promise<VeydrivoAttachment[]> {
   let loadingTask: ReturnType<typeof getDocument> | undefined;
   let pdf: Awaited<ReturnType<typeof getDocument>["promise"]> | undefined;
   try {
@@ -221,7 +221,7 @@ async function preparePdf(file: File): Promise<DriviaAttachment[]> {
     const renderedPageNumbers = candidatePages.slice(0, MAX_SCANNED_PDF_PAGES);
     const omittedPageCount = candidatePages.length - renderedPageNumbers.length;
     const wasTruncated = extractedText.length > MAX_EXTRACTED_TEXT_CHARACTERS;
-    const attachments: DriviaAttachment[] = [
+    const attachments: VeydrivoAttachment[] = [
       {
         type: "text",
         name: file.name,
@@ -259,11 +259,11 @@ async function preparePdf(file: File): Promise<DriviaAttachment[]> {
   }
 }
 
-export async function prepareQuoteDocument(file: File): Promise<DriviaAttachment[]> {
+export async function prepareQuoteDocument(file: File): Promise<VeydrivoAttachment[]> {
   if (file.size === 0) throw new Error("Le fichier sélectionné est vide.");
   if (file.size > MAX_UPLOAD_BYTES) throw new Error("Le fichier dépasse la limite de 12 Mo.");
 
-  let attachments: DriviaAttachment[];
+  let attachments: VeydrivoAttachment[];
   if (isPdfFile(file)) {
     attachments = await preparePdf(file);
   } else if (isSupportedImage(file)) {
