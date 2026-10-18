@@ -7,7 +7,7 @@ VEYVRO is an independent, responsive automotive AI experience built with React, 
 The product's official name is now **VEYVRO**. It launched as DRIVIA, was renamed VEYDRIVO, and is now VEYVRO. Routes, the `/api/chat` endpoint, behavior and features are unchanged: only the public brand identity, UI copy, SEO/PWA metadata, logo and asset file names moved. To keep deployments working through the rename:
 
 - Server environment variables are now named `VEYVRO_AI_*`. For zero-downtime migrations the handler still reads the previous `VEYDRIVO_AI_*` names and the original `DRIVIA_AI_*` names as read-only fallbacks. Rename the Vercel variables at your own pace; until then the existing configuration keeps working.
-- `VEYVRO_SITE_URL` is the canonical SEO origin override. The older `VEYDRIVO_SITE_URL` and `DRIVIA_SITE_URL` names are still honored, in that order.
+- `VEYVRO_SITE_URL` is the only supported explicit SEO origin override. The old brand SEO variables are deliberately not read: a stale migration value must not publish an obsolete public URL.
 - Public assets are now `/veyvro-hero.jpg` and `/veyvro-mark.svg`. Legacy asset URLs `/veydrivo-hero.jpg`, `/veydrivo-mark.svg`, `/drivia-hero.jpg` and `/drivia-mark.svg` are permanently redirected to the new files in `vercel.json`, so previously shared og:image links keep resolving.
 - Frontend symbols follow the brand: `VeyvroApiError`, `streamVeyvroResponse`, `VeyvroMessage` and `VeyvroAttachment` live in `src/lib/veyvroApi.ts`, and the assistant prompt is `server/veyvroSystemPrompt.ts`. The `/api/chat` request/response contract is unchanged.
 
@@ -72,16 +72,21 @@ with `EISDIR: illegal operation on a directory`. The canonical tag is injected i
 - `sitemap.xml` — one entry for the homepage, with an absolute `<loc>`.
 - absolute `og:image` / `twitter:image` URLs and the `<link rel="canonical">` tag.
 
-The site origin is resolved at build time so no domain is ever hard-coded or guessed:
+The site origin is resolved at build time with an explicit production safeguard:
 
-1. `VEYVRO_SITE_URL` (explicit override, wins everywhere)
-2. `VERCEL_URL` on preview builds
-3. `VERCEL_PROJECT_PRODUCTION_URL` (Vercel's production domain)
-4. `VERCEL_URL`
+1. `VERCEL_URL` on Vercel Preview builds, so Preview describes itself.
+2. `VEYVRO_SITE_URL` when set — configure it in Vercel for **Production only** as
+   `https://www.veyvro.dev`.
+3. `https://www.veyvro.dev` for Vercel Production when that override is absent.
+4. `VERCEL_URL` for another non-production Vercel build.
+
+`VERCEL_PROJECT_PRODUCTION_URL` is intentionally not used for public SEO: it can be the
+project's `.vercel.app` alias rather than its custom domain. This avoids publishing that
+internal alias in the sitemap, `robots.txt`, canonical URL, or Open Graph/Twitter image URLs.
 
 When no origin is available (a plain local build) the script writes the relative canonical,
-leaves `og:image` relative, skips `sitemap.xml` and omits the `Sitemap:` line, so a wrong URL
-is never published. Nothing in this step can fail the build.
+leaves `og:image` relative, skips `sitemap.xml` and omits the `Sitemap:` line. Nothing in this
+step can fail the build.
 
 ### Verifying a deployment
 

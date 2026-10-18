@@ -5,13 +5,15 @@
  * ----------------------
  * `robots.txt` and `sitemap.xml` must contain an *absolute* site origin, but the
  * origin differs between a local build, a Vercel Preview deployment and the
- * Vercel Production deployment. Hard-coding one of them would silently publish a
- * wrong Sitemap/og:image URL. So the origin is resolved at build time instead:
+ * Vercel Production deployment. Vercel's `VERCEL_PROJECT_PRODUCTION_URL` can be
+ * the project's `.vercel.app` alias rather than its public custom domain, so it
+ * must never be used for VEYVRO's production-facing crawl assets. The origin is
+ * resolved at build time instead:
  *
- *   1. VEYVRO_SITE_URL                (explicit override, wins everywhere)
- *   2. VERCEL_URL on preview builds   (self-consistent preview sitemap)
- *   3. VERCEL_PROJECT_PRODUCTION_URL  (the real production domain, no protocol)
- *   4. VERCEL_URL                     (any other Vercel build)
+ *   1. VERCEL_URL on preview builds   (self-consistent preview sitemap)
+ *   2. VEYVRO_SITE_URL                (explicit production override)
+ *   3. https://www.veyvro.dev         (VEYVRO's production canonical origin)
+ *   4. VERCEL_URL                     (other non-production Vercel builds)
  *
  * When no origin can be determined the script stays quiet about absolute URLs:
  * the static `public/robots.txt` fallback is left untouched and no sitemap is
@@ -36,28 +38,43 @@ const VERIFICATION_TAG =
 const warn = (message) => console.warn(`[generate-seo] ${message}`);
 const info = (message) => console.log(`[generate-seo] ${message}`);
 
-function resolveSiteOrigin() {
-  // Canonical name first; the previous VEYDRIVO_SITE_URL and original
-  // DRIVIA_SITE_URL are still honored so existing build pipelines keep
-  // working during the rename.
-  const explicit =
-    process.env.VEYVRO_SITE_URL?.trim() ||
-    process.env.VEYDRIVO_SITE_URL?.trim() ||
-    process.env.DRIVIA_SITE_URL?.trim();
-  if (explicit) {
-    return { origin: normalizeOrigin(explicit), source: "VEYVRO_SITE_URL (or legacy SEO origin variable)" };
-  }
+// This is the only public production origin for the VEYVRO project. Keeping a
+// safe default here prevents Vercel's internal `.vercel.app` alias from leaking
+// into crawl assets when a custom domain is attached after the first deployment.
+const PRODUCTION_CANONICAL_ORIGIN = "https://www.veyvro.dev";
 
+function resolveSiteOrigin() {
   const vercelEnv = process.env.VERCEL_ENV;
   const vercelUrl = process.env.VERCEL_URL?.trim();
-  const productionUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL?.trim();
 
+  // A Preview URL must describe the preview itself. `VEYVRO_SITE_URL` should be
+  // configured for Production only, but this order is defensive if it is ever
+  // accidentally made available to Preview too.
   if (vercelEnv === "preview" && vercelUrl) {
     return { origin: normalizeOrigin(vercelUrl), source: "VERCEL_URL (preview)" };
   }
-  if (productionUrl) {
-    return { origin: normalizeOrigin(productionUrl), source: "VERCEL_PROJECT_PRODUCTION_URL" };
+
+  // `VEYVRO_SITE_URL` is the only supported explicit SEO origin variable. Do
+  // not reuse the former brand variables here: a stale migration value must not
+  // be able to publish an obsolete public URL.
+  const explicit = process.env.VEYVRO_SITE_URL?.trim();
+  if (explicit) {
+    const origin = normalizeOrigin(explicit);
+    if (origin && (vercelEnv !== "production" || origin === PRODUCTION_CANONICAL_ORIGIN)) {
+      return { origin, source: "VEYVRO_SITE_URL" };
+    }
+    if (origin) {
+      warn(`Ignoring a non-canonical VEYVRO_SITE_URL in Production; expected ${PRODUCTION_CANONICAL_ORIGIN}.`);
+    }
   }
+
+  // VERCEL_PROJECT_PRODUCTION_URL intentionally is not a fallback here. For
+  // this project it can resolve to `drivia-ruddy.vercel.app`, which is a Vercel
+  // alias rather than the canonical public host.
+  if (vercelEnv === "production") {
+    return { origin: PRODUCTION_CANONICAL_ORIGIN, source: "VEYVRO production canonical origin" };
+  }
+
   if (vercelUrl) {
     return { origin: normalizeOrigin(vercelUrl), source: "VERCEL_URL" };
   }
@@ -154,8 +171,8 @@ function main() {
     writeFileSync(resolve(distDir, "sitemap.xml"), buildSitemapXml(origin), "utf8");
     info(`Wrote dist/sitemap.xml for ${origin} [origin from ${source}]`);
   } else {
-    warn(`No site origin found (VEYVRO_SITE_URL / VERCEL_PROJECT_PRODUCTION_URL / VERCEL_URL). Skipping sitemap.xml.`);
-    warn("On Vercel this is normally set automatically; set VEYVRO_SITE_URL to force one.");
+    warn(`No site origin found (VEYVRO_SITE_URL / VERCEL_URL). Skipping sitemap.xml.`);
+    warn("For a custom production origin, set VEYVRO_SITE_URL explicitly in Vercel.");
   }
 
   // 3. Absolute og:image / twitter:image in the built single-file HTML.
