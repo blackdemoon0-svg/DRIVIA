@@ -14,6 +14,14 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const distDir = resolve(__dirname, "..", "dist");
 
+const PRODUCTION_CANONICAL_ORIGIN = "https://www.veyvro.dev";
+
+// This mirrors scripts/generate-seo.mjs: Production must never inherit the
+// project's internal `.vercel.app` alias as its public canonical domain, and
+// its only permitted public host is the VEYVRO primary domain.
+const expectedProductionOrigin =
+  process.env.VERCEL_ENV === "production" ? PRODUCTION_CANONICAL_ORIGIN : null;
+
 const VERIFICATION_TAG =
   '<meta name="google-site-verification" content="Q9IY-30MOLsIMVPW3h8IKngR6DfnOZYC8vP09WKBwcY" />';
 
@@ -72,7 +80,19 @@ check(
 );
 
 const canonicals = head.match(/<link\s+rel="canonical"\s+href="([^"]*)"/gi) || [];
+const canonicalHref = head.match(/<link\s+rel="canonical"\s+href="([^"]*)"/i)?.[1] ?? "";
 check("exactly one canonical link in <head>", canonicals.length === 1, `found: ${canonicals.length}`);
+if (expectedProductionOrigin) {
+  check(
+    "production canonical uses the VEYVRO public origin",
+    canonicalHref === `${expectedProductionOrigin}/`,
+    canonicalHref || "canonical missing"
+  );
+  check(
+    "production <head> contains no Vercel deployment URL",
+    !/https?:\/\/[^\s"'<>]*\.vercel\.app(?:[\s"'<>/]|$)/i.test(head)
+  );
+}
 
 /* ---------- 3. Title / description / language ---------- */
 const title = head.match(/<title>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? "";
@@ -104,6 +124,14 @@ if (robots === null) {
   const sitemapLine = robots.match(/^Sitemap:\s*(\S+)\s*$/im);
   if (sitemapLine) {
     check("robots.txt Sitemap URL is absolute https", /^https:\/\/\S+\/sitemap\.xml$/.test(sitemapLine[1]), sitemapLine[1]);
+    if (expectedProductionOrigin) {
+      check(
+        "production robots.txt points to the VEYVRO sitemap",
+        sitemapLine[1] === `${expectedProductionOrigin}/sitemap.xml`,
+        sitemapLine[1]
+      );
+      check("production robots.txt contains no Vercel deployment URL", !/\.vercel\.app/i.test(robots));
+    }
   } else {
     console.warn("note: robots.txt has no Sitemap line (site origin was unknown at build time).");
   }
@@ -112,7 +140,7 @@ if (robots === null) {
 /* ---------- 6. sitemap.xml ---------- */
 if (sitemap === null) {
   console.warn("note: dist/sitemap.xml was not generated (site origin unknown at build time).");
-  console.warn("      On Vercel, VERCEL_PROJECT_PRODUCTION_URL normally provides it; or set VEYVRO_SITE_URL.");
+  console.warn("      On Vercel Production, the canonical origin is https://www.veyvro.dev; otherwise set VEYVRO_SITE_URL.");
 } else {
   check("dist/sitemap.xml exists", true);
   check("sitemap declares the sitemap 0.9 namespace", sitemap.includes("http://www.sitemaps.org/schemas/sitemap/0.9"));
@@ -120,6 +148,14 @@ if (sitemap === null) {
   check("sitemap has at least one <loc>", locs.length >= 1, `locs: ${locs.length}`);
   check("every sitemap <loc> is an absolute https URL", locs.every((l) => /^https:\/\/[^/]+\/?$/.test(l)), locs.join(", "));
   check("sitemap <url> count matches <loc> count", (sitemap.match(/<url>/g) || []).length === locs.length);
+  if (expectedProductionOrigin) {
+    check(
+      "every production sitemap URL uses the VEYVRO public origin",
+      locs.every((l) => l === `${expectedProductionOrigin}/`),
+      locs.join(", ")
+    );
+    check("production sitemap contains no Vercel deployment URL", !/\.vercel\.app/i.test(sitemap));
+  }
 }
 
 /* ---------- 7. No secrets in the public bundle ---------- */
