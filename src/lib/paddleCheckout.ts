@@ -5,10 +5,18 @@
  * server route, no secret in the bundle. Default environment is sandbox
  * (see `paddleCore.normalizeEnvironment`), so a Preview can never take a live
  * payment by accident.
+ *
+ * Before opening the checkout, the selected price ID is sent to Paddle's
+ * `PricePreview` endpoint: currency and amount must match the announced price
+ * exactly, otherwise the checkout is refused. That is what guarantees a button
+ * is wired to the price ID of *its own* plan and billing interval.
  */
 import {
   PaddleConfigError,
+  PAID_PLAN_IDS,
+  BILLING_INTERVALS,
   classifyCheckoutError,
+  evaluatePricePreview,
   getPriceId,
   priceKeyFor,
   resolvePaddleConfig,
@@ -17,6 +25,8 @@ import {
   type PaddleConfig,
   type PaddleConfigOverrides,
   type PaidPlanId,
+  type PriceExpectation,
+  type PricePreviewVerdict,
 } from "./paddleCore";
 
 const PADDLE_SCRIPT_ID = "veyvro-paddle-js";
@@ -32,6 +42,7 @@ type PaddleGlobal = {
   Environment: { set: (environment: "sandbox" | "production") => void };
   Initialize: (options: { token: string; eventCallback?: (event: PaddleEvent) => void }) => void;
   Checkout: { open: (options: Record<string, unknown>) => void };
+  PricePreview: (options: { items: Array<{ priceId: string; quantity: number }> }) => Promise<unknown>;
 };
 
 type PaddleRuntimeWindow = Window & {
@@ -103,18 +114,77 @@ export function loadPaddle(): Promise<PaddleGlobal> {
   return paddleLoader;
 }
 
+/** Load Paddle.js and apply environment + client token (idempotent). */
+async function ensurePaddleReady(config: PaddleConfig): Promise<PaddleGlobal> {
+  const paddle = await loadPaddle();
+
+  // Environment must be set before Initialize.
+  if (configuredEnvironment !== config.environment) {
+    paddle.Environment.set(config.environment);
+    configuredEnvironment = config.environment;
+    initializedToken = null;
+  }
+
+  if (initializedToken !== config.clientToken) {
+    paddle.Initialize({ token: config.clientToken });
+    initializedToken = config.clientToken;
+  }
+
+  return paddle;
+}
+
+/**
+ * Ask Paddle what the price ID really is (currency + amount) and compare it
+ * with the announced price of the plan/interval it is supposed to represent.
+ */
+export async function verifyPriceWithPaddle(
+  config: PaddleConfig,
+  plan: PaidPlanId,
+  interval: BillingInterval,
+): Promise<PricePreviewVerdict> {
+  const priceId = getPriceId(config, plan, interval);
+  if (!priceId) {
+    throw new PaddleConfigError(
+      `Aucun price ID configuré pour ${plan} (${interval}). Renseignez ${priceKeyFor(plan, interval)}.`,
+      [priceKeyFor(plan, interval)],
+    );
+  }
+
+  const paddle = await ensurePaddleReady(config);
+  const preview = await paddle.PricePreview({ items: [{ priceId, quantity: 1 }] });
+  const expectation: PriceExpectation = { plan, interval, priceId };
+  return evaluatePricePreview(preview, expectation);
+}
+
+/** Check every configured price ID at once (used by the diagnostic panel). */
+export async function verifyAllPrices(config: PaddleConfig): Promise<PricePreviewVerdict[]> {
+  const verdicts: PricePreviewVerdict[] = [];
+  for (const plan of PAID_PLAN_IDS) {
+    for (const interval of BILLING_INTERVALS) {
+      if (!getPriceId(config, plan, interval)) continue;
+      // Sequential on purpose: a misconfigured ID must not be masked by a
+      // parallel failure, and the overlay stays quiet.
+      verdicts.push(await verifyPriceWithPaddle(config, plan, interval));
+    }
+  }
+  return verdicts;
+}
+
 export type OpenCheckoutOptions = {
   plan: PaidPlanId;
   interval: BillingInterval;
   onOpened?: () => void;
   onClosed?: () => void;
   onError?: (message: string) => void;
+  /** Result of the price verification, exposed for the UI. */
+  onVerified?: (verdict: PricePreviewVerdict) => void;
 };
 
 /**
  * Open the Paddle overlay checkout for a paid plan.
- * Throws `PaddleConfigError` when the public configuration is incomplete, so
- * callers can show the exact missing variables instead of a dead button.
+ * Throws `PaddleConfigError` when the public configuration is incomplete or
+ * when the price ID does not match the announced price, so a wrong amount can
+ * never be charged.
  */
 export async function openPaddleCheckout({
   plan,
@@ -122,6 +192,7 @@ export async function openPaddleCheckout({
   onOpened,
   onClosed,
   onError,
+  onVerified,
 }: OpenCheckoutOptions): Promise<void> {
   const config = readPaddleConfig();
   const status = validatePaddleConfig(config);
@@ -136,34 +207,45 @@ export async function openPaddleCheckout({
   const priceId = getPriceId(config, plan, interval);
   if (!priceId) {
     throw new PaddleConfigError(
-      `Aucun price ID Paddle configuré pour la formule « ${plan} » (${interval}).`,
+      `Aucun price ID Paddle configuré pour ${plan} (${interval}).`,
       [priceKeyFor(plan, interval)],
     );
   }
 
-  const paddle = await loadPaddle();
+  const paddle = await ensurePaddleReady(config);
 
-  // Environment must be set before Initialize.
-  if (configuredEnvironment !== config.environment) {
-    paddle.Environment.set(config.environment);
-    configuredEnvironment = config.environment;
-    initializedToken = null;
+  // Guard: never open a checkout whose real amount differs from the price shown.
+  let verdict: PricePreviewVerdict;
+  try {
+    const preview = await paddle.PricePreview({ items: [{ priceId, quantity: 1 }] });
+    verdict = evaluatePricePreview(preview, { plan, interval, priceId });
+  } catch (error) {
+    throw new PaddleConfigError(
+      `Impossible de vérifier le tarif Paddle avant paiement (${classifyCheckoutError(error).message}). Paiement bloqué par prudence.`,
+    );
   }
 
-  if (initializedToken !== config.clientToken) {
-    paddle.Initialize({
-      token: config.clientToken,
-      eventCallback: (event) => {
-        const name = event?.name ?? "";
-        if (name === "checkout.error") {
-          onError?.(classifyCheckoutError(event.error ?? event).message);
-        } else if (name === "checkout.closed") {
-          onClosed?.();
-        }
-      },
-    });
-    initializedToken = config.clientToken;
+  onVerified?.(verdict);
+
+  if (!verdict.ok) {
+    throw new PaddleConfigError(
+      `Paiement bloqué : le price ID configuré pour ${plan} (${interval}) ne correspond pas au tarif annoncé. ${verdict.problems.join(
+        " ",
+      )}`,
+    );
   }
+
+  paddle.Initialize({
+    token: config.clientToken,
+    eventCallback: (event) => {
+      const name = event?.name ?? "";
+      if (name === "checkout.error") {
+        onError?.(classifyCheckoutError(event.error ?? event).message);
+      } else if (name === "checkout.closed") {
+        onClosed?.();
+      }
+    },
+  });
 
   const settings: Record<string, unknown> = {
     displayMode: "overlay",
@@ -179,4 +261,3 @@ export async function openPaddleCheckout({
     settings,
   });
 }
-
