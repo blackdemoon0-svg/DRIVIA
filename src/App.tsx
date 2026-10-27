@@ -15,8 +15,9 @@ import {
   type VeyvroMessage,
 } from "./lib/veyvroApi";
 import { prepareQuoteDocument } from "./lib/quoteDocument";
+import PricingView from "./components/PricingView";
 
-type View = "ai" | "battle";
+type View = "ai" | "battle" | "pricing";
 
 const QUICK_PROMPTS = [
   { label: "Comparer deux voitures", prompt: "Compare la BMW M3 et la Mercedes-AMG C 63." },
@@ -895,6 +896,14 @@ export default function App() {
           >
             Battle
           </button>
+          <button
+            type="button"
+            className={view === "pricing" ? "nav-link active" : "nav-link"}
+            aria-current={view === "pricing" ? "page" : undefined}
+            onClick={() => setView("pricing")}
+          >
+            Tarifs
+          </button>
           <button type="button" className="nav-link" onClick={() => setAboutOpen(true)}>
             About
           </button>
@@ -907,6 +916,8 @@ export default function App() {
 
       {view === "battle" ? (
         <BattleMode />
+      ) : view === "pricing" ? (
+        <PricingView onStartFree={openChat} />
       ) : quoteDialogOpen ? (
         <QuoteUploadDialog
           onClose={() => setQuoteDialogOpen(false)}
