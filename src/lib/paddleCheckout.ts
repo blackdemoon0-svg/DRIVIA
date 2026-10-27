@@ -51,8 +51,32 @@ type PaddleRuntimeWindow = Window & {
 };
 
 let paddleLoader: Promise<PaddleGlobal> | null = null;
-let initializedToken: string | null = null;
 let configuredEnvironment: string | null = null;
+
+/**
+ * Paddle.Initialize() can only be called ONCE per page — the second call
+ * raises an error and poisons the session, so the following Checkout.open()
+ * fails with Paddle's generic "Something went wrong" screen.
+ *
+ * The handler is therefore registered at initialization time behind a mutable
+ * relay: callers swap `activeEventHandler` instead of re-initializing.
+ */
+let paddleInitialized = false;
+let activeEventHandler: ((event: PaddleEvent) => void) | null = null;
+
+/** Route a Paddle.js event to the handler currently installed by the caller. */
+function relayPaddleEvent(event: PaddleEvent): void {
+  activeEventHandler?.(event);
+}
+
+/**
+ * Install the handler that receives Paddle.js events (checkout.error,
+ * checkout.closed, ...). Replaces nothing on Paddle's side: the relay was
+ * registered with the single Initialize() call, so no second one is needed.
+ */
+function setPaddleEventHandler(handler: ((event: PaddleEvent) => void) | null): void {
+  activeEventHandler = handler;
+}
 
 /** Read the effective configuration (runtime override > build-time env). */
 export function readPaddleConfig(): PaddleConfig {
@@ -168,23 +192,42 @@ export function loadPaddle(): Promise<PaddleGlobal> {
   return paddleLoader;
 }
 
-/** Load Paddle.js and apply environment + client token (idempotent). */
+/**
+ * Load Paddle.js, apply the environment and initialize it exactly once.
+ * Safe to call from every entry point: the module-level flag makes the
+ * initialization idempotent.
+ */
 async function ensurePaddleReady(config: PaddleConfig): Promise<PaddleGlobal> {
   const paddle = await loadPaddle();
 
   // Environment must be set before Initialize.
   if (configuredEnvironment !== config.environment) {
+    if (paddleInitialized) {
+      // Paddle.js keeps its environment for the page lifetime; switching after
+      // initialization is unsupported, so never guess. A reload is required.
+      throw new PaddleConfigError(
+        `Paddle.js est déjà initialisé en « ${configuredEnvironment} » ; impossible de passer à « ${config.environment} » sans recharger la page.`,
+      );
+    }
     paddle.Environment.set(config.environment);
     configuredEnvironment = config.environment;
-    initializedToken = null;
   }
 
-  if (initializedToken !== config.clientToken) {
-    paddle.Initialize({ token: config.clientToken });
-    initializedToken = config.clientToken;
+  if (!paddleInitialized) {
+    // Single Initialize() for the whole page lifetime, with the relay attached
+    // immediately so no event (especially checkout.error) is ever missed.
+    paddle.Initialize({ token: config.clientToken, eventCallback: relayPaddleEvent });
+    paddleInitialized = true;
   }
 
   return paddle;
+}
+
+/** Test/DI helpers: reset the one-shot initialization state. */
+export function resetPaddleInitialization(): void {
+  paddleInitialized = false;
+  configuredEnvironment = null;
+  activeEventHandler = null;
 }
 
 /**
@@ -290,16 +333,15 @@ export async function openPaddleCheckout({
     );
   }
 
-  paddle.Initialize({
-    token: config.clientToken,
-    eventCallback: (event) => {
-      const name = event?.name ?? "";
-      if (name === "checkout.error") {
-        onError?.(classifyCheckoutError(event.error ?? event).message);
-      } else if (name === "checkout.closed") {
-        onClosed?.();
-      }
-    },
+  // Paddle.Initialize() is already done (once) inside ensurePaddleReady. Only the
+  // event handler is swapped here, through the relay registered at initialization.
+  setPaddleEventHandler((event) => {
+    const name = event?.name ?? "";
+    if (name === "checkout.error") {
+      onError?.(classifyCheckoutError(event.error ?? event).message);
+    } else if (name === "checkout.closed") {
+      onClosed?.();
+    }
   });
 
   const settings: Record<string, unknown> = {
