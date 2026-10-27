@@ -13,6 +13,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import handler from "../api/chat.ts";
+import paddleConfigHandler from "../api/paddle-config.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.resolve(__dirname, "..", "dist");
@@ -42,6 +43,12 @@ function adaptResponse(res) {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.end(JSON.stringify(body));
   };
+  // `setHeader` is inherited from ServerResponse and uses internal state bound to
+  // `this`; calling it on the wrapper would target the wrapper instead of the
+  // real response (headers silently dropped). Bind it explicitly so both
+  // /api/chat (SSE headers) and /api/paddle-config (Cache-Control) behave like
+  // the deployed functions.
+  adapted.setHeader = (name, value) => res.setHeader(name, value);
   return adapted;
 }
 
@@ -66,6 +73,10 @@ async function serveStatic(res, pathname) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
+
+  if (url.pathname === "/api/paddle-config") {
+    return paddleConfigHandler({ method: req.method }, adaptResponse(res));
+  }
 
   if (url.pathname === "/api/chat") {
     let body;

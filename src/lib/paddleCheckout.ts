@@ -65,6 +65,60 @@ export function readPaddleConfigStatus() {
   return validatePaddleConfig(readPaddleConfig());
 }
 
+/** Same-origin endpoint that exposes the public Paddle client token. */
+const PADDLE_CONFIG_ENDPOINT = "/api/paddle-config";
+
+/**
+ * Ask the server for the client token.
+ *
+ * `VITE_PADDLE_CLIENT_TOKEN` is inlined by Vite at build time, but a variable
+ * saved in Vercel without the `VITE_` prefix (e.g. `PADDLE_CLIENT_TOKEN`) is
+ * only visible to the server. This fetch bridges that gap, so the checkout
+ * works with the variable name the project owner actually configured.
+ * Returns null on any failure: the caller then reports the missing token.
+ */
+export async function fetchServerClientToken(signal?: AbortSignal): Promise<string | null> {
+  if (typeof fetch !== "function") return null;
+  try {
+    const response = await fetch(PADDLE_CONFIG_ENDPOINT, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+      signal,
+    });
+    if (!response.ok) return null;
+    const payload = (await response.json()) as { clientToken?: unknown } | null;
+    const token = typeof payload?.clientToken === "string" ? payload.clientToken.trim() : "";
+    return token || null;
+  } catch {
+    return null;
+  }
+}
+
+let hydration: Promise<PaddleConfig> | null = null;
+
+/**
+ * Resolve the configuration, completing it from the server when the build did
+ * not inline a client token. Memoised: concurrent clicks share one request.
+ */
+export function loadPaddleConfig(): Promise<PaddleConfig> {
+  if (hydration) return hydration;
+  const local = readPaddleConfig();
+  if (local.clientToken) {
+    hydration = Promise.resolve(local);
+    return hydration;
+  }
+  hydration = fetchServerClientToken().then((token) =>
+    token ? { ...local, clientToken: token } : local,
+  );
+  return hydration;
+}
+
+/** Test/diagnostic helper: drop the memoised configuration. */
+export function resetPaddleConfigCache(): void {
+  hydration = null;
+}
+
 function injectPaddleScript(): Promise<PaddleGlobal> {
   const existing = (window as PaddleRuntimeWindow).Paddle;
   if (existing) return Promise.resolve(existing);
@@ -194,7 +248,8 @@ export async function openPaddleCheckout({
   onError,
   onVerified,
 }: OpenCheckoutOptions): Promise<void> {
-  const config = readPaddleConfig();
+  // Server hydration first: the client token may live in a non-VITE_ variable.
+  const config = await loadPaddleConfig();
   const status = validatePaddleConfig(config);
 
   if (!status.ready) {

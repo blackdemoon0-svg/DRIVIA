@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   BILLING_INTERVALS,
   CURRENCY,
@@ -12,10 +12,16 @@ import {
   validatePaddleConfig,
   type BillingInterval,
   type PaidPlanId,
+  type PaddleConfig,
   type PricePreviewVerdict,
   type PricingPlan,
 } from "../lib/paddleCore";
-import { openPaddleCheckout, readPaddleConfig, verifyAllPrices } from "../lib/paddleCheckout";
+import {
+  loadPaddleConfig,
+  openPaddleCheckout,
+  readPaddleConfig,
+  verifyAllPrices,
+} from "../lib/paddleCheckout";
 
 type PricingViewProps = {
   onStartFree: () => void;
@@ -38,7 +44,20 @@ export default function PricingView({ onStartFree }: PricingViewProps) {
   const [verifying, setVerifying] = useState(false);
   const [verdicts, setVerdicts] = useState<PricePreviewVerdict[] | null>(null);
 
-  const config = useMemo(() => readPaddleConfig(), []);
+  // Start from what the build inlined, then complete from the server when the
+  // client token was saved under a non-VITE_ name (e.g. PADDLE_CLIENT_TOKEN).
+  const [config, setConfig] = useState<PaddleConfig>(() => readPaddleConfig());
+
+  useEffect(() => {
+    let active = true;
+    void loadPaddleConfig().then((resolved) => {
+      if (active) setConfig(resolved);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const status = useMemo(() => validatePaddleConfig(config), [config]);
   const environmentLabel = config.environment === "sandbox" ? "Sandbox" : "Production";
   const canQueryPaddle = Boolean(config.clientToken);
@@ -142,10 +161,12 @@ export default function PricingView({ onStartFree }: PricingViewProps) {
             ))}
           </ul>
           <p className="pricing-config-hint">
-            À définir dans Vercel → Settings → Environment Variables, cible <strong>Preview</strong>{" "}
-            uniquement, puis redéployer le Preview (les variables <code>VITE_*</code> sont figées au
-            build). Le token client Paddle et les price IDs sont publics ; la clé API Paddle secrète
-            ne doit jamais être exposée au navigateur.
+            Deux noms acceptés dans Vercel → Settings → Environment Variables, cible{" "}
+            <strong>Preview</strong> : <code>PADDLE_CLIENT_TOKEN</code> (lu côté serveur par{" "}
+            <code>/api/paddle-config</code>, actif immédiatement) ou{" "}
+            <code>VITE_PADDLE_CLIENT_TOKEN</code> (inliné au build, nécessite un redéploiement du
+            Preview). Le token client Paddle et les price IDs sont publics ; la clé API Paddle
+            secrète ne doit jamais être exposée au navigateur.
           </p>
         </div>
       )}

@@ -281,7 +281,7 @@ export function validatePaddleConfig(config: PaddleConfig): PaddleConfigStatus {
       ? null
       : `Paiement indisponible : configuration Paddle ${config.environment === "sandbox" ? "Sandbox" : "Production"} incomplète. Variables manquantes : ${missingKeys.join(
           ", ",
-        )}. Ajoutez-les dans Vercel (environnement Preview uniquement), puis redéployez le Preview — les variables Vite sont figées au build.`;
+        )}. Le token client peut aussi être fourni côté serveur via PADDLE_CLIENT_TOKEN (lu par /api/paddle-config) ; les price IDs sont déjà intégrés en Sandbox.`;
 
   return {
     ready: missingKeys.length === 0,

@@ -11,6 +11,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { renderToStaticMarkup } from "react-dom/server";
+import paddleConfigHandler, { readClientToken } from "../api/paddle-config.ts";
 import { createElement } from "react";
 import {
   BILLING_INTERVALS,
@@ -328,12 +329,93 @@ assert.doesNotMatch(markup, /Essentiel|Expert/);
 assert.equal((markup.match(/class="pricing-cta"/g) ?? []).length, PAID_PLAN_IDS.length);
 assert.equal((markup.match(/class="pricing-cta secondary"/g) ?? []).length, 1);
 // Only the client token is missing now: the 4 price IDs are built in.
-assert.match(markup, /VITE_PADDLE_CLIENT_TOKEN/);
+assert.match(markup, /PADDLE_CLIENT_TOKEN/);
 assert.doesNotMatch(markup, /VITE_PADDLE_PRICE_/);
 // The real Sandbox IDs are the ones rendered under each paid card.
 assert.match(markup, new RegExp(REAL_IDS.plus.month));
 assert.match(markup, new RegExp(REAL_IDS.pro.month));
 assert.match(markup, /Sandbox/);
 pass("rendu réel : Plus/Pro, prix USD, 2 boutons, price IDs Sandbox réels affichés, seul le token manque");
+
+// 20. The server route accepts the variable name actually saved in Vercel.
+assert.equal(readClientToken({ PADDLE_CLIENT_TOKEN: "test_server_token" }), "test_server_token");
+assert.equal(
+  readClientToken({ PADDLE_CLIENT_TOKEN: "  ", VITE_PADDLE_CLIENT_TOKEN: "test_build_token" }),
+  "test_build_token",
+);
+assert.equal(readClientToken({}), null);
+assert.equal(readClientToken({ PADDLE_CLIENT_TOKEN: "  " }), null);
+// Priority: the server-side name wins when both are set.
+assert.equal(
+  readClientToken({ PADDLE_CLIENT_TOKEN: "server", VITE_PADDLE_CLIENT_TOKEN: "build" }),
+  "server",
+);
+pass("route serveur : lit PADDLE_CLIENT_TOKEN (nom réellement enregistré), repli sur VITE_PADDLE_CLIENT_TOKEN");
+
+// 21. Route behaviour: GET only, no-store, never leaks an API key.
+function callRoute(method, env = {}) {
+  const saved = { ...process.env };
+  for (const key of Object.keys(env)) {
+    // `process.env.X = undefined` stores the string "undefined": delete instead.
+    if (env[key] === undefined) delete process.env[key];
+    else process.env[key] = env[key];
+  }
+  let statusCode = 200;
+  let payload = null;
+  const headers = {};
+  const res = {
+    status(code) {
+      statusCode = code;
+      return this;
+    },
+    json(body) {
+      payload = body;
+    },
+    setHeader(name, value) {
+      headers[name.toLowerCase()] = value;
+    },
+  };
+  try {
+    paddleConfigHandler({ method }, res);
+  } finally {
+    for (const key of Object.keys(env)) delete process.env[key];
+    Object.assign(process.env, saved);
+  }
+  return { statusCode, payload, headers };
+}
+
+const getRoute = callRoute("GET", { PADDLE_CLIENT_TOKEN: "test_route_token" });
+assert.equal(getRoute.statusCode, 200);
+assert.deepEqual(getRoute.payload, { clientToken: "test_route_token" });
+assert.match(getRoute.headers["cache-control"], /no-store/);
+
+const getRouteEmpty = callRoute("GET", { PADDLE_CLIENT_TOKEN: undefined });
+assert.equal(getRouteEmpty.statusCode, 200);
+assert.deepEqual(getRouteEmpty.payload, { clientToken: null });
+
+const postRoute = callRoute("POST", { PADDLE_CLIENT_TOKEN: "test_route_token" });
+assert.equal(postRoute.statusCode, 405);
+assert.equal(postRoute.payload.clientToken, undefined);
+
+const routeSource = read("api/paddle-config.ts");
+assert.doesNotMatch(routeSource, /PADDLE_API_KEY|pdl_(live|sdbx)_apikey/i);
+assert.doesNotMatch(routeSource, /console\.log/);
+pass("route serveur : GET → 200 + no-store, POST → 405, aucune clé API lue ni journalisée");
+
+// 22. Client hydration completes the config from the server when needed.
+const checkoutSource = read("src/lib/paddleCheckout.ts");
+assert.match(checkoutSource, /\/api\/paddle-config/);
+assert.match(checkoutSource, /loadPaddleConfig/);
+assert.match(checkoutSource, /const config = await loadPaddleConfig\(\)/);
+assert.match(read("src/components/PricingView.tsx"), /loadPaddleConfig\(\)/);
+assert.match(read("src/components/PricingView.tsx"), /useEffect/);
+pass("hydratation : PricingView et le checkout complètent le token via /api/paddle-config");
+
+// 23. Hydration never invents a token and keeps the 4 Sandbox price IDs.
+const hydratedSource = checkoutSource;
+assert.match(hydratedSource, /token \? \{ \.\.\.local, clientToken: token \} : local/);
+assert.match(hydratedSource, /PricePreview/);
+assert.match(hydratedSource, /verdict\.ok/);
+pass("hydratation : aucun token inventé, PricePreview et le blocage sur écart conservés");
 
 console.log(`\n${checks} vérifications du parcours d'abonnement passées.`);
