@@ -12,6 +12,7 @@
  * is wired to the price ID of *its own* plan and billing interval.
  */
 import {
+  PaddleCheckoutError,
   PaddleConfigError,
   PAID_PLAN_IDS,
   BILLING_INTERVALS,
@@ -32,8 +33,17 @@ import {
 const PADDLE_SCRIPT_ID = "veyvro-paddle-js";
 const PADDLE_SCRIPT_SRC = "https://cdn.paddle.com/paddle/v2/paddle.js";
 
+/**
+ * Paddle.js event. `checkout.error` payloads put their usable fields at the
+ * root — `{ name, type, code, detail, documentation_url }` — unlike the other
+ * events, which carry a `data` object. See
+ * https://developer.paddle.com/paddle-js/events/checkout-error.md
+ */
 type PaddleEvent = {
   name?: string;
+  type?: string;
+  code?: string;
+  detail?: string;
   error?: unknown;
   data?: unknown;
 };
@@ -337,8 +347,14 @@ export async function openPaddleCheckout({
   // event handler is swapped here, through the relay registered at initialization.
   setPaddleEventHandler((event) => {
     const name = event?.name ?? "";
+
     if (name === "checkout.error") {
+      // The whole event is forwarded so root-level `detail`/`code`/`type` are read.
       onError?.(classifyCheckoutError(event.error ?? event).message);
+    } else if (name === "checkout.loaded") {
+      // Documented: "Emitted when a checkout is created and loaded on the page."
+      // Only now can we honestly say the payment window is open.
+      onOpened?.();
     } else if (name === "checkout.closed") {
       onClosed?.();
     }
@@ -352,9 +368,16 @@ export async function openPaddleCheckout({
   };
   if (config.successUrl) settings.successUrl = config.successUrl;
 
-  onOpened?.();
-  paddle.Checkout.open({
-    items: [{ priceId, quantity: 1 }],
-    settings,
-  });
+  // No optimistic notification here: `onOpened` fires on `checkout.loaded` only,
+  // so a failing checkout can no longer display "paiement ouvert".
+  try {
+    paddle.Checkout.open({
+      items: [{ priceId, quantity: 1 }],
+      settings,
+    });
+  } catch (error) {
+    // Paddle.js can reject the payload synchronously (before any frame exists).
+    // Forward it as a classified error instead of letting it surface unclassified.
+    throw new PaddleCheckoutError(classifyCheckoutError(error).message);
+  }
 }

@@ -34,6 +34,7 @@ import {
   normalizeSuccessUrl,
   parsePaddleAmount,
   priceKeyFor,
+  redactSensitive,
   resolvePaddleConfig,
   validatePaddleConfig,
 } from "../src/lib/paddleCore.ts";
@@ -417,5 +418,166 @@ assert.match(hydratedSource, /token \? \{ \.\.\.local, clientToken: token \} : l
 assert.match(hydratedSource, /PricePreview/);
 assert.match(hydratedSource, /verdict\.ok/);
 pass("hydratation : aucun token inventé, PricePreview et le blocage sur écart conservés");
+
+// ---------------------------------------------------------------------------
+// Schéma officiel de checkout.error, exceptions synchrones, routage d'événements
+// (developer.paddle.com/paddle-js/events/checkout-error.md)
+// ---------------------------------------------------------------------------
+
+// 24. Real Paddle.js payload: { name, type, code, detail } — no `message` field.
+const realPaddleError = {
+  name: "checkout.error",
+  type: "api_error",
+  code: "validation",
+  detail: "Invalid request.",
+  documentation_url: "https://developer.paddle.com/api-reference",
+};
+const classifiedReal = classifyCheckoutError(realPaddleError);
+assert.equal(classifiedReal.code, "checkout");
+assert.equal(classifiedReal.paddleDetail, "Invalid request.");
+assert.equal(classifiedReal.paddleCode, "validation");
+assert.equal(classifiedReal.paddleType, "api_error");
+// The generic sentence is preserved AND the real cause is now visible.
+assert.match(classifiedReal.message, /Paddle n'a pas pu ouvrir le paiement/);
+assert.match(classifiedReal.message, /Invalid request\./);
+assert.match(classifiedReal.message, /code validation/);
+assert.match(classifiedReal.message, /type api_error/);
+pass("schéma Paddle réel : detail/code/type lus à la racine, message générique + cause visible");
+
+// 25. Existing messages and routing are preserved.
+const domainMsg = "Ce domaine n'est pas autorisé dans Paddle Sandbox. Ajoutez l'URL du Preview dans Paddle > Checkout > Website approval, puis réessayez.";
+assert.equal(classifyCheckoutError({ error: { message: "The domain is not approved" } }).message, domainMsg);
+assert.equal(
+  classifyCheckoutError({ name: "checkout.error", type: "api_error", code: "validation", detail: "The source domain is not approved" }).message,
+  domainMsg,
+);
+const scriptMsg = "Le script de paiement Paddle n'a pas pu être chargé. Vérifiez la connexion réseau, un éventuel bloqueur de publicité, puis réessayez.";
+assert.equal(classifyCheckoutError(new TypeError("Failed to fetch")).message, scriptMsg);
+assert.equal(classifyCheckoutError(new Error("Paiement bloqué : devise non conforme")).code, "price");
+// Unknown payload without detail: no dangling "Détail Paddle" suffix.
+assert.doesNotMatch(classifyCheckoutError(new Error("boom")).message, /Détail Paddle/);
+pass("messages existants inchangés (domaine, script, prix) et aucun suffixe vide");
+
+// 26. Redaction: no token, key or email may reach the UI.
+assert.equal(redactSensitive("token test_abcdefghijklmnop1234 rejected"), "token [token masqué] rejected");
+assert.equal(redactSensitive("key pdl_sdbx_apikey_abcdef123 rejected"), "key [clé masquée] rejected");
+assert.equal(redactSensitive("contact jo@example.com"), "contact [email masqué]");
+const leaked = classifyCheckoutError({
+  name: "checkout.error",
+  type: "front-end_error",
+  code: "invalid_token",
+  detail: "Bad token test_abcdefghijklmnop1234 for jo@example.com",
+});
+assert.doesNotMatch(leaked.message, /test_abcdefghijklmnop1234/);
+assert.doesNotMatch(leaked.message, /jo@example\.com/);
+assert.match(leaked.message, /\[token masqué\]/);
+pass("masquage : token Paddle, clé API et email jamais affichés");
+
+// 27. Execution-level: sync throw from Checkout.open, event routing, single Initialize.
+function installPaddleStub({ throwOnOpen = false, preview = true } = {}) {
+  const calls = { init: 0, open: 0, env: [], initOptions: null };
+  const paddle = {
+    Environment: { set: (e) => calls.env.push(e) },
+    Initialize: (options) => {
+      calls.init += 1;
+      calls.initOptions = options;
+    },
+    PricePreview: async () => {
+      if (!preview) throw new Error("preview down");
+      return { data: { currency_code: "USD", details: { line_items: [{ totals: { total: "700", currency_code: "USD" } }] } } };
+    },
+    Checkout: {
+      open: () => {
+        calls.open += 1;
+        if (throwOnOpen) throw new Error("Paddle.js rejected the items payload");
+      },
+    },
+  };
+  globalThis.window = {
+    __VEYVRO_PADDLE__: {
+      clientToken: "test_client_token_for_tests",
+      environment: "sandbox",
+      prices: { plus: { month: "pri_fixture_plus_month", year: "pri_fixture_plus_year" }, pro: { month: "pri_fixture_pro_month", year: "pri_fixture_pro_year" } },
+    },
+    Paddle: paddle,
+  };
+  globalThis.document = { getElementById: () => null, createElement: () => ({ addEventListener() {} }), head: { appendChild() {} } };
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ clientToken: "test_client_token_for_tests" }) });
+  return { calls, paddle };
+}
+
+const checkoutMod = await import("../src/lib/paddleCheckout.ts");
+
+// 27a. Sync throw: surfaced as a classified error, and no "opened" signal.
+{
+  installPaddleStub({ throwOnOpen: true });
+  checkoutMod.resetPaddleInitialization();
+  checkoutMod.resetPaddleConfigCache();
+  let opened = 0;
+  let caught = null;
+  try {
+    await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month", onOpened: () => { opened += 1; } });
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught, "une exception synchrone de Checkout.open doit être propagée");
+  assert.equal(caught.name, "PaddleCheckoutError");
+  assert.ok(caught.message.length > 0);
+  // Re-classifying must not mangle the message that was already classified.
+  assert.equal(classifyCheckoutError(caught).message, caught.message);
+  assert.equal(opened, 0, "onOpened ne doit pas être appelé si le checkout n'a pas été chargé");
+  pass("exception synchrone de Checkout.open : capturée, classée, aucune annonce d'ouverture");
+}
+
+// 27b. Event routing on the documented schema.
+{
+  const { calls } = installPaddleStub();
+  checkoutMod.resetPaddleInitialization();
+  checkoutMod.resetPaddleConfigCache();
+  let opened = 0;
+  let closed = 0;
+  let errorMessage = null;
+
+  await checkoutMod.openPaddleCheckout({
+    plan: "plus",
+    interval: "month",
+    onOpened: () => { opened += 1; },
+    onClosed: () => { closed += 1; },
+    onError: (message) => { errorMessage = message; },
+  });
+
+  assert.equal(calls.open, 1);
+  assert.equal(opened, 0, "onOpened ne doit PAS être appelé avant checkout.loaded");
+
+  const emit = (event) => calls.initOptions.eventCallback(event);
+  emit({ name: "checkout.loaded", data: { id: "che_01", status: "ready" } });
+  assert.equal(opened, 1, "checkout.loaded déclenche onOpened");
+
+  emit({ name: "checkout.closed", data: {} });
+  assert.equal(closed, 1, "checkout.closed déclenche onClosed");
+
+  emit({ name: "checkout.error", type: "api_error", code: "validation", detail: "Invalid request." });
+  assert.ok(errorMessage, "checkout.error doit transmettre un message");
+  assert.match(errorMessage, /Invalid request\./);
+  assert.match(errorMessage, /code validation/);
+
+  // Unknown events are ignored without throwing.
+  emit({ name: "checkout.updated", data: {} });
+  emit(undefined);
+  pass("routage : checkout.loaded → onOpened, closed → onClosed, error → onError (schéma racine)");
+}
+
+// 27c. Regression guard: still a single Initialize across several checkouts.
+{
+  const { calls } = installPaddleStub();
+  checkoutMod.resetPaddleInitialization();
+  checkoutMod.resetPaddleConfigCache();
+  await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month" });
+  await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month" });
+  assert.equal(calls.init, 1, `Paddle.Initialize doit rester unique (${calls.init} appels)`);
+  assert.equal(calls.open, 2);
+  assert.deepEqual(calls.env, ["sandbox"]);
+  pass("régressions : un seul Initialize, deux checkouts, environnement Sandbox");
+}
 
 console.log(`\n${checks} vérifications du parcours d'abonnement passées.`);

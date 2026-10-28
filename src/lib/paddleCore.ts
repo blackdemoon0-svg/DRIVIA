@@ -421,7 +421,24 @@ export type CheckoutErrorCode = "config" | "script" | "price" | "domain" | "chec
 export type CheckoutErrorInfo = {
   code: CheckoutErrorCode;
   message: string;
+  /** Raw Paddle `detail`, already redacted, when the event carried one. */
+  paddleDetail?: string;
+  /** Raw Paddle `code` (e.g. "validation"), when present. */
+  paddleCode?: string;
+  /** Raw Paddle `type` ("api_error" | "front-end_error"), when present. */
+  paddleType?: string;
 };
+
+/**
+ * Thrown when the checkout path has already classified an error, so callers do
+ * not classify it a second time and lose the original detail.
+ */
+export class PaddleCheckoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PaddleCheckoutError";
+  }
+}
 
 /**
  * Turn any failure of the checkout path into a message a user can act on.
@@ -434,41 +451,96 @@ export function classifyCheckoutError(error: unknown): CheckoutErrorInfo {
     return { code: "config", message: error.message };
   }
 
+  // Already classified by openPaddleCheckout(): keep the message as-is.
+  if (error instanceof PaddleCheckoutError) {
+    return { code: "checkout", message: error.message };
+  }
+
   const candidate = asRecord(error);
   const nested = asRecord(candidate?.error);
+
+  // Paddle.js `checkout.error` payloads carry their usable fields at the root:
+  // { name, type, code, detail, documentation_url } — there is no `message`.
+  // The previous implementation only read `message`, so every real Paddle error
+  // fell through to the generic text.
+  const paddleDetail = redactSensitive(pickString(candidate, "detail") ?? pickString(nested, "detail"));
+  const paddleCode = pickString(candidate, "code") ?? pickString(nested, "code");
+  const paddleType = pickString(candidate, "type") ?? pickString(nested, "type");
+
   const rawMessage =
     typeof error === "string"
       ? error
       : error instanceof Error
         ? error.message
-        : pickString(nested, "message") ?? pickString(candidate, "message") ?? "";
-  const message = rawMessage.toLowerCase();
+        : pickString(nested, "message") ?? pickString(candidate, "message") ?? paddleDetail ?? "";
 
-  if (message.includes("failed to fetch") || message.includes("networkerror") || message.includes("script") || message.includes("import") || message.includes("blocked")) {
+  // Match against every textual field Paddle gives us, not just `message`.
+  const haystack = [rawMessage, paddleDetail, paddleCode, paddleType]
+    .filter((part): part is string => typeof part === "string" && part.length > 0)
+    .join(" ")
+    .toLowerCase();
+
+  const details = { paddleDetail: paddleDetail ?? undefined, paddleCode: paddleCode ?? undefined, paddleType: paddleType ?? undefined };
+  const suffix = describePaddleDetail(paddleDetail, paddleCode, paddleType);
+
+  if (haystack.includes("failed to fetch") || haystack.includes("networkerror") || haystack.includes("script") || haystack.includes("import") || haystack.includes("blocked")) {
     return {
       code: "script",
       message:
         "Le script de paiement Paddle n'a pas pu être chargé. Vérifiez la connexion réseau, un éventuel bloqueur de publicité, puis réessayez.",
+      ...details,
     };
   }
 
-  if (message.includes("price") || message.includes("devise") || message.includes("montant")) {
-    return { code: "price", message: rawMessage };
+  if (haystack.includes("price") || haystack.includes("devise") || haystack.includes("montant")) {
+    return { code: "price", message: rawMessage || "Montant ou devise refusé par Paddle.", ...details };
   }
 
-  if (message.includes("domain") || message.includes("approved") || message.includes("origin")) {
+  if (haystack.includes("domain") || haystack.includes("approved") || haystack.includes("origin")) {
     return {
       code: "domain",
       message:
         "Ce domaine n'est pas autorisé dans Paddle Sandbox. Ajoutez l'URL du Preview dans Paddle > Checkout > Website approval, puis réessayez.",
+      ...details,
     };
   }
 
   return {
     code: "checkout",
     message:
-      "Paddle n'a pas pu ouvrir le paiement. Vérifiez l'environnement (Sandbox), le token client et le price ID de la formule choisie, puis réessayez.",
+      "Paddle n'a pas pu ouvrir le paiement. Vérifiez l'environnement (Sandbox), le token client et le price ID de la formule choisie, puis réessayez." +
+      suffix,
+    ...details,
   };
+}
+
+const MAX_DETAIL_LENGTH = 240;
+
+/**
+ * Never surface credentials. Paddle error details are short human sentences, but
+ * they are third-party strings, so anything token-, key- or email-shaped is
+ * masked before it can reach the UI or a log.
+ */
+export function redactSensitive(text: string | null): string | null {
+  if (!text) return null;
+  const redacted = text
+    .replace(/\b(?:test|live)_[A-Za-z0-9]{16,}\b/g, "[token masqué]")
+    .replace(/\bpdl_(?:live|sdbx)_(?:apikey|ctok)_[A-Za-z0-9]+\b/gi, "[clé masquée]")
+    .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "[email masqué]");
+  return redacted.length > MAX_DETAIL_LENGTH ? `${redacted.slice(0, MAX_DETAIL_LENGTH)}…` : redacted;
+}
+
+/** Human-readable "(détail Paddle : …, code …, type …)" suffix, or "". */
+function describePaddleDetail(
+  detail: string | null,
+  code: string | null,
+  type: string | null,
+): string {
+  const parts: string[] = [];
+  if (detail) parts.push(`« ${detail} »`);
+  if (code) parts.push(`code ${code}`);
+  if (type) parts.push(`type ${type}`);
+  return parts.length === 0 ? "" : ` Détail Paddle : ${parts.join(", ")}.`;
 }
 
 /** "$7 / mois" — the currency is always visible, never implied. */
