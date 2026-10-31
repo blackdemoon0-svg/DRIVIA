@@ -1,12 +1,16 @@
 import crypto from "node:crypto";
-import { verifyAttributionProof } from "../server/attribution";
+// `.js` extensions are mandatory here: `package.json` declares
+// `"type": "module"` and Node rejects extensionless relative specifiers in ESM.
+// Omitting them makes the function fail to load, and Vercel answers
+// 500 FUNCTION_INVOCATION_FAILED without ever entering the handler.
+import { verifyAttributionProof } from "../server/attribution.js";
 import {
   BILLING_INTERVALS,
   PAID_PLAN_IDS,
   SANDBOX_PRICE_IDS,
   type BillingInterval,
   type PaidPlanId,
-} from "../src/lib/paddleCore";
+} from "../src/lib/paddleCore.js";
 
 /**
  * Paddle webhook: signature verification, idempotency, subscription persistence.

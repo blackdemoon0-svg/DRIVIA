@@ -1,4 +1,9 @@
-import { computeAttributionProof, deriveAttributionKey } from "../server/attribution";
+// The `.js` extension is required, not cosmetic: `package.json` declares
+// `"type": "module"`, and Node refuses extensionless relative specifiers in ESM.
+// Without it the whole function fails to load and Vercel answers
+// 500 FUNCTION_INVOCATION_FAILED before the handler even runs.
+// Same convention as `api/chat.ts` → `../server/veyvroSystemPrompt.js`.
+import { computeAttributionProof, deriveAttributionKey } from "../server/attribution.js";
 
 /**
  * Attribution endpoint: proves which account is about to pay.
