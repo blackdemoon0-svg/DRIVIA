@@ -9,9 +9,16 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "check:seo": "node scripts/check-seo-build.mjs",
-    "verify": "npm run typecheck && npm run build && npm run check:seo"
+    "verify": "npm run typecheck && npm run build && npm run check:seo && npm test",
+    "test:paddle": "tsx scripts/paddle-flow.test.mjs",
+    "test:attribution": "tsx scripts/paddle-attribution.test.mjs",
+    "test:webhook": "tsx scripts/paddle-webhook.test.mjs",
+    "test": "npm run test:paddle && npm run test:attribution && npm run test:webhook && npm run test:entitlement && npm run test:schema",
+    "test:entitlement": "tsx scripts/entitlement.test.mjs",
+    "test:schema": "tsx scripts/schema-alignment.test.mjs"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.118.0",
     "@vercel/analytics": "^2.0.1",
     "clsx": "2.1.1",
     "pdfjs-dist": "6.4.299",
@@ -26,6 +33,7 @@
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.1",
     "tailwindcss": "4.1.17",
+    "tsx": "^4.23.15",
     "typescript": "5.9.3",
     "vite": "7.3.2",
     "vite-plugin-singlefile": "2.3.0"

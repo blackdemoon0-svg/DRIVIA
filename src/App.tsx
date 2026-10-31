@@ -15,9 +15,11 @@ import {
   type VeyvroMessage,
 } from "./lib/veyvroApi";
 import { prepareQuoteDocument } from "./lib/quoteDocument";
+import { isSignedIn, useAuthSession } from "./lib/auth";
 import PricingView from "./components/PricingView";
+import AuthView, { AccountView } from "./components/AuthView";
 
-type View = "ai" | "battle" | "pricing";
+type View = "ai" | "battle" | "pricing" | "connexion" | "inscription" | "compte";
 
 const QUICK_PROMPTS = [
   { label: "Comparer deux voitures", prompt: "Compare la BMW M3 et la Mercedes-AMG C 63." },
@@ -714,6 +716,8 @@ export default function App() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const conversationEndRef = useRef<HTMLDivElement>(null);
   const isChatting = view === "ai" && messages.length > 0;
+  const auth = useAuthSession();
+  const signedIn = isSignedIn(auth);
 
   useEffect(() => {
     if (!aboutOpen) return undefined;
@@ -907,6 +911,14 @@ export default function App() {
           <button type="button" className="nav-link" onClick={() => setAboutOpen(true)}>
             About
           </button>
+          <button
+            type="button"
+            className={view === "compte" || view === "connexion" || view === "inscription" ? "nav-link active" : "nav-link"}
+            aria-current={view === "compte" || view === "connexion" || view === "inscription" ? "page" : undefined}
+            onClick={() => setView(signedIn ? "compte" : "connexion")}
+          >
+            {signedIn ? "Compte" : "Connexion"}
+          </button>
         </nav>
 
         <button className="header-cta" type="button" onClick={openChat}>
@@ -914,10 +926,39 @@ export default function App() {
         </button>
       </header>
 
-      {view === "battle" ? (
+      {view === "connexion" || view === "inscription" ? (
+        <AuthView
+          mode={view}
+          onModeChange={(mode) => setView(mode)}
+          onSignedIn={() => setView("compte")}
+        />
+      ) : view === "compte" ? (
+        auth.status === "loading" ? (
+          <main className="pricing-stage auth-stage" aria-busy="true" aria-label="Chargement du compte">
+            <p className="pricing-subtitle">Vérification de votre session…</p>
+          </main>
+        ) : signedIn && auth.user ? (
+          <AccountView
+            user={auth.user}
+            onGoToPricing={() => setView("pricing")}
+            onSignedOut={() => setView("connexion")}
+          />
+        ) : (
+          <AuthView
+            mode="connexion"
+            onModeChange={(mode) => setView(mode)}
+            onSignedIn={() => setView("compte")}
+          />
+        )
+      ) : view === "battle" ? (
         <BattleMode />
       ) : view === "pricing" ? (
-        <PricingView onStartFree={openChat} />
+        <PricingView
+          onStartFree={openChat}
+          userId={auth.user?.id ?? null}
+          accessToken={auth.session?.access_token ?? null}
+          onRequireSignIn={() => setView("connexion")}
+        />
       ) : quoteDialogOpen ? (
         <QuoteUploadDialog
           onClose={() => setQuoteDialogOpen(false)}

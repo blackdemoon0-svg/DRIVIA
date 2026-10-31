@@ -277,9 +277,102 @@ export async function verifyAllPrices(config: PaddleConfig): Promise<PricePrevie
   return verdicts;
 }
 
+/**
+ * Key written into Paddle `customData`.
+ *
+ * Paddle keeps custom data against the transaction, then copies it to the
+ * subscription it creates for recurring items, and the subscription is what the
+ * webhook delivers. This key is therefore the only link between a payment and a
+ * VEYVRO account. It is not a secret: it is the user's own opaque Supabase id.
+ */
+export const PADDLE_CUSTOM_DATA_USER_KEY = "user_id";
+
+/**
+ * Key holding the server-signed proof. The webhook recomputes it from the
+ * claimed user id, so a rewritten `user_id` no longer matches and is rejected.
+ */
+export const PADDLE_CUSTOM_DATA_PROOF_KEY = "attribution_proof";
+
+/** Maximum accepted length for the user id (UUIDs are 36 characters). */
+const MAX_USER_ID_LENGTH = 128;
+
+/** Same-origin endpoint that signs the attribution proof. */
+const ATTRIBUTION_ENDPOINT = "/api/paddle-attribution";
+
+export type AttributionProof = { userId: string; proof: string };
+
+/**
+ * Ask the server for a proof bound to the signed-in account.
+ *
+ * The server resolves the identity from the Supabase access token; the value
+ * returned is authoritative and is compared with the id we expected. Nothing
+ * here is a secret: the proof only certifies an identity the server verified.
+ */
+export async function fetchAttributionProof(
+  accessToken: string,
+  signal?: AbortSignal,
+): Promise<AttributionProof> {
+  let response: Response;
+  try {
+    response = await fetch(ATTRIBUTION_ENDPOINT, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      cache: "no-store",
+      signal,
+    });
+  } catch {
+    throw new PaddleCheckoutError(
+      "Impossible de vérifier votre compte auprès du serveur. Vérifiez votre connexion, puis réessayez.",
+    );
+  }
+
+  if (response.status === 401) {
+    throw new PaddleCheckoutError(
+      "Votre session a expiré. Reconnectez-vous, puis réessayez le paiement.",
+    );
+  }
+  if (response.status === 403) {
+    throw new PaddleCheckoutError(
+      "Confirmez votre adresse e-mail avant de souscrire : ouvrez le lien reçu par e-mail, puis réessayez.",
+    );
+  }
+  if (!response.ok) {
+    throw new PaddleCheckoutError(
+      "Le serveur n'a pas pu certifier votre compte. Réessayez dans un instant.",
+    );
+  }
+
+  const payload = (await response.json()) as Partial<AttributionProof> | null;
+  const userId = typeof payload?.userId === "string" ? payload.userId.trim() : "";
+  const proof = typeof payload?.proof === "string" ? payload.proof.trim() : "";
+  if (!userId || !proof) {
+    throw new PaddleCheckoutError(
+      "Le serveur n'a pas renvoyé de preuve d'attribution valide. Paiement bloqué par prudence.",
+    );
+  }
+  return { userId, proof };
+}
+
 export type OpenCheckoutOptions = {
   plan: PaidPlanId;
   interval: BillingInterval;
+  /**
+   * Supabase user id of the signed-in customer.
+   *
+   * Required: a checkout opened without it produces a subscription no account
+   * can ever claim, because the webhook would have no `custom_data.user_id`.
+   */
+  userId: string;
+  /**
+   * Supabase access token of the signed-in customer.
+   *
+   * Used once, to obtain the attribution proof from the server. It never reaches
+   * Paddle: `customData` carries the proof, never the token.
+   */
+  accessToken: string;
   onOpened?: () => void;
   onClosed?: () => void;
   onError?: (message: string) => void;
@@ -296,11 +389,38 @@ export type OpenCheckoutOptions = {
 export async function openPaddleCheckout({
   plan,
   interval,
+  userId,
+  accessToken,
   onOpened,
   onClosed,
   onError,
   onVerified,
 }: OpenCheckoutOptions): Promise<void> {
+  // Refuse to open a checkout that cannot be attributed to an account: the
+  // webhook links a subscription to a user only through `custom_data.user_id`.
+  const customerId = typeof userId === "string" ? userId.trim() : "";
+  if (!customerId || customerId.length > MAX_USER_ID_LENGTH) {
+    throw new PaddleCheckoutError(
+      "Connectez-vous à votre compte VEYVRO avant de choisir une formule payante : sans compte, l'abonnement ne peut pas être rattaché.",
+    );
+  }
+
+  if (typeof accessToken !== "string" || !accessToken.trim()) {
+    throw new PaddleCheckoutError(
+      "Votre session est introuvable. Reconnectez-vous, puis réessayez le paiement.",
+    );
+  }
+
+  // The server, not the browser, decides which account this payment belongs to.
+  const attribution = await fetchAttributionProof(accessToken.trim());
+  if (attribution.userId !== customerId) {
+    // A stale session page could hold an outdated id; refuse rather than sign a
+    // payment against the wrong account.
+    throw new PaddleCheckoutError(
+      "Votre session ne correspond plus au compte affiché. Rechargez la page, puis réessayez.",
+    );
+  }
+
   // Server hydration first: the client token may live in a non-VITE_ variable.
   const config = await loadPaddleConfig();
   const status = validatePaddleConfig(config);
@@ -374,6 +494,13 @@ export async function openPaddleCheckout({
     paddle.Checkout.open({
       items: [{ priceId, quantity: 1 }],
       settings,
+      // Documented: custom data is held against the transaction and, for
+      // recurring items, copied to the subscription created from it.
+      // The proof travels with the id so the webhook can detect a rewritten id.
+      customData: {
+        [PADDLE_CUSTOM_DATA_USER_KEY]: customerId,
+        [PADDLE_CUSTOM_DATA_PROOF_KEY]: attribution.proof,
+      },
     });
   } catch (error) {
     // Paddle.js can reject the payload synchronously (before any frame exists).

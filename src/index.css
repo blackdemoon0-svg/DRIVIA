@@ -2667,3 +2667,261 @@ select:focus-visible {
     text-align: center;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Account views (sign-up, sign-in, account).                          */
+/* Additive only: no existing selector is modified above this line.    */
+/* ------------------------------------------------------------------ */
+
+.auth-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.auth-card {
+  width: min(100%, 460px);
+  margin: 34px auto 0;
+  padding: 28px 26px 26px;
+}
+
+.auth-title {
+  margin: 0 0 18px;
+  color: #f2f4f2;
+  font-size: 18px;
+  font-weight: 580;
+  letter-spacing: -0.02em;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.auth-field > label {
+  color: #9da9a8;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.auth-input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid rgba(223, 233, 235, 0.18);
+  border-radius: 10px;
+  outline: 0;
+  background: rgba(8, 12, 15, 0.72);
+  color: #f0f3f1;
+  font-family: inherit;
+  font-size: 14px;
+  transition: border-color 180ms ease, background 180ms ease, box-shadow 180ms ease;
+}
+
+.auth-input:focus-visible {
+  border-color: rgba(212, 255, 112, 0.55);
+  background: rgba(10, 15, 18, 0.9);
+  box-shadow: 0 0 0 3px rgba(212, 255, 112, 0.12);
+}
+
+.auth-input:disabled {
+  opacity: 0.6;
+}
+
+.auth-hint {
+  margin: 0;
+  color: var(--quiet);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.pricing-card .auth-feedback {
+  width: 100%;
+  margin: 2px 0 0;
+  padding: 11px 13px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.55;
+  text-align: left;
+}
+
+.pricing-card p.pricing-notice.auth-feedback {
+  border: 1px solid rgba(168, 217, 138, 0.34);
+  background: rgba(16, 30, 14, 0.62);
+  color: #b6e39a;
+}
+
+.pricing-card .pricing-error.auth-feedback {
+  border: 1px solid rgba(255, 120, 110, 0.42);
+  background: rgba(38, 14, 13, 0.72);
+  color: #ffbcb6;
+}
+
+.auth-submit {
+  margin-top: 4px;
+}
+
+.auth-submit:disabled {
+  cursor: progress;
+  opacity: 0.72;
+}
+
+.auth-switch {
+  margin: 18px 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  text-align: center;
+}
+
+.auth-switch-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 560;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.auth-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.auth-actions .pricing-cta,
+.auth-actions .pricing-verify-button {
+  flex: 1 1 160px;
+  margin-top: 0;
+}
+
+.account-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+}
+
+.account-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.account-row:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.account-row dt {
+  min-width: 118px;
+  color: var(--quiet);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.account-row dd {
+  flex: 1 1 200px;
+  margin: 0;
+  color: #eef1ef;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.account-row dd.account-muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@media (max-width: 700px) {
+  .auth-card {
+    margin-top: 26px;
+    padding: 24px 20px 22px;
+  }
+}
+
+/* Sign-in hint on the pricing page (paid plans require an account). */
+.pricing-signin-note {
+  width: min(100%, 780px);
+  margin: 18px auto 0;
+  color: #aeb8b8;
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.pricing-signin-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 560;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* Plan display on the account page (values come from the database). */
+.account-plan {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.account-plan strong {
+  color: #f2f5f2;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.account-plan-status {
+  padding: 2px 8px;
+  border: 1px solid rgba(223, 233, 235, 0.22);
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.account-plan-ok .account-plan-status {
+  border-color: rgba(168, 217, 138, 0.45);
+  background: rgba(20, 38, 16, 0.55);
+  color: #b6e39a;
+}
+
+.account-plan-warning .account-plan-status {
+  border-color: rgba(255, 196, 110, 0.5);
+  background: rgba(40, 28, 10, 0.6);
+  color: #ffd08a;
+}
+
+.account-plan-inactive .account-plan-status {
+  border-color: rgba(255, 120, 110, 0.4);
+  background: rgba(38, 14, 13, 0.55);
+  color: #ffbcb6;
+}
+
+.account-plan-neutral .account-plan-status {
+  color: var(--muted);
+}

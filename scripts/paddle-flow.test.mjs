@@ -475,7 +475,7 @@ pass("masquage : token Paddle, clé API et email jamais affichés");
 
 // 27. Execution-level: sync throw from Checkout.open, event routing, single Initialize.
 function installPaddleStub({ throwOnOpen = false, preview = true } = {}) {
-  const calls = { init: 0, open: 0, env: [], initOptions: null };
+  const calls = { init: 0, open: 0, preview: 0, attribution: 0, env: [], initOptions: null, lastOpenPayload: null };
   const paddle = {
     Environment: { set: (e) => calls.env.push(e) },
     Initialize: (options) => {
@@ -483,12 +483,14 @@ function installPaddleStub({ throwOnOpen = false, preview = true } = {}) {
       calls.initOptions = options;
     },
     PricePreview: async () => {
+      calls.preview += 1;
       if (!preview) throw new Error("preview down");
       return { data: { currency_code: "USD", details: { line_items: [{ totals: { total: "700", currency_code: "USD" } }] } } };
     },
     Checkout: {
-      open: () => {
+      open: (payload) => {
         calls.open += 1;
+        calls.lastOpenPayload = payload;
         if (throwOnOpen) throw new Error("Paddle.js rejected the items payload");
       },
     },
@@ -502,9 +504,26 @@ function installPaddleStub({ throwOnOpen = false, preview = true } = {}) {
     Paddle: paddle,
   };
   globalThis.document = { getElementById: () => null, createElement: () => ({ addEventListener() {} }), head: { appendChild() {} } };
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({ clientToken: "test_client_token_for_tests" }) });
+  // Two routes are called: the Paddle config and the attribution proof.
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/api/paddle-attribution")) {
+      calls.attribution += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ userId: TEST_USER_ID, proof: TEST_ATTRIBUTION_PROOF }),
+      };
+    }
+    return { ok: true, status: 200, json: async () => ({ clientToken: "test_client_token_for_tests" }) };
+  };
   return { calls, paddle };
 }
+
+// Opaque Supabase-style user id used only inside this test file.
+const TEST_USER_ID = "11111111-2222-3333-4444-555555555555";
+// Placeholder proof: the checkout never verifies it, the server does.
+const TEST_ATTRIBUTION_PROOF = "v1.test-proof-placeholder";
+const TEST_ACCESS_TOKEN = "test-access-token";
 
 const checkoutMod = await import("../src/lib/paddleCheckout.ts");
 
@@ -516,7 +535,7 @@ const checkoutMod = await import("../src/lib/paddleCheckout.ts");
   let opened = 0;
   let caught = null;
   try {
-    await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month", onOpened: () => { opened += 1; } });
+    await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month", userId: TEST_USER_ID, accessToken: TEST_ACCESS_TOKEN, onOpened: () => { opened += 1; } });
   } catch (error) {
     caught = error;
   }
@@ -541,6 +560,8 @@ const checkoutMod = await import("../src/lib/paddleCheckout.ts");
   await checkoutMod.openPaddleCheckout({
     plan: "plus",
     interval: "month",
+    userId: TEST_USER_ID,
+    accessToken: TEST_ACCESS_TOKEN,
     onOpened: () => { opened += 1; },
     onClosed: () => { closed += 1; },
     onError: (message) => { errorMessage = message; },
@@ -572,12 +593,76 @@ const checkoutMod = await import("../src/lib/paddleCheckout.ts");
   const { calls } = installPaddleStub();
   checkoutMod.resetPaddleInitialization();
   checkoutMod.resetPaddleConfigCache();
-  await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month" });
-  await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month" });
+  await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month", userId: TEST_USER_ID, accessToken: TEST_ACCESS_TOKEN });
+  await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month", userId: TEST_USER_ID, accessToken: TEST_ACCESS_TOKEN });
   assert.equal(calls.init, 1, `Paddle.Initialize doit rester unique (${calls.init} appels)`);
   assert.equal(calls.open, 2);
   assert.deepEqual(calls.env, ["sandbox"]);
   pass("régressions : un seul Initialize, deux checkouts, environnement Sandbox");
+}
+
+// 28a. customData is sent to Paddle, at the root, with the signed-in user id.
+{
+  const { calls } = installPaddleStub();
+  checkoutMod.resetPaddleInitialization();
+  checkoutMod.resetPaddleConfigCache();
+  // The stub previews 700 USD cents, which is the announced Plus monthly price.
+  await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month", userId: TEST_USER_ID, accessToken: TEST_ACCESS_TOKEN });
+
+  const payload = calls.lastOpenPayload;
+  assert.ok(payload, "Checkout.open doit recevoir un payload");
+  assert.deepEqual(
+    payload.customData,
+    { user_id: TEST_USER_ID, attribution_proof: TEST_ATTRIBUTION_PROOF },
+    "customData doit porter le user_id ET sa preuve, à la racine du payload",
+  );
+  assert.equal(typeof payload.customData.user_id, "string");
+  assert.equal(typeof payload.customData.attribution_proof, "string");
+  // Flat object: Paddle warns that nested custom data may not render correctly.
+  assert.ok(Object.values(payload.customData).every((v) => typeof v !== "object"));
+  // The user id must not leak into `settings`, where Paddle ignores it.
+  assert.equal("customData" in (payload.settings ?? {}), false);
+  // The access token must never reach Paddle.
+  assert.equal(JSON.stringify(payload).includes(TEST_ACCESS_TOKEN), false);
+  pass("customData : user_id + preuve d'attribution à la racine, objet plat, jeton jamais transmis");
+}
+
+// 28b. A checkout without a user is refused before any network call.
+{
+  const { calls } = installPaddleStub();
+  checkoutMod.resetPaddleInitialization();
+  checkoutMod.resetPaddleConfigCache();
+
+  for (const missing of [undefined, "", "   ", null, 42]) {
+    let caught = null;
+    try {
+      await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month", userId: missing, accessToken: TEST_ACCESS_TOKEN });
+    } catch (error) {
+      caught = error;
+    }
+    assert.ok(caught, "userId " + JSON.stringify(missing) + " doit être refusé");
+    assert.equal(caught.name, "PaddleCheckoutError");
+    assert.match(caught.message, /Connectez-vous/);
+  }
+  assert.equal(calls.open, 0, "aucun checkout ne doit être ouvert sans utilisateur");
+  assert.equal(calls.preview, 0, "aucun appel réseau ne doit précéder le refus");
+  pass("checkout sans utilisateur : refusé, aucun appel Paddle, message explicite");
+}
+
+// 28c. An over-long user id is refused instead of being silently truncated.
+{
+  const { calls } = installPaddleStub();
+  checkoutMod.resetPaddleInitialization();
+  checkoutMod.resetPaddleConfigCache();
+  let caught = null;
+  try {
+    await checkoutMod.openPaddleCheckout({ plan: "plus", interval: "month", userId: "u".repeat(129), accessToken: TEST_ACCESS_TOKEN });
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught, "un identifiant trop long doit être refusé");
+  assert.equal(calls.open, 0);
+  pass("identifiant utilisateur trop long : refusé, aucun checkout ouvert");
 }
 
 console.log(`\n${checks} vérifications du parcours d'abonnement passées.`);

@@ -25,6 +25,12 @@ import {
 
 type PricingViewProps = {
   onStartFree: () => void;
+  /** Supabase id of the signed-in user, or `null` when signed out. */
+  userId: string | null;
+  /** Supabase access token, used once to obtain the attribution proof. */
+  accessToken: string | null;
+  /** Opens the sign-in view; a paid checkout requires an account. */
+  onRequireSignIn: () => void;
 };
 
 const INTERVAL_LABELS: Record<BillingInterval, string> = {
@@ -36,7 +42,7 @@ function isPaidPlan(plan: PricingPlan): plan is PricingPlan & { id: PaidPlanId }
   return plan.id !== "decouverte";
 }
 
-export default function PricingView({ onStartFree }: PricingViewProps) {
+export default function PricingView({ onStartFree, userId, accessToken, onRequireSignIn }: PricingViewProps) {
   const [interval, setInterval] = useState<BillingInterval>("month");
   const [pendingPlan, setPendingPlan] = useState<PaidPlanId | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -65,12 +71,24 @@ export default function PricingView({ onStartFree }: PricingViewProps) {
   const handleCheckout = async (plan: PaidPlanId) => {
     setError(null);
     setNotice(null);
+
+    // An account is required before paying: the subscription is linked to the
+    // user through `customData`, so a payment made while signed out could never
+    // be attributed to anyone.
+    if (!userId || !accessToken) {
+      setNotice("Connectez-vous à votre compte VEYVRO pour choisir une formule payante.");
+      onRequireSignIn();
+      return;
+    }
+
     setPendingPlan(plan);
 
     try {
       await openPaddleCheckout({
         plan,
         interval,
+        userId,
+        accessToken,
         onOpened: () =>
           setNotice(
             `Paiement ouvert dans Paddle (${environmentLabel}) : ${plan.toUpperCase()} — ${expectedAmount(plan, interval)} ${CURRENCY} / ${
@@ -180,6 +198,16 @@ export default function PricingView({ onStartFree }: PricingViewProps) {
       {notice && (
         <p className="pricing-notice" role="status">
           {notice}
+        </p>
+      )}
+
+      {!userId && (
+        <p className="pricing-signin-note" role="status">
+          Un compte VEYVRO est nécessaire pour souscrire : il permet de rattacher l'abonnement à
+          votre identité.{" "}
+          <button type="button" className="pricing-signin-link" onClick={onRequireSignIn}>
+            Se connecter ou créer un compte
+          </button>
         </p>
       )}
 
