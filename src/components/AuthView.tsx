@@ -341,7 +341,10 @@ export function AccountView({ user, onGoToPricing, onSignedOut }: AccountViewPro
             type="button"
             className="pricing-verify-button"
             onClick={() => {
-              void signOutNow().then(() => onSignedOut());
+              // Navigate to the login view only once the session is really gone.
+              void signOutNow().then((signedOut) => {
+                if (signedOut) onSignedOut();
+              });
             }}
             disabled={isSigningOut}
             aria-busy={isSigningOut}

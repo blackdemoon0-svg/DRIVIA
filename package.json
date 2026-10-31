@@ -13,9 +13,10 @@
     "test:paddle": "tsx scripts/paddle-flow.test.mjs",
     "test:attribution": "tsx scripts/paddle-attribution.test.mjs",
     "test:webhook": "tsx scripts/paddle-webhook.test.mjs",
-    "test": "npm run test:paddle && npm run test:attribution && npm run test:webhook && npm run test:entitlement && npm run test:schema",
+    "test": "npm run test:paddle && npm run test:attribution && npm run test:webhook && npm run test:entitlement && npm run test:auth && npm run test:schema",
     "test:entitlement": "tsx scripts/entitlement.test.mjs",
-    "test:schema": "tsx scripts/schema-alignment.test.mjs"
+    "test:schema": "tsx scripts/schema-alignment.test.mjs",
+    "test:auth": "tsx scripts/auth.test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.118.0",

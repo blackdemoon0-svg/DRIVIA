@@ -266,24 +266,30 @@ export function isSignedIn(state: AuthSessionState): boolean {
 }
 
 /**
- * Convenience wrapper around `signOut` for components: exposes a busy flag and
- * an already-translated error message.
+ * Convenience wrapper around `signOut` for components: exposes a busy flag, an
+ * already-translated error message, and whether the sign-out really happened.
+ *
+ * The boolean matters: `signOut` can fail (network down, revoked token). The
+ * caller must not navigate away pretending the user is signed out while the
+ * session is still live — it would leave a valid session behind a login form.
  */
 export function useSignOut(): {
-  signOutNow: () => Promise<void>;
+  signOutNow: () => Promise<boolean>;
   isSigningOut: boolean;
   error: string | null;
 } {
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const signOutNow = useCallback(async () => {
+  const signOutNow = useCallback(async (): Promise<boolean> => {
     setIsSigningOut(true);
     setError(null);
     try {
       await signOut();
+      return true;
     } catch (signOutError) {
       setError(describeAuthError(signOutError));
+      return false;
     } finally {
       setIsSigningOut(false);
     }
