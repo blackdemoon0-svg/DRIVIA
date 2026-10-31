@@ -17,6 +17,7 @@ import {
   describeAuthError,
   isSignedIn,
   readSession,
+  resolveEmailRedirectUrl,
   signInWithEmail,
   signOut,
   signUpWithEmail,
@@ -165,6 +166,64 @@ function restore() {
   assert.equal(await readSession(), null, "aucune session tant que l'adresse n'est pas confirmée");
   restore();
   pass("inscription (confirmation activée) : « vérifiez votre boîte mail », aucune session créée");
+}
+
+// ---------------------------------------------------------------------------
+// 2b. The confirmation link must come back to the deployment being used
+// ---------------------------------------------------------------------------
+{
+  // Pure helper: only a real web origin is accepted.
+  assert.equal(
+    resolveEmailRedirectUrl({ origin: "https://drivia-ncdrsj7oq-blackdemoon0-2303s-projects.vercel.app" }),
+    "https://drivia-ncdrsj7oq-blackdemoon0-2303s-projects.vercel.app",
+    "l'origine du Preview doit être transmise telle quelle (sans slash final)",
+  );
+  assert.equal(resolveEmailRedirectUrl({ origin: "http://localhost:5173" }), "http://localhost:5173");
+  assert.equal(resolveEmailRedirectUrl({ origin: "file://" }), undefined, "un protocole non web est refusé");
+  assert.equal(resolveEmailRedirectUrl({ origin: "pas une url" }), undefined);
+  assert.equal(resolveEmailRedirectUrl({ origin: "" }), undefined);
+  assert.equal(resolveEmailRedirectUrl(null), undefined, "hors navigateur : rien n'est envoyé");
+  assert.equal(resolveEmailRedirectUrl(undefined), undefined);
+  pass("redirect de confirmation : origine web acceptée, protocole invalide et hors navigateur refusés");
+}
+
+{
+  // Real call: the origin must reach GoTrue as `redirect_to`.
+  const ORIGIN = "https://drivia-ncdrsj7oq-blackdemoon0-2303s-projects.vercel.app";
+  globalThis.window = { location: { origin: ORIGIN } };
+
+  const calls = installFetch({
+    auth: { signup: () => json({ id: USER_ID, email: EMAIL, identities: [] }, 200) },
+  });
+
+  const result = await signUpWithEmail(EMAIL, "motdepasse1");
+  assert.deepEqual(result, { status: "confirmation-required" });
+
+  const signup = calls.find((c) => c.startsWith("POST /auth/v1/signup"));
+  assert.ok(signup, "l'appel signup doit être émis");
+  assert.ok(
+    signup.includes(`redirect_to=${encodeURIComponent(ORIGIN)}`),
+    `le lien de confirmation doit revenir sur ${ORIGIN} — reçu : ${signup}`,
+  );
+  assert.ok(!signup.includes("redirect_to=&"), "aucun redirect vide ne doit être envoyé");
+
+  delete globalThis.window;
+  restore();
+  pass("inscription : emailRedirectTo = origine courante, transmis à Supabase (redirect_to)");
+}
+
+{
+  // Without a browser (tests, SSR) no redirect is sent: Supabase keeps its own
+  // Site URL rather than receiving an empty parameter.
+  const calls = installFetch({
+    auth: { signup: () => json({ id: USER_ID, email: EMAIL, identities: [] }, 200) },
+  });
+  await signUpWithEmail(EMAIL, "motdepasse1");
+  const signup = calls.find((c) => c.startsWith("POST /auth/v1/signup"));
+  assert.ok(signup);
+  assert.ok(!signup.includes("redirect_to"), `aucun redirect hors navigateur — reçu : ${signup}`);
+  restore();
+  pass("inscription hors navigateur : aucun redirect_to (repli sur le Site URL du projet)");
 }
 
 // ---------------------------------------------------------------------------

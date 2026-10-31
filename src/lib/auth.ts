@@ -137,6 +137,34 @@ export async function readSession(): Promise<Session | null> {
 }
 
 /**
+ * Address the confirmation e-mail must send the user back to.
+ *
+ * Without it, Supabase falls back to the project's **Site URL**, which is a
+ * fixed deployment address: a newer Preview would send the visitor to an older
+ * build. Using the origin the form was submitted from keeps the round trip on
+ * the deployment the user is actually looking at.
+ *
+ * Nothing is returned outside a browser, or for an origin that is not a real
+ * web origin (`file:`, `about:`…): GoTrue would otherwise receive an
+ * unusable redirect. The value is exactly `window.location.origin`, with no
+ * trailing slash and no path — it must also be listed in the project's
+ * *Redirect URLs* to be accepted.
+ */
+export function resolveEmailRedirectUrl(
+  location: { origin?: unknown } | null | undefined,
+): string | undefined {
+  const origin = typeof location?.origin === "string" ? location.origin.trim() : "";
+  if (!origin) return undefined;
+  try {
+    const { protocol } = new URL(origin);
+    if (protocol !== "http:" && protocol !== "https:") return undefined;
+  } catch {
+    return undefined;
+  }
+  return origin;
+}
+
+/**
  * Create an account.
  *
  * With "Confirm email" enabled (the project's setting), Supabase returns no
@@ -148,7 +176,16 @@ export async function signUpWithEmail(email: string, password: string): Promise<
   if (invalid) throw new AuthError(invalid);
 
   const client = await getSupabaseClient();
-  const { data, error } = await client.auth.signUp({ email: cleanEmail, password });
+  const emailRedirectTo = resolveEmailRedirectUrl(
+    typeof window === "undefined" ? null : window.location,
+  );
+  const { data, error } = await client.auth.signUp({
+    email: cleanEmail,
+    password,
+    // Sent as `?redirect_to=`; omitted entirely when there is no usable origin,
+    // so Supabase keeps its own Site URL instead of receiving an empty value.
+    ...(emailRedirectTo ? { options: { emailRedirectTo } } : {}),
+  });
   if (error) throw new AuthError(describeAuthError(error));
 
   // An existing address returns a user with an empty `identities` array while
