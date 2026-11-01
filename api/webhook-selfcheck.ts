@@ -13,6 +13,7 @@
  * It never returns a secret. Environment variables are reported as booleans, and
  * Paddle's signing secret is used in-process only, to sign the probe payload.
  */
+import crypto from "node:crypto";
 import { computeSignature } from "./paddle-webhook.js";
 
 type ProbeRequest = {
@@ -134,10 +135,10 @@ function describeEnvNames() {
  * key that already exists in the project. Reports the destination URL and the
  * subscribed event types — never the key, never the endpoint secret.
  */
-async function probePaddleDestinations(apiKey: string) {
+async function probePaddleDestinations(apiKey: string, webhookSecret: string) {
   if (!apiKey) return { skipped: "PADDLE_SANDBOX_API_KEY is absent" };
   try {
-    const response = await fetch("https://sandbox-api.paddle.com/notifications/settings?per_page=20", {
+    const response = await fetch("https://sandbox-api.paddle.com/notification-settings?per_page=20", {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
     const text = await response.text();
@@ -150,6 +151,7 @@ async function probePaddleDestinations(apiKey: string) {
         type?: string;
         active?: boolean;
         destination?: string;
+        endpoint_secret_key?: string;
         subscribed_events?: Array<{ name?: string }>;
       }>;
     };
@@ -160,8 +162,19 @@ async function probePaddleDestinations(apiKey: string) {
       } catch {
         destinationUrl = item.destination ?? null;
       }
+      // Compare the destination's signing secret with the one the function
+      // verifies against — equality only, never either value.
+      const digest = (value: string) =>
+        crypto.createHash("sha256").update(value.trim(), "utf8").digest("hex");
+      const paddleSecret = (item.endpoint_secret_key ?? "").trim();
+      const secretsMatch =
+        paddleSecret.length > 0 && webhookSecret.length > 0
+          ? digest(paddleSecret) === digest(webhookSecret)
+          : null;
+
       return {
         id: item.id ?? null,
+        secretsMatch,
         description: item.description ?? null,
         type: item.type ?? null,
         active: item.active ?? null,
@@ -302,6 +315,7 @@ export default async function handler(request: ProbeRequest, response: ProbeResp
 
   const paddleDestinations = await probePaddleDestinations(
     process.env.PADDLE_SANDBOX_API_KEY?.trim() ?? "",
+    secret,
   );
 
   const anonKey = process.env.SUPABASE_ANON_KEY?.trim() ?? "";
