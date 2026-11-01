@@ -261,6 +261,15 @@ export default async function handler(request: ProbeRequest, response: ProbeResp
 
   return response.status(200).json({
     probe: "webhook-selfcheck",
+    // Which deployment actually answered: proves whether a rebuild picked up a
+    // changed variable, or whether the branch alias is still serving an older one.
+    deployment: {
+      id: process.env.VERCEL_DEPLOYMENT_ID ?? null,
+      url: process.env.VERCEL_URL ?? null,
+      env: process.env.VERCEL_ENV ?? null,
+      gitCommitSha: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ?? null,
+      gitRef: process.env.VERCEL_GIT_COMMIT_REF ?? null,
+    },
     keyDiagnostics: {
       supabaseUrlHost: supabaseUrl ? new URL(supabaseUrl).hostname : null,
       urlProjectRef: urlRef,
