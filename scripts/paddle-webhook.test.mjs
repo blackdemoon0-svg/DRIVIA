@@ -6,6 +6,7 @@
  * key, token or Paddle identifier is used anywhere in this file.
  */
 import crypto from "node:crypto";
+import { EventEmitter } from "node:events";
 import assert from "node:assert";
 import handler, {
   computeSignature,
@@ -937,54 +938,94 @@ async function deliver(payload, { signature, rawBody, method = "POST", env = {} 
 
 
 // ---------------------------------------------------------------------------
-// 9. Robustesse du corps brut : la cause du 500 observé chez Paddle
+// 9. Corps brut : reproduction du runtime Node de Vercel
 // ---------------------------------------------------------------------------
-// Sur Vercel, la fonction recevait un corps dont l'itération levait une
-// exception (flux déjà consommé), ou un corps déjà transformé en objet. Dans les
-// deux cas la livraison finissait en 500 opaque, sans trace ni raison.
-{
-  const cases = [
-    ["flux lisible", { [Symbol.asyncIterator]: async function* () { yield Buffer.from("{}"); } }, "stream"],
-    ["corps déjà analysé", { body: { a: 1 } }, "reserialized"],
-    ["rawBody fourni", { rawBody: "{}" }, "rawBody"],
-  ];
-  for (const [label, shape, source] of cases) {
-    const result = await readRawBody({ headers: {}, ...shape });
-    assert.equal(result.ok, true, `${label} : des octets doivent être obtenus`);
-    assert.equal(result.source, source, `${label} : source inattendue`);
-  }
+// Sur ce runtime, `request.body` est un GETTER PARESSEUX : le seul fait de le
+// lire déclenche le parsing JSON et vide le flux. `for await` sur un flux déjà
+// vidé ne rend rien — d'où la 500 puis la 401 observées chez Paddle. Les octets
+// d'origine ne restent accessibles que par les écouteurs `data` / `end`.
+//
+// Ce double reproduit ces trois propriétés. Il ne touche à aucun service.
+function createVercelRequest({ payload, headers = {}, method = "POST" }) {
+  const bytes = Buffer.from(JSON.stringify(payload), "utf8");
+  const emitter = new EventEmitter();
+  const state = { drained: false, parsed: undefined, emitted: false };
 
-  const failures = [
-    ["corps absent", { headers: {} }, "body_empty"],
-    ["flux déjà consommé", { headers: {}, readableEnded: true }, "body_empty"],
-    [
-      "flux qui lève pendant l'itération",
-      { headers: {}, [Symbol.asyncIterator]: async function* () { throw new Error("premature close"); } },
-      "body_empty",
-    ],
-  ];
-  for (const [label, shape, reason] of failures) {
-    // Must resolve, never reject: an escaping exception was the 500.
-    const result = await readRawBody({ ...shape });
-    assert.equal(result.ok, false, `${label} : doit échouer proprement`);
-    assert.equal(result.reason, reason, `${label} : raison inattendue`);
-  }
-  pass("corps brut : flux consommé ou itération en erreur → échec explicite, jamais une exception");
+  // Vercel restaure les octets d'origine sur `data` / `end`.
+  const scheduleReplay = () => {
+    if (state.emitted) return;
+    state.emitted = true;
+    setImmediate(() => {
+      emitter.emit("data", bytes);
+      emitter.emit("end");
+    });
+  };
+
+  emitter.on("newListener", (event) => {
+    if (event === "data" || event === "end") scheduleReplay();
+  });
+
+  const request = {
+    method,
+    headers,
+    on: (event, listener) => emitter.on(event, listener),
+    once: (event, listener) => emitter.once(event, listener),
+    // `for await` sur un flux déjà vidé ne rend aucun octet.
+    [Symbol.asyncIterator]: async function* () {
+      if (state.drained) return;
+      state.drained = true;
+      yield bytes;
+    },
+  };
+
+  Object.defineProperty(request, "body", {
+    enumerable: true,
+    get() {
+      if (!state.drained) {
+        state.drained = true; // le parsing consomme le flux
+        state.parsed = JSON.parse(bytes.toString("utf8"));
+        scheduleReplay();
+      }
+      return state.parsed;
+    },
+  });
+
+  return request;
 }
 
 {
-  // A parsed body is re-serialised and the HMAC is still verified over those
-  // exact bytes: a legitimate payload can now be accepted even when the runtime
-  // consumed the stream. A wrong signature is still refused.
+  // Le getter ne doit jamais être touché : les octets signés sont dans le flux.
+  const payload = { event_id: "evt_shape", event_type: "subscription.created" };
+  const read = await readRawBody(createVercelRequest({ payload }));
+  assert.equal(read.ok, true, "les octets doivent être obtenus depuis le flux");
+  assert.equal(read.source, "stream", "le flux doit être lu avant le getter `body`");
+  assert.deepEqual(JSON.parse(read.buffer.toString("utf8")), payload);
+  pass("corps brut : le flux est lu AVANT `body`, le getter paresseux n'est pas déclenché");
+}
+
+{
+  // Même si le flux a déjà été consommé, les octets restent accessibles sur
+  // `data` / `end` : la vérification doit encore disposer des vraies données.
+  const payload = { event_id: "evt_shape2", event_type: "subscription.created" };
+  const request = createVercelRequest({ payload });
+  void request.body; // quelque chose a déjà parsé le corps
+
+  const read = await readRawBody(request);
+  assert.equal(read.ok, true, "les octets doivent rester récupérables après parsing");
+  assert.deepEqual(JSON.parse(read.buffer.toString("utf8")), payload);
+  pass("corps brut : après parsing par la plateforme, les octets d'origine sont récupérés");
+}
+
+{
+  // Chaîne complète sur une requête « forme Vercel » : signature valide,
+  // événement traité, abonnement écrit ET ligne `webhook_events`.
   const users = { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } };
   const stub = createSupabaseStub({ users });
   installQueryRouting(stub);
 
   const event = subscriptionEvent();
-  const parsed = JSON.parse(JSON.stringify(event));
-  const serialised = JSON.stringify(parsed);
-  const ts = String(Math.floor(Date.now() / 1000));
-  const header = `ts=${ts};h1=${computeSignature(Buffer.from(serialised), ts, TEST_SECRET)}`;
+  const raw = JSON.stringify(event);
+  const header = sign(raw);
 
   const saved = { ...process.env };
   Object.assign(process.env, {
@@ -995,29 +1036,61 @@ async function deliver(payload, { signature, rawBody, method = "POST", env = {} 
 
   const { res, out } = makeResponse();
   await handler(
-    { method: "POST", headers: { "paddle-signature": header }, body: parsed },
+    createVercelRequest({ payload: event, headers: { "paddle-signature": header } }),
     res,
   );
   process.env = saved;
 
-  assert.equal(out.status, 200, "un corps déjà analysé et correctement signé doit être accepté");
+  assert.equal(out.status, 200, `attendu 200, reçu ${out.status} ${JSON.stringify(out.body)}`);
   assert.equal(out.body.received, true);
   assert.ok(findStoredSubscription(stub.store, event.data.id), "l'abonnement doit être enregistré");
+  const row = stub.store.events.get(event.event_id);
+  assert.ok(row, "une ligne webhook_events doit être écrite");
+  assert.equal(row.status, "processed", "l'événement doit être finalisé en `processed`");
   stub.restore();
-  pass("corps déjà analysé + signature valide : livraison acceptée et abonnement enregistré");
+  pass("requête forme Vercel : 200, abonnement enregistré, événement journalisé");
 }
 
 {
-  // Nothing may escape the handler: a broken response object included.
+  // Une signature invalide reste refusée, et la réponse indique d'où venaient
+  // les octets — la seule observabilité disponible sans logs serveur.
+  const payload = subscriptionEvent();
+  const saved = { ...process.env };
+  Object.assign(process.env, { PADDLE_WEBHOOK_SECRET: TEST_SECRET, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SERVICE_ROLE });
+  const { res, out } = makeResponse();
+  await handler(
+    createVercelRequest({
+      payload,
+      headers: {
+        // Horodatage courant, HMAC faux : le refus doit venir de la signature,
+        // pas de la fenêtre de fraîcheur.
+        "paddle-signature": `ts=${Math.floor(Date.now() / 1000)};h1=${"deadbeef".repeat(8)}`,
+      },
+    }),
+    res,
+  );
+  process.env = saved;
+  assert.equal(out.status, 401);
+  assert.equal(out.body.reason, "mismatch");
+  assert.equal(out.body.bodySource, "stream", "les octets signés doivent venir du flux");
+  pass("signature invalide : 401 `mismatch` + `bodySource: stream` (diagnostic sans logs)");
+}
+
+{
+  // Rien ne doit s'échapper du handler : même un objet de réponse cassé.
   const saved = { ...process.env };
   process.env.PADDLE_WEBHOOK_SECRET = TEST_SECRET;
   const brokenResponse = {
-    status() { throw new Error("response broken"); },
+    status() {
+      throw new Error("response broken");
+    },
     json() {},
-    setHeader() { throw new Error("headers broken"); },
+    setHeader() {
+      throw new Error("headers broken");
+    },
   };
   const outcome = await handler(
-    { method: "POST", headers: {}, body: null },
+    createVercelRequest({ payload: { event_id: "evt_broken" }, method: "POST" }),
     brokenResponse,
   );
   process.env = saved;

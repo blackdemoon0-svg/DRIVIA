@@ -666,76 +666,131 @@ export type RawBodyRead =
   | {
       ok: true;
       buffer: Buffer;
-      /** How the bytes were obtained — surfaced in the failure log only. */
-      source: "rawBody" | "body-bytes" | "stream" | "reserialized";
+      /** How the bytes were obtained — surfaced in rejection bodies. */
+      source: "rawBody" | "stream" | "buffered" | "body-bytes" | "reserialized";
     }
   | { ok: false; reason: "body_empty" | "body_unreadable" };
+
+/** How long to wait for a stream that may never emit again. */
+const BODY_STREAM_TIMEOUT_MS = 1500;
+
+type StreamLike = {
+  on?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+  read?: () => unknown;
+};
+
+/**
+ * Collect the body from the request stream.
+ *
+ * Waits for `end` rather than resolving on the first chunk: a fragmented
+ * delivery would otherwise be hashed from its first chunk only. The timeout
+ * exists so a stream that will never emit again cannot hang the function until
+ * the platform kills it.
+ */
+function readBodyStream(request: unknown, timeoutMs: number): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const stream = request as StreamLike;
+    if (!stream || typeof stream.on !== "function") {
+      resolve(null);
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(chunks.length > 0 ? Buffer.concat(chunks) : null);
+    };
+
+    try {
+      stream.on("data", (chunk: unknown) => {
+        if (Buffer.isBuffer(chunk)) chunks.push(chunk);
+        else if (typeof chunk === "string") chunks.push(Buffer.from(chunk, "utf8"));
+      });
+      stream.on("end", finish);
+      stream.on("close", finish);
+      stream.on("error", finish);
+    } catch {
+      resolve(null);
+      return;
+    }
+
+    timer = setTimeout(finish, timeoutMs);
+  });
+}
 
 /**
  * Obtain the bytes Paddle signed.
  *
- * History: this used `for await` on the request unconditionally and returned
- * `null` when the runtime handed over a parsed body. On Vercel that produced an
- * opaque 500 on every delivery — either from hashing an empty buffer or from an
- * exception thrown while iterating an already-consumed stream. Both cases are
- * now handled explicitly, and nothing here can throw.
+ * Ordering is the whole point. On Vercel's Node runtime `request.body` is a
+ * LAZY GETTER: merely reading it parses the JSON and drains the stream, so the
+ * bytes that were signed are gone. Reading `.body` first is what made every
+ * delivery fail — as a 500 while the drained stream was iterated, then as a 401
+ * once that had been guarded. The stream is therefore read BEFORE `.body` is
+ * ever touched, and `.body` is only consulted when no bytes are left to read.
  *
- * The order matters:
- *  1. bytes preserved by the runtime (`rawBody`, then a Buffer/string `body`);
- *  2. the stream, but only while it is still readable;
- *  3. last resort, a body that was already parsed into an object: re-serialise
- *     it. This never weakens the check — the HMAC is still verified over these
- *     exact bytes, so a wrong reconstruction simply fails with 401.
+ * Nothing here throws: an escaping exception is what turned a delivery into an
+ * opaque `500 FUNCTION_INVOCATION_FAILED`.
  */
-export async function readRawBody(request: ApiRequest): Promise<RawBodyRead> {
+export async function readRawBody(
+  request: ApiRequest,
+  options: { timeoutMs?: number } = {},
+): Promise<RawBodyRead> {
   const candidate = request as {
     rawBody?: unknown;
     body?: unknown;
-    readableEnded?: boolean;
-    destroyed?: boolean;
   };
 
+  // `rawBody` is a plain property, never a lazy getter: safe to consult first.
   if (Buffer.isBuffer(candidate.rawBody)) {
     return { ok: true, buffer: candidate.rawBody, source: "rawBody" };
   }
   if (typeof candidate.rawBody === "string" && candidate.rawBody.length > 0) {
     return { ok: true, buffer: Buffer.from(candidate.rawBody, "utf8"), source: "rawBody" };
   }
-  if (Buffer.isBuffer(candidate.body)) {
-    return { ok: true, buffer: candidate.body, source: "body-bytes" };
-  }
-  if (typeof candidate.body === "string" && candidate.body.length > 0) {
-    return { ok: true, buffer: Buffer.from(candidate.body, "utf8"), source: "body-bytes" };
+
+  // Stream first: this is the only path that yields the exact signed bytes.
+  const streamed = await readBodyStream(request, options.timeoutMs ?? BODY_STREAM_TIMEOUT_MS);
+  if (streamed && streamed.length > 0) {
+    return { ok: true, buffer: streamed, source: "stream" };
   }
 
-  // Touching a consumed or destroyed stream throws: that is what turned a
-  // delivery into a 500 with no trace. Only read while it can still be read.
-  const iterable = request[Symbol.asyncIterator];
-  if (typeof iterable === "function" && !candidate.readableEnded && !candidate.destroyed) {
-    try {
-      const chunks: Buffer[] = [];
-      for await (const chunk of request as AsyncIterable<Buffer | string>) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8"));
+  // Whatever the stream buffered but never emitted.
+  try {
+    const stream = request as unknown as StreamLike;
+    if (typeof stream.read === "function") {
+      const remainder = stream.read();
+      if (Buffer.isBuffer(remainder) && remainder.length > 0) {
+        return { ok: true, buffer: remainder, source: "buffered" };
       }
-      const buffer = Buffer.concat(chunks);
-      if (buffer.length > 0) return { ok: true, buffer, source: "stream" };
-    } catch {
-      // Reported by the caller as an explicit failure, never as a crash.
     }
+  } catch {
+    // Fall through: no readable bytes remain.
   }
 
-  if (candidate.body !== null && typeof candidate.body === "object") {
+  // Last resort: the platform already parsed the body. Reading `.body` here is
+  // deliberate — the stream is gone, so the getter is the only way in.
+  const body = candidate.body;
+  if (Buffer.isBuffer(body)) return { ok: true, buffer: body, source: "body-bytes" };
+  if (typeof body === "string" && body.length > 0) {
+    return { ok: true, buffer: Buffer.from(body, "utf8"), source: "body-bytes" };
+  }
+  if (body !== null && typeof body === "object") {
     try {
-      const buffer = Buffer.from(JSON.stringify(candidate.body), "utf8");
+      const buffer = Buffer.from(JSON.stringify(body), "utf8");
       if (buffer.length > 0) return { ok: true, buffer, source: "reserialized" };
     } catch {
-      // Unserialisable body: fall through to the explicit failure.
+      // Unserialisable: report the failure explicitly.
     }
   }
 
   return {
     ok: false,
-    reason: candidate.body === undefined || candidate.body === null ? "body_empty" : "body_unreadable",
+    reason: body === undefined || body === null ? "body_empty" : "body_unreadable",
   };
 }
 
@@ -784,7 +839,12 @@ async function handleWebhook(request: ApiRequest, response: ApiResponse) {
 
   if (!verdict.ok) {
     // 401 lets Paddle retry, and tells an attacker nothing beyond "rejected".
-    return response.status(401).json({ error: "Invalid signature.", reason: verdict.reason });
+    // `bodySource` says how the bytes were obtained, which is the one thing the
+    // notification log cannot otherwise reveal: "stream" means the signed bytes
+    // were available, "reserialized" means the platform had already parsed them.
+    return response
+      .status(401)
+      .json({ error: "Invalid signature.", reason: verdict.reason, bodySource: raw.source });
   }
 
   let payload: unknown;
