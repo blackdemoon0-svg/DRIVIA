@@ -103,6 +103,31 @@ async function probeRest(url: string, key: string | undefined, table: string) {
   }
 }
 
+
+/** Enumerate candidate variable NAMES (never values) and their key shape. */
+function describeEnvNames() {
+  const interesting = /SUPABASE|PADDLE|SERVICE|SECRET|KEY/i;
+  return Object.keys(process.env)
+    .filter((name) => interesting.test(name) && !/^VERCEL/.test(name))
+    .sort()
+    .map((name) => {
+      const value = process.env[name] ?? "";
+      const trimmed = value.trim();
+      return {
+        name,
+        shape: trimmed.startsWith("eyJ")
+          ? "jwt"
+          : trimmed.startsWith("sb_secret_")
+            ? "new-style-secret"
+            : trimmed.startsWith("sb_publishable_")
+              ? "publishable"
+              : trimmed.length === 0
+                ? "empty"
+                : "other",
+      };
+    });
+}
+
 const jsonHeaders = { "Content-Type": "application/json" };
 
 function readHeader(request: ProbeRequest, name: string): string | null {
@@ -242,6 +267,8 @@ export default async function handler(request: ProbeRequest, response: ProbeResp
       serviceKey: serviceInfo,
       serviceKeyRefMatchesUrl: serviceInfo.jwtRef ? serviceInfo.jwtRef === urlRef : null,
       anonKeyPresent: anonKey.length > 0,
+      serviceKeyEqualsAnonKey: serviceKey.length > 0 && serviceKey === anonKey,
+      candidateEnvNames: describeEnvNames(),
       restWithService,
       restWithAnon,
     },
