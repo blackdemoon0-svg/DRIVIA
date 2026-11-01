@@ -322,6 +322,31 @@ async function readEventStatus(
   return (status as WebhookEventRecord["status"]) ?? null;
 }
 
+/**
+ * Record why an event is stuck, without closing it.
+ *
+ * Used for unresolved conflicts: the status must stay `received` so the event
+ * remains visible as unfinished work, while the reason explains what blocked it.
+ */
+async function annotateEvent(
+  supabase: SupabaseEnv,
+  eventId: string,
+  reason: string | null,
+): Promise<void> {
+  const response = await supabaseRequest(
+    supabase,
+    `/rest/v1/webhook_events?event_id=eq.${encodeURIComponent(eventId)}`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ reason }),
+    },
+  );
+  if (!response.ok) {
+    throw new InfraError(`webhook_events annotate failed (${response.status})`);
+  }
+}
+
 async function finalizeEvent(
   supabase: SupabaseEnv,
   eventId: string,
@@ -423,10 +448,18 @@ export type SubscriptionRow = {
   source_updated_at: string;
 };
 
+/**
+ * Result of writing a subscription row.
+ *
+ * A `409` is never turned into a success: it is returned as `conflict` so the
+ * caller can look for evidence before deciding anything.
+ */
+export type UpsertResult = { status: "written" } | { status: "conflict" };
+
 async function upsertSubscription(
   supabase: SupabaseEnv,
   row: SubscriptionRow,
-): Promise<void> {
+): Promise<UpsertResult> {
   // `on_conflict` is mandatory here: the table's primary key is `id`, not
   // `paddle_subscription_id`. Without the parameter PostgREST resolves
   // duplicates on the primary key, which the webhook never sends, so a retried
@@ -444,9 +477,169 @@ async function upsertSubscription(
       body: JSON.stringify(row),
     },
   );
+
+  // 409 is a real answer, not an outage: PostgREST refused the write because of
+  // a unique constraint. Which constraint matters, so it is investigated by the
+  // caller instead of being answered with a retry loop.
+  if (response.status === 409) return { status: "conflict" };
   if (!response.ok) {
     throw new InfraError(`subscriptions upsert failed (${response.status})`);
   }
+  return { status: "written" };
+}
+
+/**
+ * Everything needed to explain a conflict, read from the table itself.
+ *
+ * Only identity and state are read — never used as proof that a payment
+ * happened. The only payment evidence is the signed Paddle event being handled.
+ */
+export type ConflictEvidence = {
+  /** Row holding the same `paddle_subscription_id`, if any. */
+  sameSubscriptionId: StoredConflictRow | null;
+  /** In-force rows for the same Paddle customer, whatever their subscription id. */
+  sameCustomerInForce: StoredConflictRow[];
+};
+
+export type StoredConflictRow = {
+  paddle_subscription_id: string | null;
+  user_id: string | null;
+  paddle_customer_id: string | null;
+  plan: string | null;
+  status: string | null;
+  paddle_price_id: string | null;
+  current_period_ends_at: string | null;
+};
+
+const CONFLICT_COLUMNS =
+  "paddle_subscription_id,user_id,paddle_customer_id,plan,status,paddle_price_id,current_period_ends_at";
+
+/** Statuses covered by the partial unique index on `paddle_customer_id`. */
+const IN_FORCE_STATUSES = ["active", "trialing", "past_due", "paused"] as const;
+
+async function readConflictEvidence(
+  supabase: SupabaseEnv,
+  row: SubscriptionRow,
+): Promise<ConflictEvidence> {
+  const byIdResponse = await supabaseRequest(
+    supabase,
+    `/rest/v1/subscriptions?paddle_subscription_id=eq.${encodeURIComponent(
+      row.paddle_subscription_id,
+    )}&select=${CONFLICT_COLUMNS}`,
+  );
+  if (!byIdResponse.ok) {
+    throw new InfraError(`subscriptions conflict read failed (${byIdResponse.status})`);
+  }
+  const byIdRows = (await byIdResponse.json()) as StoredConflictRow[];
+
+  let sameCustomerInForce: StoredConflictRow[] = [];
+  if (row.paddle_customer_id) {
+    const byCustomerResponse = await supabaseRequest(
+      supabase,
+      `/rest/v1/subscriptions?paddle_customer_id=eq.${encodeURIComponent(
+        row.paddle_customer_id,
+      )}&status=in.(${IN_FORCE_STATUSES.join(",")})&select=${CONFLICT_COLUMNS}`,
+    );
+    if (!byCustomerResponse.ok) {
+      throw new InfraError(`subscriptions conflict read failed (${byCustomerResponse.status})`);
+    }
+    sameCustomerInForce = (await byCustomerResponse.json()) as StoredConflictRow[];
+  }
+
+  return {
+    sameSubscriptionId: byIdRows[0] ?? null,
+    sameCustomerInForce: Array.isArray(sameCustomerInForce) ? sameCustomerInForce : [],
+  };
+}
+
+export type ConflictVerdict =
+  /** Provably the same state this event would write: nothing to reconcile. */
+  | { kind: "already_applied"; reason: string }
+  /** The payment is kept for a human: never discarded, never counted as done. */
+  | { kind: "unresolved"; reason: string };
+
+/**
+ * Explain a `409` using the identifiers Paddle sent and what the table holds.
+ *
+ * The bar for "already_applied" is deliberately high: same subscription id, same
+ * account, same plan, same status, same price, same period end. Anything less
+ * is unresolved, because resolving it would mean guessing which of two payments
+ * to keep. The reason string carries the Paddle ids so an operator can find the
+ * payment in Paddle without a schema change.
+ */
+export function classifyConflict(
+  evidence: ConflictEvidence,
+  incoming: SubscriptionRow,
+): ConflictVerdict {
+  const evidenceTag = `${incoming.paddle_subscription_id}/${incoming.paddle_customer_id ?? "no-customer"}`;
+
+  const sameId = evidence.sameSubscriptionId;
+  if (sameId) {
+    // The same Paddle subscription already exists under another account: the
+    // payment must not be moved, and must not be silently dropped either.
+    if (sameId.user_id && sameId.user_id !== incoming.user_id) {
+      return {
+        kind: "unresolved",
+        reason: `conflict_other_account:${evidenceTag}`,
+      };
+    }
+
+    const identical =
+      sameId.user_id === incoming.user_id &&
+      sameId.plan === incoming.plan &&
+      sameId.status === incoming.status &&
+      sameId.paddle_price_id === incoming.paddle_price_id &&
+      sameId.current_period_ends_at === incoming.current_period_ends_at;
+
+    if (identical) {
+      return {
+        kind: "already_applied",
+        reason: `conflict_already_applied:${evidenceTag}`,
+      };
+    }
+
+    // Same account, but the stored state differs from what this event carries
+    // (a renewal, an upgrade, a cancellation). We could not write it, so it
+    // stays for a human: assuming the older state is "fine" would lose money.
+    return {
+      kind: "unresolved",
+      reason: `conflict_state_diverged:${evidenceTag}`,
+    };
+  }
+
+  if (!incoming.paddle_customer_id) {
+    return {
+      kind: "unresolved",
+      reason: `conflict_without_customer:${evidenceTag}`,
+    };
+  }
+
+  const others = evidence.sameCustomerInForce.filter(
+    (row) => row.paddle_subscription_id !== incoming.paddle_subscription_id,
+  );
+
+  if (others.length === 0) {
+    // A conflict we cannot explain is not a success.
+    return {
+      kind: "unresolved",
+      reason: `conflict_unexplained:${evidenceTag}`,
+    };
+  }
+
+  // Another subscription is in force for this Paddle customer. Two live
+  // subscriptions is a billing situation only a human can settle.
+  const foreign = others.find((row) => row.user_id && row.user_id !== incoming.user_id);
+  if (foreign) {
+    return {
+      kind: "unresolved",
+      reason: `conflict_customer_bound_elsewhere:${evidenceTag}`,
+    };
+  }
+
+  return {
+    kind: "unresolved",
+    reason: `conflict_second_subscription:${evidenceTag}`,
+  };
 }
 
 /** Infrastructure failure: answer 5xx so Paddle retries. */
@@ -469,10 +662,18 @@ type SubscriptionEvent = {
 };
 
 export type HandleOutcome =
-  | { kind: "processed"; status: SubscriptionStatus }
+  /** `reason` is set when the state was already applied and provably identical. */
+  | { kind: "processed"; status: SubscriptionStatus; reason?: string }
   | { kind: "duplicate" }
   | { kind: "ignored"; reason: string }
-  | { kind: "rejected"; reason: string };
+  | { kind: "rejected"; reason: string }
+  /**
+   * A `409` that could not be resolved with certainty.
+   *
+   * The event is deliberately left in `received`: it is neither a success nor a
+   * refusal, and it must stay visible so the payment behind it is not lost.
+   */
+  | { kind: "conflict"; reason: string };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -630,7 +831,7 @@ export async function handleSubscriptionEvent(
   const period = asRecord(data.current_billing_period);
   const scheduledChange = asRecord(data.scheduled_change);
 
-  await upsertSubscription(supabase, {
+  const row: SubscriptionRow = {
     paddle_subscription_id: paddleSubscriptionId,
     user_id: attribution.userId,
     plan: mapping.plan,
@@ -646,9 +847,25 @@ export async function handleSubscriptionEvent(
     scheduled_change_effective_at: readTimestamp(scheduledChange?.effective_at),
     canceled_at: readTimestamp(data.canceled_at),
     source_updated_at: incomingAt ?? nowIso,
-  });
+  };
 
-  return { kind: "processed", status };
+  const written = await upsertSubscription(supabase, row);
+  if (written.status === "written") return { kind: "processed", status };
+
+  // 409: a unique constraint refused the write. Identify which one, with the
+  // identifiers Paddle actually sent, before deciding anything.
+  const evidence = await readConflictEvidence(supabase, row);
+  const verdict = classifyConflict(evidence, row);
+
+  if (verdict.kind === "already_applied") {
+    // Provably the exact state this event carries — checked field by field, not
+    // assumed. Reported as processed with its own reason so it stays auditable.
+    return { kind: "processed", reason: verdict.reason, status };
+  }
+
+  // Unresolved: the payment is preserved, never discarded and never counted as
+  // processed. The caller leaves the event for a human.
+  return { kind: "conflict", reason: verdict.reason };
 }
 
 // ---------------------------------------------------------------------------
@@ -897,8 +1114,25 @@ async function handleWebhook(request: ApiRequest, response: ApiResponse) {
         .json({ received: true, outcome: outcome.kind, reason: outcome.reason, event_id: eventId });
     }
 
-    await finalizeEvent(supabase, eventId, "processed", null);
-    return response.status(200).json({ received: true, event_id: eventId });
+    if (outcome.kind === "conflict") {
+      // Keep the row in `received`: it is not a success and not a refusal. The
+      // reason carries the Paddle identifiers, so the payment behind it can be
+      // found and settled by a human. 202 says "acknowledged, not completed" —
+      // Paddle stops retrying, and nothing is silently discarded.
+      await annotateEvent(supabase, eventId, outcome.reason);
+      return response.status(202).json({
+        received: true,
+        outcome: "conflict",
+        reason: outcome.reason,
+        event_id: eventId,
+      });
+    }
+
+    const reason = outcome.kind === "processed" ? outcome.reason ?? null : null;
+    await finalizeEvent(supabase, eventId, "processed", reason);
+    return response
+      .status(200)
+      .json({ received: true, reason, event_id: eventId });
   } catch (error) {
     const reason = error instanceof InfraError ? error.message : "unexpected_error";
     // 5xx so Paddle retries; no internal detail is echoed to the caller.

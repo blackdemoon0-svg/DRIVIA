@@ -128,9 +128,55 @@ function createSupabaseStub({ users = {}, seedSubscriptions = [] } = {}) {
         const existing = key === null ? null : findStoredSubscription(store, key);
         if (existing) {
           // UPDATE: the row keeps its own `id` and `created_at`.
+          // The partial customer index still applies: writing this row into an
+          // in-force state fails if ANOTHER in-force row already holds the
+          // same Paddle customer. This is the realistic source of a 409.
+          const IN_FORCE_UPDATE = ["active", "trialing", "past_due", "paused"];
+          if (existing.paddle_customer_id && IN_FORCE_UPDATE.includes(row.status)) {
+            const clash = [...store.subscriptions.values()].find(
+              (stored) =>
+                stored.id !== existing.id &&
+                stored.paddle_customer_id === existing.paddle_customer_id &&
+                IN_FORCE_UPDATE.includes(stored.status),
+            );
+            if (clash) {
+              return json(
+                {
+                  code: "23505",
+                  message:
+                    'duplicate key value violates unique constraint "subscriptions_paddle_customer_id_idx"',
+                },
+                409,
+              );
+            }
+          }
           const updated = { ...existing, ...row, id: existing.id };
           store.subscriptions.set(existing.id, updated);
           return json(null, 201);
+        }
+
+        // Fidelity to migration 0002's partial unique index: one Paddle
+        // customer may hold only ONE subscription in force at a time. A second
+        // INSERT for the same customer with an in-force status answers 409,
+        // exactly as PostgREST does — this is the conflict under test.
+        const IN_FORCE = ["active", "trialing", "past_due", "paused"];
+        if (row.paddle_customer_id && IN_FORCE.includes(row.status)) {
+          const clash = [...store.subscriptions.values()].find(
+            (stored) =>
+              stored.paddle_customer_id === row.paddle_customer_id &&
+              IN_FORCE.includes(stored.status) &&
+              stored.paddle_subscription_id !== row.paddle_subscription_id,
+          );
+          if (clash) {
+            return json(
+              {
+                code: "23505",
+                message:
+                  'duplicate key value violates unique constraint "subscriptions_paddle_customer_id_idx"',
+              },
+              409,
+            );
+          }
         }
 
         // Insert: the database supplies `id` and `created_at` on its own.
@@ -177,11 +223,29 @@ function installQueryRouting(stub) {
       return new Response(JSON.stringify(row ? [{ status: row.status }] : []), { status: 200 });
     }
     if (method === "GET" && target.pathname === "/rest/v1/subscriptions") {
-      const id = decodeURIComponent(
-        (target.searchParams.get("paddle_subscription_id") ?? "").slice(3),
-      );
-      const row = findStoredSubscription(stub.store, id);
-      return new Response(JSON.stringify(row ? [row] : []), { status: 200 });
+      const idFilter = target.searchParams.get("paddle_subscription_id");
+      const customerFilter = target.searchParams.get("paddle_customer_id");
+      const statusFilter = target.searchParams.get("status");
+
+      if (idFilter) {
+        const id = decodeURIComponent(idFilter.slice(3));
+        const row = findStoredSubscription(stub.store, id);
+        return new Response(JSON.stringify(row ? [row] : []), { status: 200 });
+      }
+
+      if (customerFilter) {
+        const customer = decodeURIComponent(customerFilter.slice(3));
+        const wanted = statusFilter?.startsWith("in.(")
+          ? statusFilter.slice(4, -1).split(",")
+          : null;
+        const rows = [...stub.store.subscriptions.values()].filter(
+          (row) =>
+            row.paddle_customer_id === customer && (!wanted || wanted.includes(row.status)),
+        );
+        return new Response(JSON.stringify(rows), { status: 200 });
+      }
+
+      return new Response(JSON.stringify([]), { status: 200 });
     }
     return base(url, init);
   };
@@ -1096,6 +1160,284 @@ function createVercelRequest({ payload, headers = {}, method = "POST" }) {
   process.env = saved;
   assert.equal(outcome, undefined, "le handler doit se terminer sans lever, quoi qu'il arrive");
   pass("aucune exception ne peut s'échapper du handler (plus de 500 opaque)");
+}
+
+
+// ---------------------------------------------------------------------------
+// 10. Conflits 409 : jamais un succes, jamais une perte
+// ---------------------------------------------------------------------------
+// Migration 0002 pose un index unique PARTIEL : un client Paddle ne peut avoir
+// qu'un seul abonnement en vigueur. Une seconde souscription pour le meme
+// client renvoie donc 409. Repondre 503 faisait boucler Paddle indefiniment ;
+// repondre 200 « ignore » aurait fait disparaitre un paiement. La regle est :
+// identifier le conflit, ne rien decider sans preuve, et conserver l'evenement.
+{
+  // 10a. Conflit RESOLU : le meme abonnement, meme compte, etat identique.
+  // C'est une redelivrance : l'etat a deja ete applique, verifie champ par
+  // champ — pas suppose.
+  // Même forme que les autres tests : le stub lit `/auth/v1/admin/users/:id`
+  // et attend l'utilisateur indexé par son identifiant.
+  const users = {
+    [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" },
+  };
+  const event = subscriptionEvent();
+  const incomingRow = {
+    paddle_subscription_id: event.data.id,
+    user_id: USER_ID,
+    paddle_customer_id: event.data.customer_id,
+    plan: "plus",
+    status: "active",
+    paddle_price_id: SANDBOX_PRICE_IDS.plus.month,
+    current_period_ends_at: event.data.current_billing_period.ends_at,
+    source_updated_at: event.occurred_at,
+  };
+
+  const stub = createSupabaseStub({
+    users,
+    seedSubscriptions: [
+      { ...incomingRow, id: crypto.randomUUID() },
+      // Une seconde ligne en vigueur pour le meme client Paddle : c'est elle
+      // qui fait echouer l'ecriture (index partiel), pas un etat different.
+      {
+        id: crypto.randomUUID(),
+        paddle_subscription_id: "sub_01bloquante0000000000001",
+        user_id: USER_ID,
+        paddle_customer_id: event.data.customer_id,
+        plan: "pro",
+        status: "active",
+        paddle_price_id: SANDBOX_PRICE_IDS.pro.month,
+        current_period_ends_at: "2027-03-01T00:00:00Z",
+        source_updated_at: "2026-10-01T00:00:00Z",
+      },
+    ],
+  });
+  installQueryRouting(stub);
+
+  const out = await deliver(event);
+  assert.equal(out.status, 200, `une redelivrance identique doit etre acceptee, recu ${out.status}`);
+  assert.match(String(out.body.reason ?? ""), /conflict_already_applied/, "la resolution doit etre nommee");
+  assert.equal(
+    stub.store.events.get(event.event_id).status,
+    "processed",
+    "l'evenement est clos, et lisible comme deja applique",
+  );
+  stub.restore();
+  pass("409 resolu : abonnement identique deja applique → 200 `conflict_already_applied`, evenement clos");
+}
+
+{
+  // 10b. Conflit RESOLU mais etat divergent : le meme abonnement existe, avec
+  // un autre plan. Ce n'est PAS une redelivrance : on ne peut pas l'ecrire, et
+  // supposer que l'ancien etat suffit ferait perdre un changement paye.
+  const users = {
+    [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" },
+  };
+  const event = subscriptionEvent();
+
+  const stub = createSupabaseStub({
+    users,
+    seedSubscriptions: [
+      {
+        id: crypto.randomUUID(),
+        paddle_subscription_id: event.data.id,
+        user_id: USER_ID,
+        paddle_customer_id: event.data.customer_id,
+        plan: "pro", // etat stocke different de l'evenement (plus)
+        status: "active",
+        paddle_price_id: SANDBOX_PRICE_IDS.pro.month,
+        current_period_ends_at: event.data.current_billing_period.ends_at,
+        source_updated_at: "2026-10-01T00:00:00Z",
+      },
+      {
+        id: crypto.randomUUID(),
+        paddle_subscription_id: "sub_01bloquante0000000000002",
+        user_id: USER_ID,
+        paddle_customer_id: event.data.customer_id,
+        plan: "plus",
+        status: "active",
+        paddle_price_id: SANDBOX_PRICE_IDS.plus.month,
+        current_period_ends_at: "2027-03-01T00:00:00Z",
+        source_updated_at: "2026-10-01T00:00:00Z",
+      },
+    ],
+  });
+  installQueryRouting(stub);
+
+  const out = await deliver(event);
+  assert.equal(out.status, 202, "un conflit non resolu n'est ni un succes ni un refus");
+  assert.equal(out.body.outcome, "conflict");
+  assert.match(out.body.reason, /conflict_state_diverged/);
+
+  const row = stub.store.events.get(event.event_id);
+  assert.equal(row.status, "received", "l'evenement reste ouvert pour investigation");
+  assert.match(row.reason, /conflict_state_diverged/);
+  assert.ok(row.reason.includes(event.data.id), "les identifiants Paddle doivent rester lisibles");
+  stub.restore();
+  pass("409 non resolu (etat divergent) : 202, evenement conserve en `received` avec les identifiants Paddle");
+}
+
+{
+  // 10c. Conflit non resolu : le client Paddle detient deja un AUTRE abonnement
+  // en vigueur. Deux abonnements payes : seule une personne peut trancher.
+  const users = {
+    [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" },
+  };
+  const event = subscriptionEvent();
+
+  const stub = createSupabaseStub({
+    users,
+    seedSubscriptions: [
+      {
+        paddle_subscription_id: "sub_01dejapresent00000000001",
+        user_id: USER_ID,
+        paddle_customer_id: event.data.customer_id, // meme client Paddle
+        plan: "plus",
+        status: "active",
+        paddle_price_id: SANDBOX_PRICE_IDS.plus.month,
+        current_period_ends_at: "2027-01-01T00:00:00Z",
+        source_updated_at: "2026-10-01T00:00:00Z",
+      },
+    ],
+  });
+  installQueryRouting(stub);
+
+  const out = await deliver(event);
+  assert.equal(out.status, 202);
+  assert.match(out.body.reason, /conflict_second_subscription/);
+
+  const row = stub.store.events.get(event.event_id);
+  assert.equal(row.status, "received");
+  // Le second paiement n'a cree aucune ligne: rien n'a ete perdu en base, et
+  // rien n'a ete ecrase.
+  assert.equal(stub.store.subscriptions.size, 1, "aucune ligne ne doit etre ecrasee");
+  stub.restore();
+  pass("409 non resolu (second abonnement du meme client) : 202, rien n'est ecrase ni perdu");
+}
+
+{
+  // 10d. Conflit non resolu : l'abonnement existe deja sous un AUTRE compte.
+  const users = {
+    [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" },
+  };
+  const event = subscriptionEvent();
+
+  const stub = createSupabaseStub({
+    users,
+    seedSubscriptions: [
+      {
+        paddle_subscription_id: event.data.id,
+        user_id: OTHER_USER_ID, // meme abonnement Paddle, autre proprietaire
+        paddle_customer_id: event.data.customer_id,
+        plan: "plus",
+        status: "active",
+        paddle_price_id: SANDBOX_PRICE_IDS.plus.month,
+        current_period_ends_at: event.data.current_billing_period.ends_at,
+        source_updated_at: "2026-09-01T00:00:00Z",
+      },
+    ],
+  });
+  installQueryRouting(stub);
+
+  const out = await deliver(event);
+
+  // Ce cas est intercepte AVANT l'ecriture par `verifyAttribution` : un
+  // abonnement deja rattache a un autre compte est refuse, pas reconcilie.
+  // C'est encore plus sur qu'un 409 : le paiement ne change jamais de
+  // proprietaire, et la raison est journalisee avec ses identifiants.
+  assert.equal(out.status, 200);
+  assert.match(String(out.body.reason ?? ""), /customer_bound_to_other_user|conflict_other_account/);
+
+  const stored = stub.store.events.get(event.event_id);
+  assert.ok(stored, "l'evenement doit rester enregistre pour investigation");
+  assert.equal(stored.status, "rejected");
+  assert.ok(stored.reason, "la raison doit etre conservee");
+  assert.equal(
+    stub.store.subscriptions.get([...stub.store.subscriptions.keys()][0]).user_id,
+    OTHER_USER_ID,
+    "le proprietaire enregistre ne doit pas etre modifie",
+  );
+  stub.restore();
+  pass("abonnement deja rattache a un autre compte : refuse avant ecriture, proprietaire inchange, raison journalisee");
+}
+
+{
+  // 10e. Paiement potentiellement perdu : le conflit ne doit JAMAIS produire un
+  // 200 « recu » sans raison, ni un 503 en boucle.
+  const users = {
+    [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" },
+  };
+  const event = subscriptionEvent();
+
+  const stub = createSupabaseStub({
+    users,
+    seedSubscriptions: [
+      {
+        paddle_subscription_id: "sub_01autre0000000000000009",
+        user_id: USER_ID,
+        paddle_customer_id: event.data.customer_id,
+        plan: "pro",
+        status: "past_due",
+        paddle_price_id: SANDBOX_PRICE_IDS.pro.month,
+        current_period_ends_at: "2026-12-15T00:00:00Z",
+        source_updated_at: "2026-10-15T00:00:00Z",
+      },
+    ],
+  });
+  installQueryRouting(stub);
+
+  const out = await deliver(event);
+
+  // Ni boucle infinie (503), ni disparition (200 sans trace).
+  assert.notEqual(out.status, 503, "un conflit ne doit pas faire boucler Paddle indefiniment");
+  assert.equal(out.status, 202);
+  assert.ok(out.body.reason, "une raison doit toujours accompagner un conflit");
+
+  const row = stub.store.events.get(event.event_id);
+  assert.ok(row, "l'evenement doit rester enregistre");
+  assert.equal(row.status, "received", "ni `processed`, ni `rejected`, ni `ignored`");
+  assert.ok(
+    row.reason && row.reason.includes(event.data.id),
+    "l'identifiant de l'abonnement Paddle doit rester disponible pour l'enquete",
+  );
+  stub.restore();
+  pass("paiement potentiellement perdu : ni 503 en boucle ni 200 sans trace, evenement et identifiants conserves");
+}
+
+{
+  // 10f. Le meme evenement rejoue apres un conflit non resolu ne cree pas de
+  // doublon et reste ouvert : il sera reevalue quand la situation sera reglee.
+  const users = {
+    [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" },
+  };
+  const event = subscriptionEvent();
+
+  const stub = createSupabaseStub({
+    users,
+    seedSubscriptions: [
+      {
+        paddle_subscription_id: "sub_01bloquant0000000000001",
+        user_id: USER_ID,
+        paddle_customer_id: event.data.customer_id,
+        plan: "plus",
+        status: "active",
+        paddle_price_id: SANDBOX_PRICE_IDS.plus.month,
+        current_period_ends_at: "2027-01-01T00:00:00Z",
+        source_updated_at: "2026-10-01T00:00:00Z",
+      },
+    ],
+  });
+  installQueryRouting(stub);
+
+  const first = await deliver(event);
+  const second = await deliver(event);
+
+  assert.equal(first.status, 202);
+  assert.equal(second.status, 202, "un rejeu doit donner la meme decision, pas un doublon");
+  assert.equal(stub.store.events.size, 1, "un seul evenement enregistre, quel que soit le nombre de livraisons");
+  assert.equal(stub.store.subscriptions.size, 1, "aucune ligne d'abonnement ajoutee");
+  assert.equal(stub.store.events.get(event.event_id).status, "received");
+  stub.restore();
+  pass("rejeu apres conflit : idempotent, l'evenement reste unique et ouvert");
 }
 
 console.log(`\n${checks} vérifications du webhook passées.`);
