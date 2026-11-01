@@ -128,6 +128,53 @@ function describeEnvNames() {
     });
 }
 
+
+/**
+ * Read-only look at Paddle's notification destinations, using the sandbox API
+ * key that already exists in the project. Reports the destination URL and the
+ * subscribed event types — never the key, never the endpoint secret.
+ */
+async function probePaddleDestinations(apiKey: string) {
+  if (!apiKey) return { skipped: "PADDLE_SANDBOX_API_KEY is absent" };
+  try {
+    const response = await fetch("https://sandbox-api.paddle.com/notifications/settings?per_page=20", {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    const text = await response.text();
+    if (!response.ok) return { status: response.status, message: text.slice(0, 200) };
+
+    const parsed = JSON.parse(text) as {
+      data?: Array<{
+        id?: string;
+        description?: string;
+        type?: string;
+        active?: boolean;
+        destination?: string;
+        subscribed_events?: Array<{ name?: string }>;
+      }>;
+    };
+    const rows = (parsed.data ?? []).map((item) => {
+      let destinationUrl: string | null = null;
+      try {
+        destinationUrl = item.destination ? new URL(item.destination).origin + new URL(item.destination).pathname : null;
+      } catch {
+        destinationUrl = item.destination ?? null;
+      }
+      return {
+        id: item.id ?? null,
+        description: item.description ?? null,
+        type: item.type ?? null,
+        active: item.active ?? null,
+        destinationUrl,
+        subscribedEvents: (item.subscribed_events ?? []).map((event) => event.name).filter(Boolean),
+      };
+    });
+    return { status: response.status, count: rows.length, rows };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : "paddle request failed" };
+  }
+}
+
 const jsonHeaders = { "Content-Type": "application/json" };
 
 function readHeader(request: ProbeRequest, name: string): string | null {
@@ -253,11 +300,39 @@ export default async function handler(request: ProbeRequest, response: ProbeResp
     }
   }
 
+  const paddleDestinations = await probePaddleDestinations(
+    process.env.PADDLE_SANDBOX_API_KEY?.trim() ?? "",
+  );
+
   const anonKey = process.env.SUPABASE_ANON_KEY?.trim() ?? "";
   const restWithService = await probeRest(supabaseUrl, serviceKey, "webhook_events");
   const restWithAnon = await probeRest(supabaseUrl, anonKey, "webhook_events");
   const serviceInfo = describeKey(process.env.SUPABASE_SERVICE_ROLE_KEY);
   const urlRef = projectRef(supabaseUrl);
+
+  // Optional cleanup: drop the probe row so the table is left as it was found.
+  const cleanupParam = request.query?.cleanup;
+  const cleanupRequested = (Array.isArray(cleanupParam) ? cleanupParam[0] : cleanupParam) === "1";
+  let cleanup: unknown = { requested: cleanupRequested, skipped: true };
+  if (cleanupRequested && supabaseUrl && serviceKey) {
+    try {
+      const removed = await fetch(
+        `${supabaseUrl}/rest/v1/webhook_events?event_id=eq.${encodeURIComponent(PROBE_EVENT_ID)}`,
+        {
+          method: "DELETE",
+          headers: {
+            apikey: serviceKey,
+            Authorization: `Bearer ${serviceKey}`,
+            Prefer: "return=representation",
+          },
+        },
+      );
+      const body = (await removed.json()) as Array<Record<string, unknown>>;
+      cleanup = { requested: true, status: removed.status, deletedRows: Array.isArray(body) ? body.length : 0 };
+    } catch (error) {
+      cleanup = { requested: true, error: error instanceof Error ? error.message : "delete failed" };
+    }
+  }
 
   return response.status(200).json({
     probe: "webhook-selfcheck",
@@ -291,5 +366,7 @@ export default async function handler(request: ProbeRequest, response: ProbeResp
     invalidSignature,
     signedDelivery,
     supabaseRow,
+    paddleDestinations,
+    cleanup,
   });
 }
