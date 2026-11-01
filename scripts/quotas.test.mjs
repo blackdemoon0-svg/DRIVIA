@@ -324,9 +324,19 @@ resetQuotas();
 // 8. Description affichée sur la page tarifs = ce que le serveur applique
 // ---------------------------------------------------------------------------
 {
-  assert.equal(describeLimits("decouverte"), "15 messages par jour, 1 analyse de devis par jour, sans pièce jointe.");
+  assert.equal(
+    describeLimits("decouverte"),
+    "15 messages par jour, 1 analyse de devis par jour, document joint uniquement pour l'analyse de devis.",
+  );
   assert.equal(describeLimits("plus"), "200 messages par jour, analyses de devis illimitées, photos et PDF acceptés.");
   assert.equal(describeLimits("pro"), "600 messages par jour, analyses de devis illimitées, photos et PDF acceptés.");
+
+  // Option (a) validée : la Découverte peut joindre le document de son analyse
+  // de devis, mais n'obtient aucune capacité photo/PDF générale.
+  assert.equal(PLAN_LIMITS.decouverte.quoteAnalysis, true);
+  assert.equal(PLAN_LIMITS.decouverte.attachments, false);
+  assert.equal(PLAN_LIMITS.plus.quoteAnalysis, true);
+  assert.equal(PLAN_LIMITS.pro.quoteAnalysis, true);
 
   const decouverte = PRICING_PLANS.find((plan) => plan.id === "decouverte");
   const plus = PRICING_PLANS.find((plan) => plan.id === "plus");

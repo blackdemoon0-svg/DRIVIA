@@ -186,18 +186,21 @@ function restore() {
     messagesPerDay: 15,
     quoteAnalysesPerDay: 1,
     attachments: false,
+    quoteAnalysis: true,
     requestsPerMinute: 10,
   });
   assert.deepEqual(PLAN_LIMITS.plus, {
     messagesPerDay: 200,
     quoteAnalysesPerDay: null,
     attachments: true,
+    quoteAnalysis: true,
     requestsPerMinute: 20,
   });
   assert.deepEqual(PLAN_LIMITS.pro, {
     messagesPerDay: 600,
     quoteAnalysesPerDay: null,
     attachments: true,
+    quoteAnalysis: true,
     requestsPerMinute: 30,
   });
 

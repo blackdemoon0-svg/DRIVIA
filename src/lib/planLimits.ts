@@ -23,8 +23,19 @@ export type PlanLimits = {
   messagesPerDay: number | null;
   /** Garage-quote analyses per UTC day. `null` means unlimited. */
   quoteAnalysesPerDay: number | null;
-  /** Whether photos and PDFs may be attached. */
+  /**
+   * Whether photos and PDFs may be attached *outside* a garage-quote analysis.
+   *
+   * A garage-quote analysis is a separate right: Découverte may attach the
+   * document it is entitled to analyse once a day, but gets no general
+   * photo/PDF capability.
+   */
   attachments: boolean;
+  /**
+   * Whether a garage-quote analysis — document attached — is available at all.
+   * True on every plan: it is a catalogue promise on Découverte too.
+   */
+  quoteAnalysis: boolean;
   /** Requests allowed in a rolling minute, per account. */
   requestsPerMinute: number;
 };
@@ -37,19 +48,24 @@ export const PLAN_LIMITS: Record<PlanId, PlanLimits> = {
   decouverte: {
     messagesPerDay: 15,
     quoteAnalysesPerDay: 1,
+    // No general photo/PDF capability, but the daily garage-quote analysis
+    // (which needs its document) is part of the offer.
     attachments: false,
+    quoteAnalysis: true,
     requestsPerMinute: 10,
   },
   plus: {
     messagesPerDay: 200,
     quoteAnalysesPerDay: null,
     attachments: true,
+    quoteAnalysis: true,
     requestsPerMinute: 20,
   },
   pro: {
     messagesPerDay: 600,
     quoteAnalysesPerDay: null,
     attachments: true,
+    quoteAnalysis: true,
     requestsPerMinute: 30,
   },
 };
@@ -86,6 +102,7 @@ export function describeLimits(plan: PlanId): string {
   }
 
   if (limits.attachments) parts.push("photos et PDF acceptés");
+  else if (limits.quoteAnalysis) parts.push("document joint uniquement pour l'analyse de devis");
   else parts.push("sans pièce jointe");
 
   return `${parts.join(", ")}.`;

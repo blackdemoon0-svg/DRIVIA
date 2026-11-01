@@ -225,31 +225,41 @@ const days = (n) => new Date(Date.now() + n * 86_400_000).toISOString();
 
 {
   // Période échue : plus aucun droit payant, même si le statut dit « active ».
+  //
+  // Le révélateur est désormais le quota : un compte retombé en Découverte
+  // plafonne à 15 messages par jour. On pré-remplit 15 messages avec les
+  // limites Découverte — c'est exactement ce que ferait la base s'il était
+  // encore en Pro — puis on vérifie que le 16e est refusé.
+  resetQuotas();
   setEnv();
   installSupabase({
     rows: [
       { user_id: USER_ID, plan: "pro", status: "active", current_period_ends_at: days(-1) },
     ],
   });
-  const { res, out } = makeResponse();
-  await handler(
-    {
-      method: "POST",
-      headers: { authorization: `Bearer ${TOKEN}` },
-      // Une pièce jointe est réservée aux formules payantes : elle est donc un
-      // révélateur direct du plan appliqué.
-      body: chatBody({
-        attachments: [{ type: "text", name: "devis.pdf", mimeType: "application/pdf", text: "Devis" }],
-        task: "garage-quote",
-      }),
-    },
-    res,
-  );
-  assert.equal(out.status, 403, "un abonnement expiré ne donne aucun droit");
-  assert.equal(out.body.code, "plan_required");
+
+  const base = Date.now();
+  for (let index = 0; index < 15; index += 1) {
+    consumeQuota({
+      userId: USER_ID,
+      plan: "decouverte",
+      isQuoteAnalysis: false,
+      nowMs: base - (14 - index) * 7_000,
+    });
+  }
+
+  const out = await callChat({
+    headers: { authorization: `Bearer ${TOKEN}`, "x-forwarded-for": "192.0.2.20" },
+  });
+  assert.equal(out.status, 429, "un abonnement expiré ne donne plus le quota Pro");
+  assert.equal(out.body.code, "daily_messages");
+  assert.equal(out.body.plan, "decouverte", "le plan appliqué est bien retombé en Découverte");
+
   restoreEnv();
-  pass("abonnement expiré : les droits payants sont retirés (403), le statut stocké ne suffit pas");
+  resetQuotas();
+  pass("abonnement expiré : les droits payants sont retirés, le quota appliqué est celui de Découverte");
 }
+
 
 {
   // Abonnement valide : droit payant accordé.
@@ -271,41 +281,37 @@ const days = (n) => new Date(Date.now() + n * 86_400_000).toISOString();
 
 {
   // Ligne appartenant à un autre compte : aucun droit.
+  //
+  // Le révélateur est le quota : si la ligne d'un autre compte accordait un
+  // plan Pro, 15 messages déjà consommés ne bloqueraient pas. Le refus prouve
+  // que le plan appliqué est bien Découverte.
+  resetQuotas();
   setEnv();
   installSupabase({
     rows: [{ user_id: OTHER_ID, plan: "pro", status: "active", current_period_ends_at: days(20) }],
   });
+
+  const base = Date.now();
+  for (let index = 0; index < 15; index += 1) {
+    consumeQuota({
+      userId: USER_ID,
+      plan: "decouverte",
+      isQuoteAnalysis: false,
+      nowMs: base - (14 - index) * 7_000,
+    });
+  }
+
   const out = await callChat({
-    headers: { authorization: `Bearer ${TOKEN}` },
-    body: chatBody({
-      attachments: [{ type: "text", name: "devis.pdf", mimeType: "application/pdf", text: "Devis" }],
-      task: "garage-quote",
-    }),
+    headers: { authorization: `Bearer ${TOKEN}`, "x-forwarded-for": "192.0.2.21" },
   });
-  assert.equal(out.status, 403, "la ligne d'un autre compte ne doit rien accorder");
+  assert.equal(out.status, 429, "la ligne d'un autre compte ne doit accorder aucun quota payant");
+  assert.equal(out.body.plan, "decouverte");
+
   restoreEnv();
-  pass("ligne appartenant à un autre compte : aucun droit payant accordé");
+  resetQuotas();
+  pass("ligne appartenant à un autre compte : aucun droit payant accordé (quota Découverte appliqué)");
 }
 
-// ---------------------------------------------------------------------------
-// 5. Formule Découverte : pièces jointes refusées
-// ---------------------------------------------------------------------------
-{
-  setEnv();
-  installSupabase({ rows: [] });
-  const out = await callChat({
-    headers: { authorization: `Bearer ${TOKEN}` },
-    body: chatBody({
-      attachments: [{ type: "text", name: "devis.pdf", mimeType: "application/pdf", text: "Devis" }],
-      task: "garage-quote",
-    }),
-  });
-  assert.equal(out.status, 403);
-  assert.equal(out.body.code, "plan_required");
-  assert.match(out.body.error, /Plus and Pro/);
-  restoreEnv();
-  pass("Découverte : analyse de photo ou de PDF refusée (403 `plan_required`)");
-}
 
 // ---------------------------------------------------------------------------
 // 6. Lecture des abonnements en échec : 503, jamais un repli
@@ -485,28 +491,65 @@ const days = (n) => new Date(Date.now() + n * 86_400_000).toISOString();
 }
 
 {
-  // Constat à documenter : avec « aucune pièce jointe » pour Découverte, une
-  // analyse de devis est impossible — le refus tombe sur le droit d'attacher un
-  // document (403) avant même d'atteindre le quota de 1 analyse par jour.
+  // Option (a), validée : la Découverte peut joindre le document de son analyse
+  // de devis — c'est la promesse du catalogue — une fois par jour.
+  resetQuotas();
+  setEnv();
+  installSupabase({ rows: [] });
+
+  const quote = () =>
+    callChat({
+      headers: { authorization: `Bearer ${TOKEN}`, "x-forwarded-for": "192.0.2.13" },
+      body: chatBody({
+        attachments: [{ type: "text", name: "devis.pdf", mimeType: "application/pdf", text: "Devis" }],
+        task: "garage-quote",
+      }),
+    });
+
+  const first = await quote();
+  assert.notEqual(first.status, 403, "la Découverte doit pouvoir joindre le document de son analyse de devis");
+  assert.notEqual(first.status, 401);
+
+  // Deuxième analyse le même jour : c'est le quota de 1 qui tranche, plus le droit.
+  const second = await callChat({
+    headers: { authorization: `Bearer ${TOKEN}`, "x-forwarded-for": "192.0.2.14" },
+    body: chatBody({
+      attachments: [{ type: "text", name: "devis2.pdf", mimeType: "application/pdf", text: "Devis 2" }],
+      task: "garage-quote",
+    }),
+  });
+  assert.equal(second.status, 429, "le quota d'une analyse par jour doit s'appliquer");
+  assert.equal(second.body.code, "daily_quotes");
+
+  restoreEnv();
+  resetQuotas();
+  pass("Découverte : le document joint est accepté pour l'analyse de devis, puis bloqué à 1 par jour (429 `daily_quotes`)");
+}
+
+{
+  // Et la capacité photo/PDF générale reste bien réservée aux offres payantes :
+  // une pièce jointe hors analyse de devis est refusée côté validation du corps,
+  // quel que soit le plan, parce qu'aucun autre cas d'usage n'existe.
   resetQuotas();
   setEnv();
   installSupabase({ rows: [] });
 
   const out = await callChat({
-    headers: { authorization: `Bearer ${TOKEN}`, "x-forwarded-for": "192.0.2.13" },
+    headers: { authorization: `Bearer ${TOKEN}`, "x-forwarded-for": "192.0.2.15" },
     body: chatBody({
-      attachments: [{ type: "text", name: "devis.pdf", mimeType: "application/pdf", text: "Devis" }],
-      task: "garage-quote",
+      attachments: [{ type: "text", name: "facture.pdf", mimeType: "application/pdf", text: "Facture" }],
+      // Pas de tâche : la pièce jointe n'a aucun usage hors analyse de devis.
     }),
   });
 
-  assert.equal(out.status, 403);
-  assert.equal(out.body.code, "plan_required");
+  assert.equal(out.status, 400, "une pièce jointe sans analyse de devis reste refusée");
+  assert.match(out.body.error, /only supported for garage quote analysis/i);
 
   restoreEnv();
   resetQuotas();
-  pass("Découverte : l'analyse de devis est refusée sur le droit d'attacher (403), le quota de 1/jour reste inatteignable");
+  pass("hors analyse de devis : aucune pièce jointe n'est acceptée, la capacité photo/PDF générale reste payante");
 }
+
 
 globalThis.fetch = originalFetch;
 console.log(`\n${checks} vérifications d'accès au chat passées.`);

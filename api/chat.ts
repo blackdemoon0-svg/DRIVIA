@@ -665,8 +665,15 @@ async function handleChatPost(
   }
 
   // Plan entitlement, decided server-side from the database — the browser only
-  // sent a token. Découverte has no photo or PDF capability at all.
-  if (attachments.length > 0 && !access.limits.attachments) {
+  // sent a token.
+  //
+  // Découverte has no general photo/PDF capability, but it does include the
+  // daily garage-quote analysis, and that analysis needs its document. So the
+  // attachment is allowed on that one path and refused everywhere else; the
+  // one-per-day ceiling is then applied by the quota below.
+  const isQuoteAnalysisTask = task === "garage-quote";
+  const mayAttach = access.limits.attachments || (isQuoteAnalysisTask && access.limits.quoteAnalysis);
+  if (attachments.length > 0 && !mayAttach) {
     return response.status(403).json({
       code: "plan_required",
       error:
@@ -687,7 +694,7 @@ async function handleChatPost(
   const quota = consumeQuota({
     userId: access.userId,
     plan: access.plan,
-    isQuoteAnalysis: task === "garage-quote",
+    isQuoteAnalysis: isQuoteAnalysisTask,
   });
   if (!quota.ok) {
     response.setHeader("Retry-After", String(quota.retryAfterSeconds));
