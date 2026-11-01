@@ -662,25 +662,81 @@ export async function handleSubscriptionEvent(
  * and key ordering, which invalidates the signature. Refusing loudly is safer
  * than accepting an unverifiable event.
  */
-export async function readRawBody(request: ApiRequest): Promise<Buffer | null> {
-  const candidate = request as { rawBody?: unknown; body?: unknown };
-
-  if (Buffer.isBuffer(candidate.rawBody)) return candidate.rawBody;
-  if (typeof candidate.rawBody === "string") return Buffer.from(candidate.rawBody, "utf8");
-  if (Buffer.isBuffer(candidate.body)) return candidate.body;
-  if (typeof candidate.body === "string") return Buffer.from(candidate.body, "utf8");
-
-  const iterable = request[Symbol.asyncIterator];
-  if (typeof iterable === "function") {
-    const chunks: Buffer[] = [];
-    for await (const chunk of request as AsyncIterable<Buffer | string>) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8"));
+export type RawBodyRead =
+  | {
+      ok: true;
+      buffer: Buffer;
+      /** How the bytes were obtained — surfaced in the failure log only. */
+      source: "rawBody" | "body-bytes" | "stream" | "reserialized";
     }
-    return Buffer.concat(chunks);
+  | { ok: false; reason: "body_empty" | "body_unreadable" };
+
+/**
+ * Obtain the bytes Paddle signed.
+ *
+ * History: this used `for await` on the request unconditionally and returned
+ * `null` when the runtime handed over a parsed body. On Vercel that produced an
+ * opaque 500 on every delivery — either from hashing an empty buffer or from an
+ * exception thrown while iterating an already-consumed stream. Both cases are
+ * now handled explicitly, and nothing here can throw.
+ *
+ * The order matters:
+ *  1. bytes preserved by the runtime (`rawBody`, then a Buffer/string `body`);
+ *  2. the stream, but only while it is still readable;
+ *  3. last resort, a body that was already parsed into an object: re-serialise
+ *     it. This never weakens the check — the HMAC is still verified over these
+ *     exact bytes, so a wrong reconstruction simply fails with 401.
+ */
+export async function readRawBody(request: ApiRequest): Promise<RawBodyRead> {
+  const candidate = request as {
+    rawBody?: unknown;
+    body?: unknown;
+    readableEnded?: boolean;
+    destroyed?: boolean;
+  };
+
+  if (Buffer.isBuffer(candidate.rawBody)) {
+    return { ok: true, buffer: candidate.rawBody, source: "rawBody" };
+  }
+  if (typeof candidate.rawBody === "string" && candidate.rawBody.length > 0) {
+    return { ok: true, buffer: Buffer.from(candidate.rawBody, "utf8"), source: "rawBody" };
+  }
+  if (Buffer.isBuffer(candidate.body)) {
+    return { ok: true, buffer: candidate.body, source: "body-bytes" };
+  }
+  if (typeof candidate.body === "string" && candidate.body.length > 0) {
+    return { ok: true, buffer: Buffer.from(candidate.body, "utf8"), source: "body-bytes" };
   }
 
-  // Body already parsed into an object, or absent: no verifiable bytes.
-  return null;
+  // Touching a consumed or destroyed stream throws: that is what turned a
+  // delivery into a 500 with no trace. Only read while it can still be read.
+  const iterable = request[Symbol.asyncIterator];
+  if (typeof iterable === "function" && !candidate.readableEnded && !candidate.destroyed) {
+    try {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request as AsyncIterable<Buffer | string>) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8"));
+      }
+      const buffer = Buffer.concat(chunks);
+      if (buffer.length > 0) return { ok: true, buffer, source: "stream" };
+    } catch {
+      // Reported by the caller as an explicit failure, never as a crash.
+    }
+  }
+
+  if (candidate.body !== null && typeof candidate.body === "object") {
+    try {
+      const buffer = Buffer.from(JSON.stringify(candidate.body), "utf8");
+      if (buffer.length > 0) return { ok: true, buffer, source: "reserialized" };
+    } catch {
+      // Unserialisable body: fall through to the explicit failure.
+    }
+  }
+
+  return {
+    ok: false,
+    reason: candidate.body === undefined || candidate.body === null ? "body_empty" : "body_unreadable",
+  };
 }
 
 function readHeader(request: ApiRequest, name: string): string | null {
@@ -700,7 +756,7 @@ function readHeader(request: ApiRequest, name: string): string | null {
  */
 export const config = { api: { bodyParser: false } };
 
-export default async function handler(request: ApiRequest, response: ApiResponse) {
+async function handleWebhook(request: ApiRequest, response: ApiResponse) {
   response.setHeader("Cache-Control", "no-store, max-age=0");
   response.setHeader("Content-Type", "application/json; charset=utf-8");
 
@@ -708,13 +764,16 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     return response.status(405).json({ error: "Only POST requests are supported." });
   }
 
-  const rawBody = await readRawBody(request);
-  if (!rawBody) {
-    // Never fall back to an unverified body.
-    return response
-      .status(500)
-      .json({ error: "Raw request body unavailable; the signature cannot be verified." });
+  const raw = await readRawBody(request);
+  if (!raw.ok) {
+    // Never fall back to an unverified body. The reason is returned so a
+    // delivery log answers "why" without needing server logs.
+    return response.status(500).json({
+      error: "Raw request body unavailable; the signature cannot be verified.",
+      reason: raw.reason,
+    });
   }
+  const rawBody = raw.buffer;
 
   const secret = process.env[WEBHOOK_ENV_KEYS.signatureSecret]?.trim();
   const verdict = verifySignature({
@@ -784,5 +843,33 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     const reason = error instanceof InfraError ? error.message : "unexpected_error";
     // 5xx so Paddle retries; no internal detail is echoed to the caller.
     return response.status(503).json({ error: "Temporary failure, retry later.", reason });
+  }
+}
+
+/**
+ * Vercel entry point.
+ *
+ * Everything above runs inside `handleWebhook`, but an exception raised *before*
+ * its own `try` — while reading the body, or while verifying the signature —
+ * used to escape and surface as Vercel's opaque
+ * `500 FUNCTION_INVOCATION_FAILED`, with no trace and no reason for Paddle.
+ *
+ * This wrapper guarantees that a delivery always receives a JSON decision:
+ * Paddle retries on 503, and the `reason` makes the failure diagnosable from
+ * the notification log alone.
+ */
+export default async function handler(request: ApiRequest, response: ApiResponse) {
+  try {
+    return await handleWebhook(request, response);
+  } catch (error) {
+    const reason = error instanceof InfraError ? error.message : "unhandled_exception";
+    try {
+      return response
+        .status(503)
+        .json({ error: "Temporary failure, retry later.", reason });
+    } catch {
+      // The response object itself is unusable: nothing more can be said.
+      return undefined;
+    }
   }
 }

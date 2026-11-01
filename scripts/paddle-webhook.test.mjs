@@ -12,6 +12,7 @@ import handler, {
   handleSubscriptionEvent,
   isUserIdShaped,
   parseSignatureHeader,
+  readRawBody,
   resolvePlanFromPriceId,
   verifySignature,
 } from "../api/paddle-webhook.ts";
@@ -353,7 +354,8 @@ async function deliver(payload, { signature, rawBody, method = "POST", env = {} 
 }
 
 {
-  // A parsed object body cannot be verified: refuse loudly instead of trusting it.
+  // A parsed object body is re-serialised, but the HMAC must still match those
+  // exact bytes. A wrong signature is refused: nothing is ever accepted unverified.
   const saved = { ...process.env };
   Object.assign(process.env, { PADDLE_WEBHOOK_SECRET: TEST_SECRET, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SERVICE_ROLE });
   const { res, out } = makeResponse();
@@ -362,9 +364,9 @@ async function deliver(payload, { signature, rawBody, method = "POST", env = {} 
     res,
   );
   process.env = saved;
-  assert.equal(out.status, 500);
-  assert.match(out.body.error, /Raw request body unavailable/);
-  pass("corps déjà analysé : 500 explicite, jamais d'acceptation non vérifiée");
+  assert.ok(out.status === 401 || out.status === 500, `refus attendu, reçu ${out.status}`);
+  assert.notEqual(out.body.received, true, "jamais d'acceptation d'un corps non vérifié");
+  pass("corps déjà analysé sans signature valide : refus explicite, jamais d'acceptation non vérifiée");
 }
 
 {
@@ -931,6 +933,96 @@ async function deliver(payload, { signature, rawBody, method = "POST", env = {} 
   assert.equal(isUserIdShaped(USER_ID), true);
   assert.equal(isUserIdShaped("ctm_01abc"), false);
   pass("garde de forme : seuls des UUID sont acceptés comme identifiant utilisateur");
+}
+
+
+// ---------------------------------------------------------------------------
+// 9. Robustesse du corps brut : la cause du 500 observé chez Paddle
+// ---------------------------------------------------------------------------
+// Sur Vercel, la fonction recevait un corps dont l'itération levait une
+// exception (flux déjà consommé), ou un corps déjà transformé en objet. Dans les
+// deux cas la livraison finissait en 500 opaque, sans trace ni raison.
+{
+  const cases = [
+    ["flux lisible", { [Symbol.asyncIterator]: async function* () { yield Buffer.from("{}"); } }, "stream"],
+    ["corps déjà analysé", { body: { a: 1 } }, "reserialized"],
+    ["rawBody fourni", { rawBody: "{}" }, "rawBody"],
+  ];
+  for (const [label, shape, source] of cases) {
+    const result = await readRawBody({ headers: {}, ...shape });
+    assert.equal(result.ok, true, `${label} : des octets doivent être obtenus`);
+    assert.equal(result.source, source, `${label} : source inattendue`);
+  }
+
+  const failures = [
+    ["corps absent", { headers: {} }, "body_empty"],
+    ["flux déjà consommé", { headers: {}, readableEnded: true }, "body_empty"],
+    [
+      "flux qui lève pendant l'itération",
+      { headers: {}, [Symbol.asyncIterator]: async function* () { throw new Error("premature close"); } },
+      "body_empty",
+    ],
+  ];
+  for (const [label, shape, reason] of failures) {
+    // Must resolve, never reject: an escaping exception was the 500.
+    const result = await readRawBody({ ...shape });
+    assert.equal(result.ok, false, `${label} : doit échouer proprement`);
+    assert.equal(result.reason, reason, `${label} : raison inattendue`);
+  }
+  pass("corps brut : flux consommé ou itération en erreur → échec explicite, jamais une exception");
+}
+
+{
+  // A parsed body is re-serialised and the HMAC is still verified over those
+  // exact bytes: a legitimate payload can now be accepted even when the runtime
+  // consumed the stream. A wrong signature is still refused.
+  const users = { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } };
+  const stub = createSupabaseStub({ users });
+  installQueryRouting(stub);
+
+  const event = subscriptionEvent();
+  const parsed = JSON.parse(JSON.stringify(event));
+  const serialised = JSON.stringify(parsed);
+  const ts = String(Math.floor(Date.now() / 1000));
+  const header = `ts=${ts};h1=${computeSignature(Buffer.from(serialised), ts, TEST_SECRET)}`;
+
+  const saved = { ...process.env };
+  Object.assign(process.env, {
+    PADDLE_WEBHOOK_SECRET: TEST_SECRET,
+    SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY: SERVICE_ROLE,
+  });
+
+  const { res, out } = makeResponse();
+  await handler(
+    { method: "POST", headers: { "paddle-signature": header }, body: parsed },
+    res,
+  );
+  process.env = saved;
+
+  assert.equal(out.status, 200, "un corps déjà analysé et correctement signé doit être accepté");
+  assert.equal(out.body.received, true);
+  assert.ok(findStoredSubscription(stub.store, event.data.id), "l'abonnement doit être enregistré");
+  stub.restore();
+  pass("corps déjà analysé + signature valide : livraison acceptée et abonnement enregistré");
+}
+
+{
+  // Nothing may escape the handler: a broken response object included.
+  const saved = { ...process.env };
+  process.env.PADDLE_WEBHOOK_SECRET = TEST_SECRET;
+  const brokenResponse = {
+    status() { throw new Error("response broken"); },
+    json() {},
+    setHeader() { throw new Error("headers broken"); },
+  };
+  const outcome = await handler(
+    { method: "POST", headers: {}, body: null },
+    brokenResponse,
+  );
+  process.env = saved;
+  assert.equal(outcome, undefined, "le handler doit se terminer sans lever, quoi qu'il arrive");
+  pass("aucune exception ne peut s'échapper du handler (plus de 500 opaque)");
 }
 
 console.log(`\n${checks} vérifications du webhook passées.`);
