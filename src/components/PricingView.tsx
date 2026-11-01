@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BILLING_INTERVALS,
   CURRENCY,
@@ -17,6 +17,14 @@ import {
   type PricingPlan,
 } from "../lib/paddleCore";
 import { describeLimits, type PlanId } from "../lib/planLimits";
+import { fetchOwnSubscriptionRows, planLabel } from "../lib/entitlement";
+import {
+  IDLE_ACTIVITY,
+  decideCta,
+  snapshotFromRows,
+  type CheckoutActivity,
+  type PlanSnapshot,
+} from "../lib/purchaseGuard";
 import {
   loadPaddleConfig,
   openPaddleCheckout,
@@ -45,7 +53,14 @@ function isPaidPlan(plan: PricingPlan): plan is PricingPlan & { id: PaidPlanId }
 
 export default function PricingView({ onStartFree, userId, accessToken, onRequireSignIn }: PricingViewProps) {
   const [interval, setInterval] = useState<BillingInterval>("month");
-  const [pendingPlan, setPendingPlan] = useState<PaidPlanId | null>(null);
+  // What the database says about this account. `checking` until the read lands:
+  // nothing is claimed and nothing may be bought before then.
+  const [snapshot, setSnapshot] = useState<PlanSnapshot>({ kind: "checking" });
+  // The checkout in flight, if any. Never a payment: see `onClosed` below.
+  const [activity, setActivity] = useState<CheckoutActivity>(IDLE_ACTIVITY);
+  // Synchronous re-entrancy lock: React state is applied after the handler
+  // returns, so two clicks in the same tick would both see `idle` without it.
+  const checkoutLock = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
@@ -69,7 +84,68 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
   const environmentLabel = config.environment === "sandbox" ? "Sandbox" : "Production";
   const canQueryPaddle = Boolean(config.clientToken);
 
+  /**
+   * Read the account's own rows and turn them into a guard snapshot.
+   *
+   * The rows come from `subscriptions` through row level security: no prop, no
+   * query string and no local storage can declare a formula here. A failed read
+   * becomes `unknown`, never "free" — an unreadable subscription is a reason to
+   * refuse a payment, not a reason to assume there is none.
+   */
+  const readPlan = useCallback(async (): Promise<PlanSnapshot> => {
+    if (!userId) return { kind: "free" };
+
+    const result = await fetchOwnSubscriptionRows(userId);
+    if (result.kind === "error") {
+      return {
+        kind: "unknown",
+        message:
+          result.transport === "thrown"
+            ? "Votre formule n'a pas pu être vérifiée : la lecture a échoué. Aucun paiement n'est ouvert tant que ce n'est pas résolu."
+            : "Votre formule est momentanément illisible. Aucun paiement n'est ouvert tant que ce n'est pas résolu.",
+      };
+    }
+    return snapshotFromRows(result.rows, userId);
+  }, [userId]);
+
+  /** Re-read the plan, showing `checking` meanwhile so nothing can be clicked. */
+  const refreshPlan = useCallback(async (): Promise<PlanSnapshot> => {
+    setSnapshot({ kind: "checking" });
+    const next = await readPlan();
+    setSnapshot(next);
+    return next;
+  }, [readPlan]);
+
+  useEffect(() => {
+    let active = true;
+    if (!userId) {
+      // Signed out: nothing is stored for anyone, and a click leads to sign-in.
+      setSnapshot({ kind: "free" });
+      return;
+    }
+    setSnapshot({ kind: "checking" });
+    void readPlan().then((next) => {
+      if (active) setSnapshot(next);
+    });
+    return () => {
+      active = false;
+    };
+  }, [userId, readPlan]);
+
+  /** Give up on a checkout whose window never appeared. */
+  const releaseCheckout = () => {
+    checkoutLock.current = false;
+    setActivity(IDLE_ACTIVITY);
+    setNotice("Paiement interrompu avant toute confirmation : votre formule n'a pas changé.");
+    void refreshPlan();
+  };
+
   const handleCheckout = async (plan: PaidPlanId) => {
+    // Two clicks in the same tick: React has not re-rendered yet, so the
+    // disabled attribute is still absent. The lock is what actually prevents a
+    // second checkout from being created — and therefore a second payment.
+    if (checkoutLock.current) return;
+
     setError(null);
     setNotice(null);
 
@@ -82,7 +158,17 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
       return;
     }
 
-    setPendingPlan(plan);
+    // Belt to the button's braces: the guard is re-evaluated at click time, so a
+    // stale render can never open a checkout the current state refuses.
+    const catalogue = PRICING_PLANS.find((item) => item.id === plan);
+    const decision = decideCta(plan, catalogue?.cta ?? "Choisir", snapshot, activity);
+    if (decision.disabled) {
+      if (decision.hint) setNotice(decision.hint);
+      return;
+    }
+
+    checkoutLock.current = true;
+    setActivity({ kind: "creating", plan });
 
     try {
       await openPaddleCheckout({
@@ -91,12 +177,27 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
         userId,
         accessToken,
         onOpened: () =>
+          // `checkout.loaded` proves a checkout exists, nothing more. The wording
+          // says so, and the plan is left untouched until the database changes.
           setNotice(
             `Paiement ouvert dans Paddle (${environmentLabel}) : ${plan.toUpperCase()} — ${expectedAmount(plan, interval)} ${CURRENCY} / ${
               interval === "month" ? "mois" : "an"
-            }.`,
+            }. Votre formule ne change pas tant que l'abonnement n'est pas enregistré.`,
           ),
-        onClosed: () => setPendingPlan(null),
+        onClosed: () => {
+          // The window is gone; the payment may or may not have happened. Ask the
+          // database instead of assuming either way.
+          checkoutLock.current = false;
+          setActivity(IDLE_ACTIVITY);
+          void refreshPlan().then((next) => {
+            const recorded = next.kind === "subscribed" && next.plan === plan;
+            setNotice(
+              recorded
+                ? `${planLabel(plan)} est maintenant enregistré sur votre compte.`
+                : "Fenêtre de paiement fermée : aucun abonnement n'est encore enregistré à votre nom. L'ouverture du paiement ne vaut pas confirmation — l'accès n'est accordé qu'après l'enregistrement de l'abonnement par Paddle, ce qui peut prendre quelques instants.",
+            );
+          });
+        },
         onVerified: (verdict) => {
           setVerdicts((current) => [
             ...(current ?? []).filter((item) => item.priceId !== verdict.priceId),
@@ -105,13 +206,22 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
         },
         onError: (message) => {
           setError(message);
-          setPendingPlan(null);
+          checkoutLock.current = false;
+          setActivity(IDLE_ACTIVITY);
         },
       });
+
+      // `Checkout.open()` returned without throwing: the window exists even if
+      // `checkout.loaded` has not fired yet. Still not a payment.
+      setActivity((current) =>
+        current.kind === "creating" && current.plan === plan ? { kind: "open", plan } : current,
+      );
     } catch (checkoutError) {
       setError(classifyCheckoutError(checkoutError).message);
-    } finally {
-      setPendingPlan(null);
+      // Release here, not in a `finally`: the click must not become available
+      // again while the overlay is open, or a second payment could be started.
+      checkoutLock.current = false;
+      setActivity(IDLE_ACTIVITY);
     }
   };
 
@@ -196,9 +306,42 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
         </div>
       )}
 
+      {snapshot.kind === "unknown" && (
+        <div className="pricing-error" role="alert">
+          {snapshot.message}{" "}
+          <button type="button" className="pricing-signin-link" onClick={() => void refreshPlan()}>
+            Réessayer la vérification
+          </button>
+        </div>
+      )}
+
+      {userId && activity.kind !== "idle" && (
+        <p className="pricing-notice" role="status">
+          {activity.kind === "creating"
+            ? "Ouverture du paiement… Merci de ne pas fermer cette page."
+            : "Fenêtre de paiement Paddle ouverte. Aucun débit n'est considéré comme confirmé avant l'enregistrement de l'abonnement."}{" "}
+          <button type="button" className="pricing-signin-link" onClick={releaseCheckout}>
+            La fenêtre ne s&apos;est pas ouverte ?
+          </button>
+        </p>
+      )}
+
       {notice && (
         <p className="pricing-notice" role="status">
           {notice}
+        </p>
+      )}
+
+      {userId && (
+        <p className="pricing-signin-note" role="status">
+          {snapshot.kind === "subscribed"
+            ? `Formule lue sur votre compte : ${planLabel(snapshot.plan)}.`
+            : snapshot.kind === "free"
+              ? "Aucune formule payante enregistrée sur votre compte : la formule Découverte s'applique."
+              : "Formule en cours de vérification sur votre compte."}{" "}
+          <button type="button" className="pricing-signin-link" onClick={() => void refreshPlan()}>
+            Actualiser ma formule
+          </button>
         </p>
       )}
 
@@ -217,8 +360,11 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
           const price = formatPlanPrice(plan, interval);
           const billingNote = planBillingNote(plan, interval);
           const paid = isPaidPlan(plan);
-          const isPending = paid && pendingPlan === plan.id;
-          const label = isPending ? "Vérification du tarif…" : plan.cta;
+          // One decision per card, taken from the guard: it owns whether the
+          // button may be pressed, what it says, and why it is refused.
+          const decision = paid ? decideCta(plan.id, plan.cta, snapshot, activity) : null;
+          const isPending = activity.kind === "creating" && activity.plan === plan.id;
+          const label = decision ? decision.label : plan.cta;
           const planPriceId = paid ? getPriceId(config, plan.id, interval) : null;
 
           return (
@@ -249,12 +395,14 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
                 <li className="pricing-quota">{describeLimits(plan.id as PlanId)}</li>
               </ul>
 
-              {paid ? (
+              {paid && decision ? (
                 <button
                   type="button"
                   className="pricing-cta"
                   onClick={() => void handleCheckout(plan.id)}
+                  disabled={decision.disabled}
                   aria-busy={isPending}
+                  data-cta-reason={decision.reason}
                   aria-describedby={status.ready ? undefined : "pricing-config-summary"}
                 >
                   {label}
@@ -264,6 +412,8 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
                   {label}
                 </button>
               )}
+
+              {decision?.hint && <p className="pricing-cta-note">{decision.hint}</p>}
 
               {paid && planPriceId && (
                 <p className="pricing-price-id">

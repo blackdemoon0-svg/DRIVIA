@@ -19,12 +19,26 @@
 
 import crypto from "node:crypto";
 import { limitsFor, type PlanLimits } from "../src/lib/planLimits.js";
+import {
+  ENTITLED_STATUSES,
+  findBlockingSubscription,
+  resolveAccessPlan,
+  toGrant,
+  type AccessPlan,
+  type BlockingSubscription,
+  type PaidAccessPlan,
+  type StoredSubscriptionRow,
+  type SubscriptionStatus,
+} from "../src/lib/subscriptionAccess.js";
 
-/** Plan identifiers, matching the public catalogue in `src/lib/paddleCore.ts`. */
-export type AccessPlan = "decouverte" | "plus" | "pro";
+/**
+ * Plan identifiers, matching the public catalogue in `src/lib/paddleCore.ts`.
+ * `AccessPlan` and `PaidAccessPlan` are re-exported from the shared rule module
+ * so every caller keeps importing them from here.
+ */
+export type { AccessPlan, BlockingSubscription, PaidAccessPlan, SubscriptionStatus };
 
-/** Paid plans only: the ones a subscription can grant. */
-export type PaidAccessPlan = Exclude<AccessPlan, "decouverte">;
+export { ENTITLED_STATUSES, findBlockingSubscription, resolveAccessPlan, toGrant };
 
 /**
  * Environment variable names, exactly as configured in Vercel.
@@ -149,95 +163,18 @@ export async function resolveIdentity(
 // Subscription rows
 // ---------------------------------------------------------------------------
 
-/** Raw row as PostgREST returns it. Every field is untrusted until checked. */
-export type RawSubscriptionRow = {
-  user_id?: unknown;
-  plan?: unknown;
-  status?: unknown;
-  current_period_ends_at?: unknown;
-  scheduled_change_effective_at?: unknown;
-};
-
 /**
- * Statuses that can still grant access, provided the paid period has not ended.
+ * The row rule lives in `src/lib/subscriptionAccess.ts`, because the pricing
+ * page needs the very same rule to decide which button may be pressed. Keeping
+ * one copy is the point: two copies would drift, and the drift would either
+ * offer a purchase the database refuses or hide one the customer needs.
  *
- * `past_due` is included on purpose: Paddle reports a failed renewal while the
- * customer keeps access until the period ends or the subscription is canceled —
- * that window is what the "update your payment method" notice refers to.
- * `paused` and any unknown status grant nothing.
+ * Nothing is loosened by the shared module: it is pure, imports nothing, and
+ * only *this* module decides whether a request may run. The pricing page reads
+ * the customer's own rows through row level security for display, and the guard
+ * there is a courtesy — never an authorisation.
  */
-const ENTITLED_STATUSES = ["active", "trialing", "past_due", "canceled"] as const;
-
-const KNOWN_PAID_PLANS: readonly PaidAccessPlan[] = ["plus", "pro"];
-
-function asTrimmedString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function asPlan(value: unknown): PaidAccessPlan | null {
-  const raw = asTrimmedString(value);
-  return raw && (KNOWN_PAID_PLANS as readonly string[]).includes(raw)
-    ? (raw as PaidAccessPlan)
-    : null;
-}
-
-/**
- * Convert one stored row into a grant, for one specific account.
- *
- * Returns `null` unless every condition holds: the row belongs to this user, the
- * plan is one we sell, the status is entitled, and the paid period ends in the
- * future. A row we cannot fully understand grants nothing.
- */
-export function toGrant(
-  row: RawSubscriptionRow | null | undefined,
-  expectedUserId: string,
-  nowMs: number = Date.now(),
-): PaidAccessPlan | null {
-  if (!row || typeof row !== "object") return null;
-
-  const expected = (expectedUserId ?? "").trim();
-  if (!expected) return null;
-
-  const rowUserId = asTrimmedString(row.user_id);
-  if (!rowUserId || rowUserId !== expected) return null;
-
-  const plan = asPlan(row.plan);
-  if (!plan) return null;
-
-  const status = asTrimmedString(row.status);
-  if (!status || !(ENTITLED_STATUSES as readonly string[]).includes(status)) return null;
-
-  // The period end is the only proof the subscription is currently paid for.
-  // A missing or unparseable date is not "probably still valid": it grants
-  // nothing.
-  const periodEnd = asTrimmedString(row.current_period_ends_at);
-  if (!periodEnd) return null;
-  const periodEndMs = Date.parse(periodEnd);
-  if (!Number.isFinite(periodEndMs)) return null;
-  if (periodEndMs <= nowMs) return null;
-
-  return plan;
-}
-
-/**
- * Decide the plan for an account from its stored rows.
- *
- * The most capable valid grant wins, so a customer who upgraded is never held
- * back by a stale `plus` row still present in the table.
- */
-export function resolveAccessPlan(
-  rows: readonly (RawSubscriptionRow | null | undefined)[],
-  expectedUserId: string,
-  nowMs: number = Date.now(),
-): AccessPlan {
-  const grants = rows
-    .map((row) => toGrant(row, expectedUserId, nowMs))
-    .filter((plan): plan is PaidAccessPlan => plan !== null);
-
-  if (grants.includes("pro")) return "pro";
-  if (grants.includes("plus")) return "plus";
-  return "decouverte";
-}
+export type RawSubscriptionRow = StoredSubscriptionRow;
 
 // ---------------------------------------------------------------------------
 // Reading subscriptions

@@ -20,6 +20,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { getSupabaseClient } from "./supabaseClient";
+import type { StoredSubscriptionRow } from "./subscriptionAccess";
 
 /**
  * Table already present in the `veyvro-preview` project and aligned by
@@ -54,15 +55,13 @@ const KNOWN_STATUSES: readonly SubscriptionStatus[] = [
 ];
 
 /** Raw row as PostgREST returns it. Every field is untrusted until checked. */
-export type RawSubscriptionRow = {
-  user_id?: unknown;
-  plan?: unknown;
-  status?: unknown;
-  current_period_ends_at?: unknown;
-  scheduled_change_effective_at?: unknown;
-  canceled_at?: unknown;
-  source_updated_at?: unknown;
-};
+export type RawSubscriptionRow = StoredSubscriptionRow;
+
+/** Result of reading the rows this account may see. */
+export type SubscriptionRowsResult =
+  | { kind: "rows"; rows: StoredSubscriptionRow[] }
+  /** `thrown`: the query never left. `refused`: the database answered an error. */
+  | { kind: "error"; transport: "thrown" | "refused" };
 
 /** A row that passed validation for one specific account. */
 export type Subscription = {
@@ -207,7 +206,38 @@ export type SubscriptionReader = {
 };
 
 /**
- * Read the subscription of one account.
+ * Read the rows this account is allowed to see.
+ *
+ * The primitive shared by the account page (which picks one row to display) and
+ * the pricing guard (which needs *all* rows to know whether another
+ * subscription is possible). Row level security is the real barrier; the
+ * `user_id` filter and the ownership check are defence in depth.
+ *
+ * `transport` lets each caller word the two failures differently: the query
+ * never left (`thrown`), the database refused it (`refused`).
+ */
+export async function readOwnSubscriptionRows(
+  client: SubscriptionReader,
+  expectedUserId: string,
+): Promise<SubscriptionRowsResult> {
+  const userId = (expectedUserId ?? "").trim();
+  if (!userId) return { kind: "rows", rows: [] };
+
+  let response: { data: unknown; error: { message?: string } | null };
+  try {
+    response = await client.from(SUBSCRIPTION_TABLE).select(SUBSCRIPTION_COLUMNS).eq("user_id", userId);
+  } catch {
+    return { kind: "error", transport: "thrown" };
+  }
+
+  if (response.error) return { kind: "error", transport: "refused" };
+
+  const rows = Array.isArray(response.data) ? (response.data as StoredSubscriptionRow[]) : [];
+  return { kind: "rows", rows };
+}
+
+/**
+ * Read the subscription set of one account.
  *
  * The query is filtered on `user_id`, and the result is validated again: an
  * account can only ever see its own row. `expectedUserId` comes from the
@@ -220,30 +250,33 @@ export async function readEntitlement(
   const userId = (expectedUserId ?? "").trim();
   if (!userId) return { kind: "none" };
 
-  let response: { data: unknown; error: { message?: string } | null };
-  try {
-    response = await client
-      .from(SUBSCRIPTION_TABLE)
-      .select(SUBSCRIPTION_COLUMNS)
-      .eq("user_id", userId);
-  } catch {
+  const result = await readOwnSubscriptionRows(client, userId);
+  if (result.kind === "error") {
     return {
       kind: "error",
-      message: "Impossible de lire votre formule pour le moment.",
+      message:
+        result.transport === "thrown"
+          ? "Impossible de lire votre formule pour le moment."
+          : // A missing table (migration not applied yet) or an RLS refusal lands here.
+            "Votre formule est momentanément illisible. Réessayez dans un instant.",
     };
   }
 
-  if (response.error) {
-    // A missing table (migration not applied yet) or an RLS refusal lands here.
-    return {
-      kind: "error",
-      message: "Votre formule est momentanément illisible. Réessayez dans un instant.",
-    };
-  }
-
-  const rows = Array.isArray(response.data) ? (response.data as RawSubscriptionRow[]) : [];
-  const subscription = selectSubscription(rows, userId);
+  const subscription = selectSubscription(result.rows, userId);
   return subscription ? { kind: "subscription", subscription } : { kind: "none" };
+}
+
+/** Same as `readOwnSubscriptionRows`, using the shared browser client. */
+export async function fetchOwnSubscriptionRows(
+  expectedUserId: string,
+): Promise<SubscriptionRowsResult> {
+  let client: SupabaseClient;
+  try {
+    client = await getSupabaseClient();
+  } catch {
+    return { kind: "error", transport: "thrown" };
+  }
+  return readOwnSubscriptionRows(client as unknown as SubscriptionReader, expectedUserId);
 }
 
 /** Same as `readEntitlement`, using the shared browser client. */

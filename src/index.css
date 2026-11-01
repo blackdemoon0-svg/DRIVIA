@@ -1973,6 +1973,19 @@ select:focus-visible {
   color: #0a0d0f;
 }
 
+/*
+ * A refused button must look refused. Without this rule the guard would be
+ * invisible: the button would still turn green on hover and a customer could
+ * believe the click simply failed.
+ */
+.pricing-cta:disabled,
+.pricing-cta:disabled:hover {
+  border-color: rgba(222, 234, 235, 0.16);
+  background: rgba(10, 14, 17, 0.24);
+  color: #6f7b7d;
+  cursor: not-allowed;
+}
+
 .pricing-cta[aria-busy="true"] {
   cursor: progress;
   opacity: 0.75;
