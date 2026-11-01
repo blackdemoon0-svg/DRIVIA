@@ -16,6 +16,7 @@ import {
   type PricePreviewVerdict,
   type PricingPlan,
 } from "../lib/paddleCore";
+import { describeLimits, type PlanId } from "../lib/planLimits";
 import {
   loadPaddleConfig,
   openPaddleCheckout,
@@ -243,6 +244,9 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
                 {plan.features.map((feature) => (
                   <li key={feature}>{feature}</li>
                 ))}
+                {/* Generated from the table the server enforces, so the page
+                    cannot promise a quota the handler would refuse. */}
+                <li className="pricing-quota">{describeLimits(plan.id as PlanId)}</li>
               </ul>
 
               {paid ? (

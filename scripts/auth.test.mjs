@@ -15,8 +15,10 @@ import assert from "node:assert";
 import {
   MIN_PASSWORD_LENGTH,
   describeAuthError,
+  isObfuscatedExistingUser,
   isSignedIn,
   readSession,
+  resendConfirmationEmail,
   resolveEmailRedirectUrl,
   signInWithEmail,
   signOut,
@@ -61,6 +63,7 @@ function installFetch({ auth }) {
     if (url.includes("/auth/v1/token") && url.includes("grant_type=password")) {
       return auth.signInWithPassword();
     }
+    if (url.includes("/auth/v1/resend")) return auth.resend();
     if (url.includes("/auth/v1/logout")) return auth.logout();
     if (url.includes("/auth/v1/user")) return auth.getUser();
 
@@ -193,7 +196,15 @@ function restore() {
   globalThis.window = { location: { origin: ORIGIN } };
 
   const calls = installFetch({
-    auth: { signup: () => json({ id: USER_ID, email: EMAIL, identities: [] }, 200) },
+    // One identity = a genuine sign-up. `identities: []` is Supabase's
+    // anti-enumeration answer for an existing account, covered further down.
+    auth: {
+      signup: () =>
+        json(
+          { id: USER_ID, email: EMAIL, identities: [{ id: "identity-1", provider: "email" }] },
+          200,
+        ),
+    },
   });
 
   const result = await signUpWithEmail(EMAIL, "motdepasse1");
@@ -351,7 +362,9 @@ function restore() {
   assert.equal(describeAuthError(new Error("Invalid login credentials")), "E-mail ou mot de passe incorrect.");
   assert.equal(describeAuthError(new Error("Email not confirmed")), "Confirmez d'abord votre adresse e-mail : ouvrez le lien reçu par e-mail, puis reconnectez-vous.");
   assert.match(describeAuthError(new Error("Password should be at least 6 characters")), /8 caractères/);
-  assert.match(describeAuthError(new Error("email rate limit exceeded")), /Trop de tentatives/);
+  // Depuis la correction : le quota e-mail de Supabase est nomme precisement,
+  // au lieu du message generique « trop de tentatives » qui masquait la cause.
+  assert.match(describeAuthError(new Error("email rate limit exceeded")), /limite horaire/i);
   assert.match(describeAuthError(new Error("Signups not allowed for this instance")), /désactivée/);
   assert.match(describeAuthError(new Error("Failed to fetch")), /injoignable/);
 
@@ -372,6 +385,203 @@ function restore() {
   assert.equal(isSignedIn({ status: "loading", session: null, user: null, message: null }), false);
   assert.equal(isSignedIn({ status: "unavailable", session: null, user: null, message: "x" }), false);
   pass("état « connecté » exige une session réelle (jamais un simple statut)");
+}
+
+
+// ---------------------------------------------------------------------------
+// 2c. Adresse deja enregistree : Supabase n'envoie RIEN
+// ---------------------------------------------------------------------------
+// Avec "Confirm email" active, `signUp` d'une adresse confirmee ne renvoie pas
+// d'erreur : il renvoie un utilisateur obfusque dont `identities` est vide, et
+// n'envoie aucun e-mail. L'interface annoncait "verifiez votre boite mail"
+// pour un message qui n'existait pas.
+{
+  // Le predicat est strict : seul un tableau vide signale l'adresse existante.
+  assert.equal(isObfuscatedExistingUser([]), true);
+  assert.equal(isObfuscatedExistingUser([{ id: "identity-1" }]), false);
+  assert.equal(isObfuscatedExistingUser(undefined), false, "forme inattendue : jamais « deja enregistre »");
+  assert.equal(isObfuscatedExistingUser(null), false);
+  assert.equal(isObfuscatedExistingUser("[]"), false);
+  assert.equal(isObfuscatedExistingUser({}), false);
+  pass("predicat « adresse existante » : seul un tableau `identities` vide compte, toute autre forme est une inscription");
+}
+
+{
+  installFetch({
+    auth: {
+      // Reponse reelle de GoTrue pour une adresse deja confirmee.
+      signup: () =>
+        json(
+          {
+            id: "00000000-0000-4000-8000-000000000000",
+            aud: "authenticated",
+            email: EMAIL,
+            email_confirmed_at: null,
+            identities: [],
+            created_at: new Date().toISOString(),
+          },
+          200,
+        ),
+    },
+  });
+
+  const result = await signUpWithEmail(EMAIL, "motdepasse1");
+  assert.deepEqual(
+    result,
+    { status: "already-registered" },
+    "aucun e-mail n'est envoye : le dire, au lieu d'annoncer une boite mail",
+  );
+  assert.equal(await readSession(), null, "toujours aucune session");
+  restore();
+  pass("inscription sur une adresse existante : etat `already-registered`, plus de faux « verifiez votre boite mail »");
+}
+
+{
+  // Une forme inattendue ne doit jamais bloquer une inscription reelle.
+  installFetch({
+    auth: { signup: () => json({ id: USER_ID, email: EMAIL }, 200) },
+  });
+  const result = await signUpWithEmail(EMAIL, "motdepasse1");
+  assert.deepEqual(result, { status: "confirmation-required" });
+  restore();
+  pass("inscription : reponse sans `identities` -> traitee comme une inscription normale (aucun blocage)");
+}
+
+// ---------------------------------------------------------------------------
+// 2d. Renvoi de l'e-mail de confirmation
+// ---------------------------------------------------------------------------
+{
+  const ORIGIN = "https://drivia-git-arena-75da48ff-drivia-blackdemoon0-2303s-projects.vercel.app";
+  globalThis.window = { location: { origin: ORIGIN } };
+
+  const calls = installFetch({ auth: { resend: () => json({}, 200) } });
+
+  const result = await resendConfirmationEmail("  Client@VEYVRO.test  ");
+  assert.deepEqual(result, { sent: true });
+
+  const resend = calls.find((c) => c.startsWith("POST /auth/v1/resend"));
+  assert.ok(resend, "l'appel resend doit etre emis");
+  assert.ok(
+    resend.includes(`redirect_to=${encodeURIComponent(ORIGIN)}`),
+    `le lien doit revenir sur l'origine courante — recu : ${resend}`,
+  );
+
+  delete globalThis.window;
+  restore();
+  pass("renvoi : `emailRedirectTo` = origine courante, adresse normalisee");
+}
+
+{
+  // Cooldown de 60 s par adresse : message actionnable, pas une erreur opaque.
+  installFetch({
+    auth: {
+      resend: () =>
+        json(
+          {
+            code: 429,
+            error_code: "over_email_send_rate_limit",
+            msg: "For security purposes, you can only request this after 47 seconds.",
+          },
+          429,
+        ),
+    },
+  });
+  await assert.rejects(
+    () => resendConfirmationEmail(EMAIL),
+    (error) => {
+      assert.match(error.message, /Patientez une minute/i);
+      return true;
+    },
+  );
+  restore();
+  pass("renvoi trop rapproche : 429 traduit en « patientez une minute », pas en erreur technique");
+}
+
+{
+  // Quota horaire du service integre (2 e-mails/heure pour tout le projet).
+  installFetch({
+    auth: {
+      resend: () =>
+        json({ code: 429, error_code: "over_email_send_rate_limit", msg: "email rate limit exceeded" }, 429),
+    },
+  });
+  await assert.rejects(
+    () => resendConfirmationEmail(EMAIL),
+    (error) => {
+      assert.match(error.message, /limite horaire/i);
+      return true;
+    },
+  );
+  restore();
+  pass("quota horaire atteint : message distinct du cooldown de 60 s");
+}
+
+{
+  // Adresse refusee par l'expediteur integre (hors equipe du projet).
+  installFetch({
+    auth: {
+      resend: () =>
+        json(
+          {
+            code: 400,
+            error_code: "email_address_not_authorized",
+            msg: "Email address not authorized",
+          },
+          400,
+        ),
+    },
+  });
+  await assert.rejects(
+    () => resendConfirmationEmail(EMAIL),
+    (error) => {
+      assert.match(error.message, /refuse cette adresse/i);
+      // L'ancien message generique ne doit plus masquer la cause.
+      assert.doesNotMatch(error.message, /La connexion a echoue\. Reessayez dans un instant\.$/);
+      return true;
+    },
+  );
+  restore();
+  pass("adresse non autorisee par l'expediteur Supabase : cause nommee, plus d'erreur generique");
+}
+
+{
+  // Une adresse invalide ne doit jamais atteindre le reseau.
+  const calls = installFetch({ auth: {} });
+  await assert.rejects(() => resendConfirmationEmail("pas-un-email"), /adresse e-mail/i);
+  assert.equal(calls.length, 0, "aucune requete pour une adresse invalide");
+  restore();
+  pass("renvoi : adresse invalide rejetee avant tout appel reseau");
+}
+
+
+// ---------------------------------------------------------------------------
+// 2e. Interface : le message et le bouton de renvoi existent vraiment
+// ---------------------------------------------------------------------------
+// Un test de logique ne prouve pas que l'utilisateur voit autre chose que le
+// faux « verifiez votre boite mail ». Le composant est donc rendu pour de vrai.
+{
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const { createElement } = await import("react");
+  const { default: AuthView, RESEND_COOLDOWN_SECONDS } = await import(
+    "../src/components/AuthView.tsx"
+  );
+
+  assert.equal(RESEND_COOLDOWN_SECONDS, 60, "cooldown aligne sur la limite Supabase");
+
+  // 1. Aucun bouton de renvoi tant qu'aucune confirmation n'est en attente.
+  const fresh = renderToStaticMarkup(
+    createElement(AuthView, { mode: "inscription", onModeChange: () => {} }),
+  );
+  assert.doesNotMatch(fresh, /Renvoyer l'e-mail/, "aucun renvoi propose avant une inscription");
+  assert.match(fresh, /Créer mon compte/);
+
+  // 2. La vue de connexion n'expose pas non plus le bouton.
+  const signIn = renderToStaticMarkup(
+    createElement(AuthView, { mode: "connexion", onModeChange: () => {} }),
+  );
+  assert.doesNotMatch(signIn, /Renvoyer l'e-mail/);
+
+  pass("interface : le bouton de renvoi n'apparait que dans le cas prevu, jamais avant une inscription");
 }
 
 console.log(`\n${checks} vérifications d'authentification passées.`);

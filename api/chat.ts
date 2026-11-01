@@ -1,4 +1,6 @@
 import VEYVRO_SYSTEM_PROMPT from "../server/veyvroSystemPrompt.js";
+import { authorizeRequest, type AccessDecision } from "../server/access.js";
+import { consumeQuota } from "../server/quotas.js";
 
 /**
  * Rebrand support: VEYVRO_* variables are the canonical names. The handler
@@ -582,9 +584,31 @@ async function consumeProviderFrame(
   return { complete: false, hasText: false, finishReason };
 }
 
+/** Read a header regardless of the case the platform used. */
+function readRequestHeader(request: ApiRequest, name: string): string | null {
+  const headers = request.headers ?? {};
+  const direct = headers[name] ?? headers[name.toLowerCase()];
+  const value = Array.isArray(direct) ? direct[0] : direct;
+  return typeof value === "string" && value ? value : null;
+}
+
+/**
+ * Chat entry point.
+ *
+ * Authentication comes first, before any rate-limit bookkeeping: an anonymous
+ * caller must not even consume an IP bucket, and the quotas of a plan are only
+ * meaningful for an identified account.
+ */
 export default async function handler(request: ApiRequest, response: ApiResponse) {
   if (request.method !== "POST") {
     return response.status(405).json({ error: "Only POST requests are supported." });
+  }
+
+  const access = await authorizeRequest(readRequestHeader(request, "authorization"));
+  if (!access.ok) {
+    // Fail closed: 401 for a caller we cannot identify, 503 when the server
+    // cannot decide. Never a default plan.
+    return response.status(access.status).json({ error: access.error, code: access.code });
   }
 
   const admission = admitChatRequest(request);
@@ -596,13 +620,17 @@ export default async function handler(request: ApiRequest, response: ApiResponse
   }
 
   try {
-    return await handleChatPost(request, response);
+    return await handleChatPost(request, response, access);
   } finally {
     admission.release();
   }
 }
 
-async function handleChatPost(request: ApiRequest, response: ApiResponse) {
+async function handleChatPost(
+  request: ApiRequest,
+  response: ApiResponse,
+  access: Extract<AccessDecision, { ok: true }>,
+) {
   let requestBody: unknown;
   try {
     requestBody = request.body;
@@ -634,6 +662,43 @@ async function handleChatPost(request: ApiRequest, response: ApiResponse) {
   }
   if (attachments.length > 0 && task !== "garage-quote") {
     return response.status(400).json({ error: "Document attachments are only supported for garage quote analysis." });
+  }
+
+  // Plan entitlement, decided server-side from the database — the browser only
+  // sent a token. Découverte has no photo or PDF capability at all.
+  if (attachments.length > 0 && !access.limits.attachments) {
+    return response.status(403).json({
+      code: "plan_required",
+      error:
+        "Photos and PDF analysis is part of VEYVRO Plus and Pro. Upgrade your plan to analyse a document.",
+    });
+  }
+
+  // Quotas, enforced on the plan read in the database.
+  //
+  // Consumed here — after every validation, just before the provider call — so a
+  // malformed request or a refused attachment never eats into the allowance.
+  //
+  // Limitation, stated plainly: these counters live in the memory of one
+  // instance, so they reset on a cold start and do not aggregate across
+  // instances. They stop loops and casual overuse; they are not a billing meter
+  // and not resistant to someone deliberately waiting out a cold start. Making
+  // them durable requires a table, i.e. a migration, which is out of scope here.
+  const quota = consumeQuota({
+    userId: access.userId,
+    plan: access.plan,
+    isQuoteAnalysis: task === "garage-quote",
+  });
+  if (!quota.ok) {
+    response.setHeader("Retry-After", String(quota.retryAfterSeconds));
+    return response.status(429).json({
+      code: quota.kind,
+      error: quota.error,
+      plan: access.plan,
+      limit: quota.limit,
+      used: quota.used,
+      retryAfterSeconds: quota.retryAfterSeconds,
+    });
   }
 
   const apiKey = readEnvVar("VEYVRO_AI_API_KEY", "VEYDRIVO_AI_API_KEY", "DRIVIA_AI_API_KEY");

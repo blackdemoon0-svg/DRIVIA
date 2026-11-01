@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   MIN_PASSWORD_LENGTH,
   describeAuthError,
+  resendConfirmationEmail,
   signInWithEmail,
   signUpWithEmail,
   useSignOut,
@@ -29,6 +30,13 @@ import {
 
 type AuthMode = "connexion" | "inscription";
 
+/**
+ * Supabase refuses a second confirmation e-mail for the same address within
+ * 60 seconds. The button is disabled for that long so a click cannot burn the
+ * project-wide quota (2 e-mails/hour on the built-in sender).
+ */
+export const RESEND_COOLDOWN_SECONDS = 60;
+
 type AuthViewProps = {
   mode: AuthMode;
   onModeChange: (mode: AuthMode) => void;
@@ -44,6 +52,14 @@ export default function AuthView({ mode, onModeChange, onSignedIn }: AuthViewPro
   const [confirmation, setConfirmation] = useState("");
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [isBusy, setIsBusy] = useState(false);
+  /**
+   * Address awaiting confirmation, so the resend button knows what to resend.
+   * `null` means "no pending confirmation": the button is not offered.
+   */
+  const [pendingConfirmation, setPendingConfirmation] = useState<string | null>(null);
+  /** Seconds left on Supabase's 60-second per-address cooldown. */
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const [isResending, setIsResending] = useState(false);
   const emailRef = useRef<HTMLInputElement>(null);
 
   const isSignUp = mode === "inscription";
@@ -53,7 +69,17 @@ export default function AuthView({ mode, onModeChange, onSignedIn }: AuthViewPro
     setPassword("");
     setConfirmation("");
     setFeedback(null);
+    setPendingConfirmation(null);
+    setResendCooldown(0);
   }, [mode]);
+
+  // Countdown for the resend button. Ticks once per second while active and
+  // stops by itself, so the timer can never outlive the component.
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const timer = setTimeout(() => setResendCooldown((current) => current - 1), 1_000);
+    return () => clearTimeout(timer);
+  }, [resendCooldown]);
 
   useEffect(() => {
     emailRef.current?.focus();
@@ -64,6 +90,7 @@ export default function AuthView({ mode, onModeChange, onSignedIn }: AuthViewPro
     if (isBusy) return;
 
     setFeedback(null);
+    const cleanAddress = email.trim().toLowerCase();
 
     const invalid = validateCredentials(email, password);
     if (invalid) {
@@ -87,10 +114,24 @@ export default function AuthView({ mode, onModeChange, onSignedIn }: AuthViewPro
         setConfirmation("");
         if (result.status === "signed-in") {
           // "Confirm email" disabled: a real session exists, so this is safe.
+          setPendingConfirmation(null);
           setFeedback({ tone: "success", text: "Compte créé et connecté." });
           onSignedIn?.();
+        } else if (result.status === "already-registered") {
+          // Supabase sent nothing. Saying "check your inbox" here is what made a
+          // working sign-up look broken, so the wording changes — while staying
+          // neutral: it never confirms that the account exists.
+          setPendingConfirmation(cleanAddress);
+          setResendCooldown(RESEND_COOLDOWN_SECONDS);
+          setFeedback({
+            tone: "success",
+            text: "Si cette adresse n'est pas déjà enregistrée, un e-mail de confirmation arrive. Si vous avez déjà un compte, connectez-vous : vous n'avez peut-être plus besoin de le confirmer.",
+          });
         } else {
-          // The project has "Confirm email" enabled: no session exists yet.
+          // The project has "Confirm email" enabled: an e-mail was sent, no
+          // session exists yet. The resend button covers a lost or filtered one.
+          setPendingConfirmation(cleanAddress);
+          setResendCooldown(RESEND_COOLDOWN_SECONDS);
           setFeedback({
             tone: "success",
             text: "Compte créé. Vérifiez votre boîte mail et cliquez sur le lien de confirmation pour activer votre adresse, puis revenez vous connecter.",
@@ -106,6 +147,29 @@ export default function AuthView({ mode, onModeChange, onSignedIn }: AuthViewPro
       setFeedback({ tone: "error", text: describeAuthError(error) });
     } finally {
       setIsBusy(false);
+    }
+  };
+
+  const handleResend = async () => {
+    const address = pendingConfirmation;
+    if (!address || isResending || resendCooldown > 0) return;
+
+    setIsResending(true);
+    try {
+      await resendConfirmationEmail(address);
+      // Deliberately neutral: identical wording whether or not it was sent.
+      setFeedback({
+        tone: "success",
+        text: "Si un compte attend confirmation pour cette adresse, un nouvel e-mail vient d'être envoyé.",
+      });
+      setResendCooldown(RESEND_COOLDOWN_SECONDS);
+    } catch (error) {
+      // A rate limit already answers "wait a minute": keep the button locked so
+      // the user cannot hammer the quota.
+      setResendCooldown(RESEND_COOLDOWN_SECONDS);
+      setFeedback({ tone: "error", text: describeAuthError(error) });
+    } finally {
+      setIsResending(false);
     }
   };
 
@@ -196,6 +260,22 @@ export default function AuthView({ mode, onModeChange, onSignedIn }: AuthViewPro
             >
               {feedback.text}
             </p>
+          )}
+
+          {pendingConfirmation && (
+            <button
+              type="button"
+              className="pricing-cta secondary auth-submit"
+              onClick={() => void handleResend()}
+              disabled={isResending || resendCooldown > 0}
+              aria-busy={isResending}
+            >
+              {isResending
+                ? "Envoi en cours…"
+                : resendCooldown > 0
+                  ? `Renvoyer l'e-mail (${resendCooldown} s)`
+                  : "Renvoyer l'e-mail de confirmation"}
+            </button>
           )}
 
           <button type="submit" className="pricing-cta auth-submit" disabled={isBusy} aria-busy={isBusy}>

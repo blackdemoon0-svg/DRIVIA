@@ -46,7 +46,27 @@ export type SignUpResult =
   /** An e-mail was sent: no session exists yet, the user is NOT signed in. */
   | { status: "confirmation-required" }
   /** "Confirm email" is disabled: Supabase returned a real session. */
-  | { status: "signed-in" };
+  | { status: "signed-in" }
+  /**
+   * The address already belongs to a confirmed account: Supabase answered with
+   * an obfuscated user and sent NOTHING. Reported so the interface can stop
+   * claiming an e-mail is on its way, without revealing whether the account
+   * exists.
+   */
+  | { status: "already-registered" };
+
+/**
+ * Detect Supabase's anti-enumeration answer for an existing confirmed account.
+ *
+ * With "Confirm email" enabled, `signUp` never returns an error for a known
+ * address: it returns a fake user whose `identities` array is empty, and sends
+ * no e-mail. Everything else (a fresh sign-up, an unconfirmed address) carries
+ * at least one identity, so anything that is not exactly `[]` is treated as a
+ * real sign-up — an unexpected shape must never block a genuine registration.
+ */
+export function isObfuscatedExistingUser(identities: unknown): boolean {
+  return Array.isArray(identities) && identities.length === 0;
+}
 
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
@@ -107,6 +127,32 @@ export function describeAuthError(error: unknown): string {
   }
   if (text.includes("password should be at least") || text.includes("password is too short")) {
     return `Le mot de passe doit contenir au moins ${MIN_PASSWORD_LENGTH} caractères.`;
+  }
+  // Supabase reports both limits with the SAME code (`over_email_send_rate_limit`)
+  // and different messages. The code lives on `error.code`, not in the message,
+  // so it has to be read separately — matching only the text is what left the
+  // 60-second cooldown falling through to the generic "connexion échouée".
+  const errorCode =
+    typeof (error as { code?: unknown })?.code === "string"
+      ? (error as { code: string }).code.toLowerCase()
+      : "";
+  const mentionsEmailRateLimit =
+    errorCode === "over_email_send_rate_limit" ||
+    text.includes("over_email_send_rate_limit") ||
+    text.includes("email rate limit exceeded");
+  const cooldown = /(?:after|dans) (\d+) secondes?/.test(text) || /after (\d+) seconds?/.test(text);
+
+  if (mentionsEmailRateLimit || cooldown) {
+    if (cooldown) {
+      // Per-address cooldown: waiting a minute fixes it.
+      return "Un e-mail vient d'être envoyé à cette adresse. Patientez une minute avant de redemander le lien.";
+    }
+    // Project-wide hourly budget of the built-in sender, or 2 e-mails/hour.
+    return "Le service d'e-mail de Supabase a atteint sa limite horaire. Réessayez dans un moment.";
+  }
+  if (text.includes("email_address_not_authorized") || text.includes("email address not authorized")) {
+    // Supabase's built-in sender only reaches the project team's own addresses.
+    return "Le service d'e-mail du projet refuse cette adresse de destination. Un envoi personnalisé doit être configuré côté serveur.";
   }
   if (text.includes("rate limit") || text.includes("too many requests")) {
     return "Trop de tentatives en peu de temps. Patientez quelques minutes avant de réessayer.";
@@ -188,11 +234,49 @@ export async function signUpWithEmail(email: string, password: string): Promise<
   });
   if (error) throw new AuthError(describeAuthError(error));
 
-  // An existing address returns a user with an empty `identities` array while
-  // "Confirm email" is on: treat it exactly like a fresh sign-up so the form
-  // cannot be used to discover accounts.
   if (data.session) return { status: "signed-in" };
+
+  // An existing confirmed address returns a fake user with an empty
+  // `identities` array and NO e-mail. Saying "check your inbox" there is what
+  // made a working sign-up look broken: the report distinguishes the two cases
+  // while the wording shown to the user stays neutral.
+  if (isObfuscatedExistingUser(data.user?.identities)) {
+    return { status: "already-registered" };
+  }
+
   return { status: "confirmation-required" };
+}
+
+/**
+ * Ask Supabase to send the confirmation e-mail again.
+ *
+ * Needed because the first one can be lost, filtered, or never sent at all
+ * (rate limit). The call is deliberately bare: the result is a boolean, and the
+ * caller shows the same neutral message whatever happens, so this cannot be
+ * turned into an account-discovery oracle.
+ *
+ * Supabase applies a 60-second cooldown per address and a project-wide hourly
+ * quota; both surface as 429 and are translated into actionable wording.
+ */
+export async function resendConfirmationEmail(
+  email: string,
+): Promise<{ sent: boolean }> {
+  const cleanEmail = normalizeEmail(email);
+  if (!looksLikeEmail(cleanEmail)) throw new AuthError("Cette adresse e-mail n'est pas valide.");
+
+  const client = await getSupabaseClient();
+  const emailRedirectTo = resolveEmailRedirectUrl(
+    typeof window === "undefined" ? null : window.location,
+  );
+
+  const { error } = await client.auth.resend({
+    type: "signup",
+    email: cleanEmail,
+    ...(emailRedirectTo ? { options: { emailRedirectTo } } : {}),
+  });
+  if (error) throw new AuthError(describeAuthError(error));
+
+  return { sent: true };
 }
 
 /** Sign in with e-mail and password. The session is verified before returning. */

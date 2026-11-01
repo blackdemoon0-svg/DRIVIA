@@ -21,6 +21,14 @@ type StreamOptions = {
   signal?: AbortSignal;
   attachments?: VeyvroAttachment[];
   task?: "garage-quote";
+  /**
+   * Supabase access token of the signed-in user.
+   *
+   * The server refuses any request without it: the identity, and therefore the
+   * plan, is never taken from the request body. Sent as a bearer header only —
+   * never in the URL, never logged.
+   */
+  accessToken?: string | null;
 };
 
 type StreamPayload = {
@@ -99,7 +107,7 @@ export async function streamVeyvroResponse(
   onDelta: (delta: string) => void,
   options: StreamOptions = {},
 ): Promise<void> {
-  const { signal, attachments } = options;
+  const { signal, attachments, accessToken } = options;
   const history = messages
     .slice(-24)
     .map((message) => ({ ...message, content: message.content.trim().slice(0, 4_000) }))
@@ -109,12 +117,22 @@ export async function streamVeyvroResponse(
     historyCharacters -= history.shift()?.content.length ?? 0;
   }
 
+  // Without a session there is nothing the server could authorise: fail here
+  // with a message the interface can turn into "sign in", instead of a 401.
+  if (!accessToken) {
+    throw new VeyvroApiError(401, "Sign in to VEYVRO to use the chat.", "auth_required");
+  }
+
   let response: Response;
 
   try {
     response = await fetch("/api/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+      },
       body: JSON.stringify({
         messages: history,
         ...(attachments?.length ? { attachments } : {}),
