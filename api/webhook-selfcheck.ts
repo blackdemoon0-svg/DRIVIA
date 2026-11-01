@@ -33,6 +33,76 @@ const PROBE_EVENT_ID = "evt_selfcheck_veyvro_0001";
 /** A well-formed UUID that is not an account: the handler must reject it. */
 const PROBE_USER_ID = "11111111-1111-4111-8111-111111111111";
 
+
+/**
+ * Describe a key WITHOUT revealing it: shape, JWT claims, and red flags only.
+ * Used to find out why PostgREST answers 401 without ever printing the secret.
+ */
+function describeKey(raw: string | undefined) {
+  const value = raw ?? "";
+  const trimmed = value.trim();
+  const info: Record<string, unknown> = {
+    present: trimmed.length > 0,
+    length: trimmed.length,
+    untrimmedLength: value.length,
+    hadSurroundingWhitespace: value !== trimmed,
+    hasQuotes: /^["'`]|["'`]$/.test(trimmed),
+    shape: trimmed.startsWith("eyJ")
+      ? "jwt"
+      : trimmed.startsWith("sb_secret_")
+        ? "new-style-secret"
+        : trimmed.startsWith("sb_publishable_")
+          ? "publishable"
+          : "unknown",
+  };
+
+  if (info.shape === "jwt") {
+    try {
+      const payload = JSON.parse(
+        Buffer.from(trimmed.split(".")[1] ?? "", "base64url").toString("utf8"),
+      ) as { ref?: string; role?: string; exp?: number; iss?: string };
+      info.jwtRole = payload.role ?? null;
+      info.jwtRef = payload.ref ?? null;
+      info.jwtExp = payload.exp ? new Date(payload.exp * 1000).toISOString() : null;
+      info.jwtExpired = payload.exp ? payload.exp * 1000 < Date.now() : null;
+      info.jwtIssuer = payload.iss ?? null;
+    } catch {
+      info.jwtDecode = "failed";
+    }
+  }
+  return info;
+}
+
+/** Project ref encoded in the Supabase URL (the subdomain). */
+function projectRef(url: string): string | null {
+  try {
+    return new URL(url).hostname.split(".")[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** One read against PostgREST, reported as status + short message only. */
+async function probeRest(url: string, key: string | undefined, table: string) {
+  if (!url || !key) return { skipped: "missing url or key" };
+  try {
+    const response = await fetch(`${url}/rest/v1/${table}?select=*&limit=1`, {
+      headers: { apikey: key, Authorization: `Bearer ${key}` },
+    });
+    const text = await response.text();
+    let message: unknown = text.slice(0, 160);
+    try {
+      const parsed = JSON.parse(text) as { message?: string; code?: string; hint?: string };
+      message = parsed.message ?? parsed.code ?? text.slice(0, 160);
+    } catch {
+      /* plain text body */
+    }
+    return { status: response.status, message };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : "request failed" };
+  }
+}
+
 const jsonHeaders = { "Content-Type": "application/json" };
 
 function readHeader(request: ProbeRequest, name: string): string | null {
@@ -158,8 +228,23 @@ export default async function handler(request: ProbeRequest, response: ProbeResp
     }
   }
 
+  const anonKey = process.env.SUPABASE_ANON_KEY?.trim() ?? "";
+  const restWithService = await probeRest(supabaseUrl, serviceKey, "webhook_events");
+  const restWithAnon = await probeRest(supabaseUrl, anonKey, "webhook_events");
+  const serviceInfo = describeKey(process.env.SUPABASE_SERVICE_ROLE_KEY);
+  const urlRef = projectRef(supabaseUrl);
+
   return response.status(200).json({
     probe: "webhook-selfcheck",
+    keyDiagnostics: {
+      supabaseUrlHost: supabaseUrl ? new URL(supabaseUrl).hostname : null,
+      urlProjectRef: urlRef,
+      serviceKey: serviceInfo,
+      serviceKeyRefMatchesUrl: serviceInfo.jwtRef ? serviceInfo.jwtRef === urlRef : null,
+      anonKeyPresent: anonKey.length > 0,
+      restWithService,
+      restWithAnon,
+    },
     eventId: PROBE_EVENT_ID,
     envPresent: {
       PADDLE_WEBHOOK_SECRET: secret.length > 0,
