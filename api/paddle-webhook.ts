@@ -642,7 +642,20 @@ export type HandleOutcome =
   | { kind: "ignored"; reason: string }
   | { kind: "rejected"; reason: string }
   /**
-   * A `409` that could not be resolved with certainty.
+   * A failure that means "our configuration does not match the payment we can
+   * see" — typically a signing secret that changed under an in-flight payment.
+   *
+   * The event is left in `received` and Paddle is told to retry, so correcting
+   * the configuration inside Paddle's retry window activates the subscription
+   * with no human intervention. Nothing is granted while it fails, and if the
+   * configuration is never corrected the notification ends `failed` in Paddle
+   * rather than being reported as delivered.
+   */
+  | { kind: "retry"; reason: string }
+  /**
+   * A `409` that could not be resolved with certainty, or a real payment whose
+   * billing email contradicts the account: plausible enough not to be thrown
+   * away, unprovable enough not to be granted.
    *
    * The event is deliberately left in `received`: it is neither a success nor a
    * refusal, and it must stay visible so the payment behind it is not lost.
@@ -706,9 +719,10 @@ function readScheduledAction(value: unknown): string | null {
  *
  * "Strict" here means: an unknown account, a malformed `custom_data.user_id`,
  * an unconfirmed address, an email that contradicts the account, or a Paddle
- * customer already bound to another account all lead to a refusal. A refusal is
- * recorded for audit and acknowledged, so Paddle stops retrying, but it never
- * grants access.
+ * customer already bound to another account all lead to a refusal. A refusal
+ * always grants nothing; how it is acknowledged (final, retryable, or left open
+ * for a human) is decided by `classifyAttributionFailure`, because a paid
+ * subscription must never be discarded over a configuration gap.
  */
 async function verifyAttribution(
   supabase: SupabaseEnv,
@@ -752,6 +766,34 @@ async function verifyAttribution(
   return { ok: true, userId };
 }
 
+/**
+ * Turn an attribution failure into the right kind of outcome.
+ *
+ * The distinction is what decides whether a paid subscription can still be
+ * activated automatically, so it is made once, here:
+ *
+ * - `invalid_attribution_proof` — the proof is well formed but does not verify.
+ *   Either the signing secret changed after the checkout minted it, or the
+ *   value is forged; the two are indistinguishable from the event alone. It is
+ *   therefore treated as retryable: a corrected secret heals it on Paddle's
+ *   next attempt, a forged value simply keeps failing until Paddle gives up.
+ *   Nothing is ever granted while it fails.
+ * - `email_mismatch` — a real payment whose billing email differs from the
+ *   account's. A customer who typed another address at checkout is a plausible
+ *   and legitimate case; discarding their payment would be a bug. Retrying
+ *   cannot fix it, so it is kept open for a human.
+ * - `customer_bound_to_other_user` — a deliberate security refusal. A Paddle
+ *   customer never changes owner because an event says so. Final.
+ * - everything else (`missing_custom_data_user_id`, `missing_attribution_proof`,
+ *   `unknown_user`, `unconfirmed_email`, `unknown_status`) — a fact about this
+ *   event that no amount of retrying changes. Acknowledged and recorded.
+ */
+function classifyAttributionFailure(reason: string): HandleOutcome {
+  if (reason === "invalid_attribution_proof") return { kind: "retry", reason };
+  if (reason === "email_mismatch") return { kind: "conflict", reason };
+  return { kind: "rejected", reason };
+}
+
 export async function handleSubscriptionEvent(
   event: SubscriptionEvent,
   options: { supabase: SupabaseEnv; now?: () => string; attributionSecret?: string | null },
@@ -786,11 +828,14 @@ export async function handleSubscriptionEvent(
   }
 
   const attribution = await verifyAttribution(supabase, data, existing, attributionSecret);
-  if (!attribution.ok) return { kind: "rejected", reason: attribution.reason };
+  if (!attribution.ok) return classifyAttributionFailure(attribution.reason);
 
   const priceId = readFirstPriceId(data);
   const mapping = resolvePlanFromPriceId(priceId);
-  if (!mapping) return { kind: "rejected", reason: "unknown_price_id" };
+  // A price the catalogue cannot name is a configuration gap, not a fact about
+  // this customer: if the price variable is corrected inside Paddle's retry
+  // window, the redelivery resolves it. Never a guessed plan.
+  if (!mapping) return { kind: "retry", reason: "unknown_price_id" };
 
   const rawStatus = typeof data.status === "string" ? data.status : "";
   const status = (SUBSCRIPTION_STATUSES as readonly string[]).includes(rawStatus)
@@ -1079,6 +1124,20 @@ async function handleWebhook(request: ApiRequest, response: ApiResponse) {
       { event_id: eventId, event_type: eventType, occurred_at: readTimestamp(event.occurred_at) ?? undefined, data: asRecord(event.data) ?? {} },
       { supabase },
     );
+
+    if (outcome.kind === "retry") {
+      // Left open on purpose: `received`, never `processed` and never
+      // `rejected`. 503 is what makes Paddle deliver it again, which is the
+      // only way a configuration corrected after the payment can still
+      // activate the subscription without a human.
+      await annotateEvent(supabase, eventId, outcome.reason);
+      return response.status(503).json({
+        received: false,
+        outcome: "retry",
+        reason: outcome.reason,
+        event_id: eventId,
+      });
+    }
 
     if (outcome.kind === "rejected" || outcome.kind === "ignored") {
       await finalizeEvent(supabase, eventId, outcome.kind, outcome.reason);

@@ -690,8 +690,10 @@ async function deliver(payload, { signature, rawBody, method = "POST", env = {} 
   const out = await deliver(
     subscriptionEvent({ data: { customer: { email: "quelqu-un-dautre@example.com" } } }),
   );
+  assert.equal(out.status, 202, "un paiement qu'on ne sait pas attribuer reste ouvert");
+  assert.equal(out.body.outcome, "conflict");
   assert.equal(out.body.reason, "email_mismatch");
-  assert.equal(stub.store.subscriptions.size, 0);
+  assert.equal(stub.store.subscriptions.size, 0, "jamais de droit sans attribution certaine");
   stub.restore();
 
   // Same payload, matching email: accepted.
@@ -782,12 +784,20 @@ async function deliver(payload, { signature, rawBody, method = "POST", env = {} 
       },
     }),
   );
-  assert.equal(out.status, 200, "le refus est acquitté");
-  assert.equal(out.body.outcome, "rejected");
+  // A mismatch is indistinguishable from a rotated signing secret, so it is
+  // retried rather than discarded — and it stays open, visibly, until it
+  // resolves. What it can never do is grant anything.
+  assert.equal(out.status, 503, "un écart de configuration est réessayé, pas acquitté");
+  assert.equal(out.body.outcome, "retry");
   assert.equal(out.body.reason, "invalid_attribution_proof");
   assert.equal(stub.store.subscriptions.size, 0, "aucun droit accordé sur preuve falsifiée");
+  assert.equal(
+    stub.store.events.values().next().value?.status,
+    "received",
+    "l'événement reste ouvert : ni traité, ni définitivement refusé",
+  );
   stub.restore();
-  pass("falsification : user_id remplacé, preuve d'un autre compte → refusé");
+  pass("falsification : user_id remplacé, preuve d'un autre compte → 503 `retry`, rien d'accordé");
 }
 
 {
@@ -819,10 +829,12 @@ async function deliver(payload, { signature, rawBody, method = "POST", env = {} 
       },
     }),
   );
+  assert.equal(out.status, 503);
+  assert.equal(out.body.outcome, "retry");
   assert.equal(out.body.reason, "invalid_attribution_proof");
   assert.equal(stub.store.subscriptions.size, 0);
   stub.restore();
-  pass("falsification : preuve forgée avec un autre secret → refusée");
+  pass("preuve signée avec un autre secret : 503 `retry` (secret tourné ?), rien d'accordé");
 }
 
 {
@@ -866,10 +878,11 @@ async function deliver(payload, { signature, rawBody, method = "POST", env = {} 
   const out = await deliver(
     subscriptionEvent({ data: { items: [{ price: { id: "pri_01inconnu" } }] } }),
   );
+  assert.equal(out.status, 503, "une lacune de catalogue est réessayée, pas consommée");
   assert.equal(out.body.reason, "unknown_price_id");
   assert.equal(stub.store.subscriptions.size, 0);
   stub.restore();
-  pass("prix inconnu : refusé, aucun plan deviné");
+  pass("prix inconnu : 503 `retry`, aucun plan deviné, aucun droit accordé");
 }
 
 {
@@ -1438,6 +1451,58 @@ function createVercelRequest({ payload, headers = {}, method = "POST" }) {
   assert.equal(stub.store.events.get(event.event_id).status, "received");
   stub.restore();
   pass("rejeu apres conflit : idempotent, l'evenement reste unique et ouvert");
+}
+
+{
+  // Auto-réparation : la preuve a été signée avant que le secret ne change.
+  // Première livraison avec le secret courant → 503, événement laissé ouvert.
+  // Le secret est corrigé, Paddle livre à nouveau le MÊME événement → il est
+  // repris et traité, sans intervention humaine et sans doublon.
+  const secretUtiliseAuCheckout = TEST_SECRET;
+  const secretTourne = crypto.randomBytes(32).toString("hex");
+
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+
+  const event = subscriptionEvent();
+  const bodyString = JSON.stringify(event);
+
+  const first = await deliver(event, {
+    rawBody: bodyString,
+    signature: sign(bodyString, { secret: secretTourne }),
+    env: { PADDLE_WEBHOOK_SECRET: secretTourne },
+  });
+  assert.equal(first.status, 503, "secret divergent : livraison réessayée");
+  assert.equal(first.body.outcome, "retry");
+  assert.equal(first.body.reason, "invalid_attribution_proof");
+  assert.equal(stub.store.subscriptions.size, 0, "aucun droit tant que la preuve ne vérifie pas");
+  const pending = stub.store.events.get(event.event_id);
+  assert.equal(pending.status, "received", "l'événement reste ouvert, donc rejouable");
+
+  // Le secret est corrigé côté déploiement : la même notification revient.
+  const second = await deliver(event, {
+    rawBody: bodyString,
+    signature: sign(bodyString, { secret: secretUtiliseAuCheckout }),
+    env: { PADDLE_WEBHOOK_SECRET: secretUtiliseAuCheckout },
+  });
+  assert.equal(second.status, 200, "après correction, la livraison aboutit");
+  assert.equal(second.body.duplicate, undefined, "l'événement ouvert est repris, pas court-circuité");
+  assert.equal(stub.store.subscriptions.size, 1, "l'abonnement est enfin accordé");
+  assert.equal(stub.store.events.get(event.event_id).status, "processed");
+
+  // Troisième livraison : désormais un vrai doublon, sans réécriture.
+  const third = await deliver(event, {
+    rawBody: bodyString,
+    signature: sign(bodyString, { secret: secretUtiliseAuCheckout }),
+    env: { PADDLE_WEBHOOK_SECRET: secretUtiliseAuCheckout },
+  });
+  assert.equal(third.status, 200);
+  assert.equal(third.body.duplicate, true, "une fois traité, l'événement est un doublon");
+
+  stub.restore();
+  pass("auto-réparation : 503 tant que le secret diverge, traité dès la correction, puis doublon");
 }
 
 console.log(`\n${checks} vérifications du webhook passées.`);
