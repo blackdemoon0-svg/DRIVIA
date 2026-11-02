@@ -4,13 +4,12 @@ import crypto from "node:crypto";
 // Omitting them makes the function fail to load, and Vercel answers
 // 500 FUNCTION_INVOCATION_FAILED without ever entering the handler.
 import { verifyAttributionProof } from "../server/attribution.js";
-import {
-  BILLING_INTERVALS,
-  PAID_PLAN_IDS,
-  SANDBOX_PRICE_IDS,
-  type BillingInterval,
-  type PaidPlanId,
-} from "../src/lib/paddleCore.js";
+import type { BillingInterval, PaidPlanId } from "../src/lib/paddleCore.js";
+// The price catalogue lives in one module shared with the plan-change route, so
+// an incoming price ID and the price ID sent to Paddle can never disagree.
+import { resolvePlanFromPriceId } from "../src/lib/paddlePrices.js";
+
+export { resolvePlanFromPriceId };
 
 /**
  * Paddle webhook: signature verification, idempotency, subscription persistence.
@@ -186,31 +185,6 @@ export function verifySignature(options: {
 // ---------------------------------------------------------------------------
 // Plan resolution
 // ---------------------------------------------------------------------------
-
-/**
- * Map a Paddle price ID to our plan.
- *
- * Environment names mirror the client (`VITE_PADDLE_PRICE_PLUS_MONTH`, …): they
- * are ordinary server-side variables too, so production IDs need no new
- * configuration. The built-in Sandbox IDs are the final fallback.
- */
-export function resolvePlanFromPriceId(
-  priceId: string | null | undefined,
-  env: Env = process.env,
-): { plan: PaidPlanId; interval: BillingInterval } | null {
-  if (!priceId) return null;
-
-  for (const plan of PAID_PLAN_IDS) {
-    for (const interval of BILLING_INTERVALS) {
-      const suffix = `${plan.toUpperCase()}_${interval.toUpperCase()}`;
-      for (const name of [`VITE_PADDLE_PRICE_${suffix}`, `PADDLE_PRICE_${suffix}`]) {
-        if (env[name]?.trim() === priceId) return { plan, interval };
-      }
-      if (SANDBOX_PRICE_IDS[plan][interval] === priceId) return { plan, interval };
-    }
-  }
-  return null;
-}
 
 // ---------------------------------------------------------------------------
 // Attribution

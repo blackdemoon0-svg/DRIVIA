@@ -330,7 +330,19 @@ function decide(plan, snapshot, activity = IDLE) {
 {
   const source = readFileSync(new URL("../src/components/PricingView.tsx", import.meta.url), "utf8");
 
-  assert.match(source, /decideCta\(plan\.id, plan\.cta, snapshot, activity\)/, "chaque bouton payant passe par la garde");
+  // Since the Plus → Pro step, the guard receives the *merged* activity: a
+  // checkout and an in-place plan change both lock the buttons, and the card
+  // must see both.
+  assert.match(
+    source,
+    /decideCta\(plan\.id, plan\.cta, snapshot, guardActivity\)/,
+    "chaque bouton payant passe par la garde",
+  );
+  assert.match(
+    source,
+    /const guardActivity: CheckoutActivity =[\s\S]{0,400}changeStage\.kind/,
+    "un changement de formule en cours verrouille aussi les boutons",
+  );
   assert.match(source, /disabled=\{decision\.disabled\}/, "la décision doit atteindre l'attribut disabled");
   assert.match(source, /if \(checkoutLock\.current\) return;/, "verrou synchrone avant toute création de checkout");
   assert.match(source, /decideCta\(plan, catalogue\?\.cta/, "la garde est réévaluée au moment du clic");

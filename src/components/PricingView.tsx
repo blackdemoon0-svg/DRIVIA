@@ -26,6 +26,16 @@ import {
   type PlanSnapshot,
 } from "../lib/purchaseGuard";
 import {
+  PlanChangeError,
+  describePlanChangeError,
+  formatMinorAmount,
+  isQuoteExpired,
+  previewPlanChange,
+  requestPlanChange,
+  type PlanChangePreview,
+  type PlanChangeQuote,
+} from "../lib/paddlePlanChange";
+import {
   loadPaddleConfig,
   openPaddleCheckout,
   readPaddleConfig,
@@ -47,6 +57,44 @@ const INTERVAL_LABELS: Record<BillingInterval, string> = {
   year: "Annuel",
 };
 
+/**
+ * Where a plan change (Plus → Pro) stands.
+ *
+ * `quoting` asks Paddle what the change costs; `confirm` shows that figure and
+ * waits for the customer; `applying` sends the change; `pending` means Paddle
+ * accepted it and the database has not caught up yet. **None of these states is
+ * "the plan changed"** — only a re-read of `subscriptions` can say that.
+ */
+type PlanChangeStage =
+  | { kind: "idle" }
+  | { kind: "quoting"; plan: PaidPlanId }
+  /**
+   * `quote` carries everything the confirmation will send: the plan, the
+   * interval and the amount Paddle computed, signed. Deliberately *not* read
+   * from the monthly/yearly toggle at confirmation time — the toggle may have
+   * moved since, and what gets applied must be exactly what was shown.
+   */
+  | { kind: "confirm"; plan: PaidPlanId; preview: PlanChangePreview; quote: PlanChangeQuote }
+  | { kind: "applying"; plan: PaidPlanId }
+  | { kind: "pending"; plan: PaidPlanId };
+
+const IDLE_CHANGE: PlanChangeStage = { kind: "idle" };
+
+/** Button text while a change is in flight for that plan. */
+function planChangeLabel(stage: PlanChangeStage, planId: string): string | null {
+  if (stage.kind === "idle" || stage.plan !== planId) return null;
+  switch (stage.kind) {
+    case "quoting":
+      return "Calcul du montant…";
+    case "confirm":
+      return "Confirmation attendue";
+    case "applying":
+      return "Changement en cours…";
+    case "pending":
+      return "En attente de confirmation";
+  }
+}
+
 function isPaidPlan(plan: PricingPlan): plan is PricingPlan & { id: PaidPlanId } {
   return plan.id !== "decouverte";
 }
@@ -58,9 +106,18 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
   const [snapshot, setSnapshot] = useState<PlanSnapshot>({ kind: "checking" });
   // The checkout in flight, if any. Never a payment: see `onClosed` below.
   const [activity, setActivity] = useState<CheckoutActivity>(IDLE_ACTIVITY);
+  /** Plus → Pro, in place. Never a checkout: a second one would create a second subscription. */
+  const [changeStage, setChangeStage] = useState<PlanChangeStage>(IDLE_CHANGE);
   // Synchronous re-entrancy lock: React state is applied after the handler
   // returns, so two clicks in the same tick would both see `idle` without it.
   const checkoutLock = useRef(false);
+  // Same lock for the plan change. Without it, a double click on "Confirmer"
+  // reads the same pre-render `confirm` state twice and sends two requests —
+  // the server would refuse the second, but nothing should be sent at all.
+  const changeLock = useRef(false);
+  // Ticks once a second while a quote is displayed, so the countdown and the
+  // expiry are visible without trusting a single render's timestamp.
+  const [clock, setClock] = useState(() => Date.now());
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
@@ -132,12 +189,151 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
     };
   }, [userId, readPlan]);
 
+  // Signing out, or signing in as someone else, must not carry over a quote,
+  // an "en attente" banner or a lock from the previous account: a quote is
+  // bound to one account on the server, and the screen must agree with that.
+  useEffect(() => {
+    changeLock.current = false;
+    setChangeStage(IDLE_CHANGE);
+  }, [userId]);
+
+  // Count down only while a quote is on screen: the amount is valid for a few
+  // minutes, and the customer can see how long they have left.
+  useEffect(() => {
+    if (changeStage.kind !== "confirm") return;
+    setClock(Date.now());
+    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [changeStage]);
+
   /** Give up on a checkout whose window never appeared. */
   const releaseCheckout = () => {
     checkoutLock.current = false;
     setActivity(IDLE_ACTIVITY);
     setNotice("Paiement interrompu avant toute confirmation : votre formule n'a pas changé.");
     void refreshPlan();
+  };
+
+  /**
+   * What the purchase guard sees: a checkout in flight, or a plan change in
+   * flight. Both must lock every paid button — the guard has no reason to know
+   * which mechanism is running, only that money may be moving.
+   */
+  const guardActivity: CheckoutActivity =
+    activity.kind !== "idle"
+      ? activity
+      : changeStage.kind === "idle"
+        ? IDLE_ACTIVITY
+        : changeStage.kind === "pending"
+          ? { kind: "open", plan: changeStage.plan }
+          : { kind: "creating", plan: changeStage.plan };
+
+  /** Ask Paddle what the change would cost. Nothing is charged by this step. */
+  const startPlanChange = async (plan: PaidPlanId) => {
+    // Two clicks in the same tick would otherwise send two quotes.
+    if (changeLock.current) return;
+
+    if (!userId || !accessToken) {
+      setNotice("Connectez-vous à votre compte VEYVRO pour changer de formule.");
+      onRequireSignIn();
+      return;
+    }
+
+    changeLock.current = true;
+    setError(null);
+    setNotice(null);
+    setChangeStage({ kind: "quoting", plan });
+
+    try {
+      const result = await previewPlanChange({ accessToken, targetPlan: plan, interval });
+      // The amount is Paddle's own figure, and the quote carries the signed
+      // proof of it. Both are kept for the confirmation step.
+      setChangeStage({
+        kind: "confirm",
+        plan: result.quote.targetPlan,
+        preview: result.preview,
+        quote: result.quote,
+      });
+    } catch (changeError) {
+      setError(
+        changeError instanceof PlanChangeError
+          ? changeError.message
+          : describePlanChangeError("unexpected_error"),
+      );
+      setChangeStage(IDLE_CHANGE);
+    } finally {
+      changeLock.current = false;
+    }
+  };
+
+  /** Send the change a quote describes. Paddle charges the prorated amount. */
+  const confirmPlanChange = async () => {
+    if (changeStage.kind !== "confirm") return;
+    // One confirmation at a time: React state has not re-rendered yet, so the
+    // disabled attribute alone cannot stop a second click in the same tick.
+    if (changeLock.current) return;
+
+    const { plan, quote } = changeStage;
+
+    // An expired quote is not confirmed: the amount it quotes is no longer the
+    // amount Paddle would charge.
+    if (isQuoteExpired(quote, Date.now())) {
+      setChangeStage(IDLE_CHANGE);
+      setNotice(describePlanChangeError("quote_expired"));
+      return;
+    }
+
+    changeLock.current = true;
+    setError(null);
+    setNotice(null);
+    setChangeStage({ kind: "applying", plan });
+
+    try {
+      // The plan and the interval travel inside the signed quote: nothing here
+      // re-reads the monthly/yearly toggle, which the customer may have moved.
+      await requestPlanChange({ accessToken, quote });
+      // Accepted, not applied: the plan still comes from the database.
+      setChangeStage({ kind: "pending", plan });
+    } catch (changeError) {
+      setError(
+        changeError instanceof PlanChangeError
+          ? changeError.message
+          : describePlanChangeError("unexpected_error"),
+      );
+      setChangeStage(IDLE_CHANGE);
+    } finally {
+      changeLock.current = false;
+    }
+  };
+
+  const cancelPlanChange = () => {
+    setChangeStage(IDLE_CHANGE);
+    setNotice("Changement annulé avant tout paiement : votre formule n'a pas changé.");
+  };
+
+  /** Give up waiting for the webhook without ever claiming the plan changed. */
+  const abandonPlanChange = () => {
+    setChangeStage(IDLE_CHANGE);
+    setNotice(
+      "Attente interrompue. Votre formule reste celle enregistrée sur votre compte : la relire ci-dessus reste la seule source de vérité.",
+    );
+  };
+
+  /**
+   * Re-read the account, and settle a pending change only if the database now
+   * shows the plan the customer asked for.
+   */
+  const refreshAndSettle = async () => {
+    // Named `awaitedPlan` on purpose: the old checkout lock that used to carry
+    // the "pending" name was released too early and must not return.
+    const awaitedPlan = changeStage.kind === "pending" ? changeStage.plan : null;
+    const next = await refreshPlan();
+
+    if (awaitedPlan && next.kind === "subscribed" && next.plan === awaitedPlan) {
+      setChangeStage(IDLE_CHANGE);
+      setNotice(`${planLabel(awaitedPlan)} est maintenant enregistré sur votre compte.`);
+    }
+    return next;
   };
 
   const handleCheckout = async (plan: PaidPlanId) => {
@@ -161,9 +357,17 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
     // Belt to the button's braces: the guard is re-evaluated at click time, so a
     // stale render can never open a checkout the current state refuses.
     const catalogue = PRICING_PLANS.find((item) => item.id === plan);
-    const decision = decideCta(plan, catalogue?.cta ?? "Choisir", snapshot, activity);
+    const decision = decideCta(plan, catalogue?.cta ?? "Choisir", snapshot, guardActivity);
     if (decision.disabled) {
       if (decision.hint) setNotice(decision.hint);
+      return;
+    }
+
+    // An upgrade must never reach this function: opening a checkout would create
+    // a second Paddle subscription for a customer who already has one.
+    if (decision.reason === "upgrade") {
+      setNotice(decision.hint);
+      void startPlanChange(plan);
       return;
     }
 
@@ -225,6 +429,30 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
     }
   };
 
+  /**
+   * Single entry point for every paid button.
+   *
+   * An `upgrade` never opens a checkout — Paddle.js cannot modify a subscription,
+   * so a second checkout would create a second subscription and a second charge.
+   * It goes through the server route instead.
+   */
+  const handlePlanAction = (plan: PaidPlanId) => {
+    const catalogue = PRICING_PLANS.find((item) => item.id === plan);
+    const decision = decideCta(plan, catalogue?.cta ?? "Choisir", snapshot, guardActivity);
+
+    if (decision.disabled) {
+      if (decision.hint) setNotice(decision.hint);
+      return;
+    }
+
+    if (decision.reason === "upgrade") {
+      void startPlanChange(plan);
+      return;
+    }
+
+    void handleCheckout(plan);
+  };
+
   const handleVerifyPrices = async () => {
     setError(null);
     setNotice(null);
@@ -243,6 +471,14 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
       setVerifying(false);
     }
   };
+
+  // A quote is only valid for a few minutes; the panel says so and stops
+  // offering the confirmation once it has passed.
+  const quoteExpired = changeStage.kind === "confirm" && isQuoteExpired(changeStage.quote, clock);
+  const quoteSecondsLeft =
+    changeStage.kind === "confirm"
+      ? Math.max(0, Math.ceil((Date.parse(changeStage.quote.expiresAt) - clock) / 1_000))
+      : 0;
 
   return (
     <main className="pricing-stage" id="pricing" aria-labelledby="pricing-title">
@@ -315,6 +551,75 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
         </div>
       )}
 
+      {changeStage.kind === "confirm" && (
+        <section className="pricing-verify" aria-label="Confirmation du changement de formule">
+          <h2>Passer à {planLabel(changeStage.plan)}</h2>
+          <p>
+            Montant calculé par Paddle au prorata de la période en cours :{" "}
+            <strong>
+              {formatMinorAmount(changeStage.preview.amountMinor, changeStage.preview.currencyCode)}
+            </strong>{" "}
+            {changeStage.preview.action === "credit"
+              ? "en votre faveur."
+              : "à payer maintenant."}
+            {changeStage.preview.action === "charge" && changeStage.preview.amountMinor > 0
+              ? ` Votre abonnement se poursuivra ensuite au tarif ${planLabel(changeStage.plan)}.`
+              : ""}
+          </p>
+          <p>
+            Le prélèvement est effectué par Paddle sur le moyen de paiement enregistré. Si le
+            paiement échoue, le changement n'est pas appliqué et votre formule actuelle reste
+            inchangée.
+          </p>
+          <p className="pricing-cta-note">
+            Ce montant est garanti pour la formule {planLabel(changeStage.plan)} en{" "}
+            {changeStage.quote.interval === "month" ? "mensuel" : "annuel"} pendant encore{" "}
+            {Math.floor(quoteSecondsLeft / 60)} min {String(quoteSecondsLeft % 60).padStart(2, "0")} s.
+            Paddle vérifie ce montant une seconde fois avant d'appliquer le changement ; s'il a
+            changé, rien n'est prélevé et un nouveau calcul vous est demandé.
+          </p>
+          <div className="auth-actions">
+            <button
+              type="button"
+              className="pricing-cta"
+              onClick={() => void confirmPlanChange()}
+              disabled={quoteExpired}
+            >
+              {quoteExpired
+                ? "Montant expiré"
+                : `Confirmer et payer ${formatMinorAmount(
+                    changeStage.preview.amountMinor,
+                    changeStage.preview.currencyCode,
+                  )}`}
+            </button>
+            <button
+              type="button"
+              className="pricing-verify-button"
+              onClick={() => void startPlanChange(changeStage.plan)}
+            >
+              Recalculer le montant
+            </button>
+            <button type="button" className="pricing-verify-button" onClick={cancelPlanChange}>
+              Conserver ma formule actuelle
+            </button>
+          </div>
+        </section>
+      )}
+
+      {changeStage.kind === "pending" && (
+        <p className="pricing-notice" role="status">
+          Changement envoyé à Paddle pour {planLabel(changeStage.plan)}. Votre formule reste celle
+          enregistrée sur votre compte tant que l'abonnement n'a pas été mis à jour : cela peut
+          prendre quelques instants.{" "}
+          <button type="button" className="pricing-signin-link" onClick={() => void refreshAndSettle()}>
+            Actualiser ma formule
+          </button>{" "}
+          <button type="button" className="pricing-signin-link" onClick={abandonPlanChange}>
+            Cesser d&apos;attendre
+          </button>
+        </p>
+      )}
+
       {userId && activity.kind !== "idle" && (
         <p className="pricing-notice" role="status">
           {activity.kind === "creating"
@@ -339,7 +644,7 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
             : snapshot.kind === "free"
               ? "Aucune formule payante enregistrée sur votre compte : la formule Découverte s'applique."
               : "Formule en cours de vérification sur votre compte."}{" "}
-          <button type="button" className="pricing-signin-link" onClick={() => void refreshPlan()}>
+          <button type="button" className="pricing-signin-link" onClick={() => void refreshAndSettle()}>
             Actualiser ma formule
           </button>
         </p>
@@ -362,9 +667,11 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
           const paid = isPaidPlan(plan);
           // One decision per card, taken from the guard: it owns whether the
           // button may be pressed, what it says, and why it is refused.
-          const decision = paid ? decideCta(plan.id, plan.cta, snapshot, activity) : null;
-          const isPending = activity.kind === "creating" && activity.plan === plan.id;
-          const label = decision ? decision.label : plan.cta;
+          const decision = paid ? decideCta(plan.id, plan.cta, snapshot, guardActivity) : null;
+          const isPending = guardActivity.kind === "creating" && guardActivity.plan === plan.id;
+          // A change in flight on this plan says what it is doing, instead of the
+          // generic "opening a payment" wording that belongs to a checkout.
+          const label = (paid ? planChangeLabel(changeStage, plan.id) : null) ?? (decision ? decision.label : plan.cta);
           const planPriceId = paid ? getPriceId(config, plan.id, interval) : null;
 
           return (
@@ -399,7 +706,7 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
                 <button
                   type="button"
                   className="pricing-cta"
-                  onClick={() => void handleCheckout(plan.id)}
+                  onClick={() => handlePlanAction(plan.id)}
                   disabled={decision.disabled}
                   aria-busy={isPending}
                   data-cta-reason={decision.reason}

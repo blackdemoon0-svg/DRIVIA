@@ -343,8 +343,16 @@ export function AccountView({ user, onGoToPricing, onSignedOut }: AccountViewPro
     };
   }, [user.id]);
 
-  const summary =
-    entitlement?.kind === "subscription" ? summarizeSubscription(entitlement.subscription) : null;
+  const subscription = entitlement?.kind === "subscription" ? entitlement.subscription : null;
+  const summary = subscription ? summarizeSubscription(subscription) : null;
+
+  /**
+   * The account page is a starting point for the upgrade, not a place where the
+   * change is executed: the prorated amount has to be shown and confirmed, and
+   * that lives on the pricing page. Only a Plus subscription in good standing
+   * gets the button — the same rule the server applies.
+   */
+  const offersUpgrade = subscription?.plan === "plus" && subscription.status === "active";
 
   return (
     <main className="pricing-stage auth-stage" aria-label="Mon compte">
@@ -413,7 +421,19 @@ export function AccountView({ user, onGoToPricing, onSignedOut }: AccountViewPro
           </p>
         )}
 
+        {offersUpgrade && (
+          <p className="pricing-notice auth-feedback" role="status">
+            Le passage à VEYVRO Pro se fait depuis la page des formules : le montant au prorata
+            vous y sera montré avant toute confirmation.
+          </p>
+        )}
+
         <div className="auth-actions">
+          {offersUpgrade && (
+            <button type="button" className="pricing-cta" onClick={onGoToPricing}>
+              Passer à VEYVRO Pro
+            </button>
+          )}
           <button type="button" className="pricing-cta secondary" onClick={onGoToPricing}>
             {summary ? "Voir les formules" : "Découvrir les formules"}
           </button>

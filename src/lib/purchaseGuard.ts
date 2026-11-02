@@ -240,11 +240,11 @@ export function decideCta(
       disabled: false,
       label: `Passer à ${PLAN_LABELS[plan]}`,
       reason: "upgrade",
-      // Paddle.js opens a *new* checkout; it does not modify the subscription in
-      // place. The wording must not promise a smooth in-place upgrade, because
-      // the change only exists once Paddle has confirmed it and the webhook has
-      // recorded it.
-      hint: `Votre formule actuelle est ${PLAN_LABELS[snapshot.plan]}. Le passage à ${PLAN_LABELS[plan]} est un nouveau paiement Paddle : il n'est enregistré qu'une fois l'abonnement confirmé et reçu par notre serveur.`,
+      // An upgrade no longer opens a checkout: it modifies the existing Paddle
+      // subscription through the server. The wording therefore promises a
+      // prorated amount shown *before* confirmation, and never a plan that has
+      // already changed — the webhook still has to record it.
+      hint: `Votre formule actuelle est ${PLAN_LABELS[snapshot.plan]}. Le montant au prorata vous sera montré avant de confirmer ; le changement n'est enregistré qu'une fois l'abonnement mis à jour par Paddle.`,
     };
   }
 

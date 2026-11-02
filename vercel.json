@@ -6,6 +6,9 @@
   "functions": {
     "api/chat.ts": {
       "maxDuration": 60
+    },
+    "api/paddle-plan-change.ts": {
+      "maxDuration": 30
     }
   },
   "redirects": [
