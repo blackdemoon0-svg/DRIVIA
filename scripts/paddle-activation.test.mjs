@@ -27,6 +27,7 @@ import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import attributionHandler from "../api/paddle-attribution.ts";
 import webhookHandler from "../api/paddle-webhook.ts";
+import { computeAttributionProof } from "../server/attribution.ts";
 import { resolveAccessPlan } from "../src/lib/subscriptionAccess.ts";
 import { SANDBOX_PRICE_IDS } from "../src/lib/paddleCore.ts";
 
@@ -443,6 +444,130 @@ function subscriptionCreated({ customData, email = USER_EMAIL, priceId = SANDBOX
   );
 
   pass("événements : created / updated / canceled / past_due traités, transaction.completed sans effet");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Renewal keeps the access without needing the checkout's proof
+// ---------------------------------------------------------------------------
+
+{
+  const SECRET = crypto.randomBytes(32).toString("hex");
+  const stub = installSupabaseStub({ users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL } } });
+
+  const minted = await mintProof(SECRET);
+  const created = subscriptionCreated({
+    customData: { user_id: minted.body.userId, attribution_proof: minted.body.proof },
+  });
+  const bound = await deliver(created, SECRET);
+  assert.equal(bound.status, 200);
+  assert.equal(resolveAccessPlan([...stub.store.subscriptions.values()], USER_ID), "plus");
+
+  // Paddle re-sends the `custom_data` frozen at checkout time, proof included.
+  // Here the proof was signed with a key that no longer exists: the renewal
+  // must still be applied, because the owner is the stored one.
+  const renewedEnd = new Date(Date.now() + 55 * 24 * 3_600_000).toISOString();
+  const renewal = subscriptionCreated({
+    customData: {
+      user_id: USER_ID,
+      attribution_proof: computeAttributionProof("secret-revoque", USER_ID),
+    },
+  });
+  renewal.event_type = "subscription.updated";
+  renewal.data.current_billing_period = { starts_at: PERIOD_END, ends_at: renewedEnd };
+
+  const out = await deliver(renewal, SECRET);
+  assert.equal(out.status, 200, `un renouvellement ne doit jamais être bloqué (reçu ${out.status})`);
+  assert.equal(out.body.reason, null, "aucun refus");
+
+  const row = stub.store.subscriptions.get(SUBSCRIPTION_ID);
+  assert.equal(row.user_id, USER_ID, "le propriétaire est celui de la base");
+  assert.equal(row.current_period_ends_at, renewedEnd, "la nouvelle période est enregistrée");
+  assert.equal(resolveAccessPlan([row], USER_ID), "plus", "l'accès est conservé");
+  assert.equal(stub.store.writes, 2, "deux écritures : liaison puis renouvellement");
+
+  stub.restore();
+  pass("renouvellement : preuve figée d'un ancien secret ignorée, propriétaire et accès conservés");
+}
+
+// ---------------------------------------------------------------------------
+// 8. Ownership cannot be moved, even with a cryptographically valid proof
+// ---------------------------------------------------------------------------
+
+{
+  const SECRET = crypto.randomBytes(32).toString("hex");
+  const stub = installSupabaseStub({ users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL } } });
+
+  const minted = await mintProof(SECRET);
+  const created = subscriptionCreated({
+    customData: { user_id: minted.body.userId, attribution_proof: minted.body.proof },
+  });
+  assert.equal((await deliver(created, SECRET)).status, 200);
+
+  // The strongest possible attempt: a genuine HMAC for the other account.
+  const hijack = subscriptionCreated({
+    customData: {
+      user_id: OTHER_USER_ID,
+      attribution_proof: computeAttributionProof(SECRET, OTHER_USER_ID),
+    },
+  });
+  hijack.event_type = "subscription.updated";
+
+  const out = await deliver(hijack, SECRET);
+  assert.equal(out.status, 200, "refus acquitté, pas de boucle Paddle");
+  assert.equal(out.body.outcome, "rejected");
+  assert.equal(out.body.reason, "customer_bound_to_other_user");
+
+  const row = stub.store.subscriptions.get(SUBSCRIPTION_ID);
+  assert.equal(row.user_id, USER_ID, "le propriétaire n'a pas bougé");
+  assert.equal(stub.store.writes, 1, "aucune écriture supplémentaire");
+  assert.equal(resolveAccessPlan([row], USER_ID), "plus", "l'accès reste à son titulaire");
+  assert.equal(resolveAccessPlan([row], OTHER_USER_ID), "decouverte", "l'autre compte n'obtient rien");
+
+  stub.restore();
+  pass("chaîne réelle : preuve valide d'un autre compte refusée, propriétaire et accès intacts");
+}
+
+// ---------------------------------------------------------------------------
+// 9. The proof still guards the binding: no proof, no first activation
+// ---------------------------------------------------------------------------
+
+{
+  const SECRET = crypto.randomBytes(32).toString("hex");
+  const stub = installSupabaseStub({ users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL } } });
+
+  const minted = await mintProof(SECRET);
+  assert.equal(
+    (
+      await deliver(
+        subscriptionCreated({
+          customData: { user_id: minted.body.userId, attribution_proof: minted.body.proof },
+        }),
+        SECRET,
+      )
+    ).status,
+    200,
+  );
+
+  // Renewal without any `custom_data`: accepted, the owner is known.
+  const renewal = subscriptionCreated({});
+  renewal.event_type = "subscription.updated";
+  const renewed = await deliver(renewal, SECRET);
+  assert.equal(renewed.status, 200, "un renouvellement sans custom_data aboutit");
+  assert.equal(stub.store.writes, 2);
+
+  // A brand-new Paddle subscription without any `custom_data`: refused, because
+  // nothing would prove which account is paying.
+  const unknown = subscriptionCreated({});
+  unknown.data.id = "sub_01hv8y5ehszzq0yv20ttx9999";
+  const refused = await deliver(unknown, SECRET);
+  assert.equal(refused.status, 200);
+  assert.equal(refused.body.outcome, "rejected");
+  assert.equal(refused.body.reason, "missing_custom_data_user_id");
+  assert.equal(stub.store.subscriptions.has("sub_01hv8y5ehszzq0yv20ttx9999"), false);
+  assert.equal(stub.store.writes, 2, "aucune écriture pour une liaison non prouvée");
+
+  stub.restore();
+  pass("contraste : renouvellement sans preuve accepté, liaison sans preuve refusée sans écriture");
 }
 
 setEnv(crypto.randomBytes(32).toString("hex"));

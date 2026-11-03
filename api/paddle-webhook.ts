@@ -717,37 +717,95 @@ function readScheduledAction(value: unknown): string | null {
 /**
  * Decide whether this event may write an entitlement.
  *
- * "Strict" here means: an unknown account, a malformed `custom_data.user_id`,
- * an unconfirmed address, an email that contradicts the account, or a Paddle
- * customer already bound to another account all lead to a refusal. A refusal
- * always grants nothing; how it is acknowledged (final, retryable, or left open
- * for a human) is decided by `classifyAttributionFailure`, because a paid
- * subscription must never be discarded over a configuration gap.
+ * Two situations, deliberately handled in two separate branches.
+ *
+ * 1. `existing` is null — FIRST BINDING. The payment is being attached to an
+ *    account right now, so the claim must be proven: `custom_data.user_id` has
+ *    to be a well-formed id whose HMAC was minted by `api/paddle-attribution`
+ *    for that exact id, the account must exist, its address must be confirmed,
+ *    and a billing email carried by the payload must match it. Any gap refuses.
+ *
+ * 2. `existing` is not null — RENEWAL. The owner was fixed by the row written
+ *    at binding time, and Paddle re-sends `custom_data` with every renewal.
+ *    That copy is a *snapshot of the checkout*, frozen at payment time: it is
+ *    not a fresh claim, and it still carries a proof signed with whatever key
+ *    existed back then. The owner is therefore read from the database and never
+ *    from the payload, and no proof is required — requiring one would tie every
+ *    renewal to the signing secret, so a single key rotation would stop all
+ *    renewals without any error surfacing. What the payload says about the
+ *    owner is instead *checked against* the stored owner: naming another
+ *    account is refused before any write.
+ *
+ * A refusal always grants nothing; how it is acknowledged (final, retryable, or
+ * left open for a human) is decided by `classifyAttributionFailure`, because a
+ * paid subscription must never be discarded over a configuration gap.
  */
 async function verifyAttribution(
   supabase: SupabaseEnv,
   data: Record<string, unknown>,
   existing: StoredSubscription | null,
   secret: string | null,
-): Promise<{ ok: true; userId: string } | { ok: false; reason: string }> {
-  const userId = readCustomDataUserId(data);
-  if (!userId) return { ok: false, reason: "missing_custom_data_user_id" };
+): Promise<
+  | { ok: true; userId: string; binding: "first" | "renewal" }
+  | { ok: false; reason: string }
+> {
+  const claimedUserId = readCustomDataUserId(data);
+  const customerId =
+    typeof data.customer_id === "string" && data.customer_id.trim()
+      ? data.customer_id.trim()
+      : null;
+
+  // --- Renewal: the owner is already established by an earlier write. ------
+  if (existing) {
+    const owner = existing.user_id;
+
+    // The column is NOT NULL and references `auth.users`, so a row without an
+    // owner should be impossible. Fail closed rather than invent one.
+    if (!owner) return { ok: false, reason: "missing_subscription_owner" };
+
+    if (claimedUserId && claimedUserId !== owner) {
+      // A Paddle customer already bound to another account keeps the reason it
+      // has always had; a claim pointing anywhere else gets its own name. Both
+      // are refused, and neither can move the row.
+      if (customerId && existing.paddle_customer_id) {
+        return { ok: false, reason: "customer_bound_to_other_user" };
+      }
+      return { ok: false, reason: "subscription_owner_mismatch" };
+    }
+
+    // An event may not swap the Paddle customer under a known subscription,
+    // even when it names the right owner.
+    if (customerId && existing.paddle_customer_id && customerId !== existing.paddle_customer_id) {
+      return { ok: false, reason: "customer_id_mismatch" };
+    }
+
+    // No proof, no account lookup, no email comparison: none of them could
+    // change the owner, and each of them can break a legitimate renewal.
+    return { ok: true, userId: owner, binding: "renewal" };
+  }
+
+  // --- First binding: nothing is established yet, so everything is checked. -
+  if (!claimedUserId) return { ok: false, reason: "missing_custom_data_user_id" };
 
   // A user id alone is never trusted: the proof must match this exact id.
   // Swapping in another account's id makes the HMAC mismatch, so the event is
   // refused before any database write.
   const proof = readCustomDataProof(data);
   if (!proof) return { ok: false, reason: "missing_attribution_proof" };
-  if (!verifyAttributionProof(secret, userId, proof)) {
+  if (!verifyAttributionProof(secret, claimedUserId, proof)) {
     return { ok: false, reason: "invalid_attribution_proof" };
   }
+  // Kept for the multi-key phase: today the check above already fails closed
+  // when the secret is missing, so this branch is a guard, not the main one.
   if (!secret) return { ok: false, reason: "missing_attribution_secret" };
 
-  const user = await fetchUser(supabase, userId);
+  const user = await fetchUser(supabase, claimedUserId);
   if (!user) return { ok: false, reason: "unknown_user" };
   if (!user.email_confirmed_at) return { ok: false, reason: "unconfirmed_email" };
 
-  // When the payload carries a billing email, it must match the account.
+  // When the payload carries a billing email, it must match the account. This
+  // only runs while binding: a customer who later edits the address in Paddle
+  // must not lose access on their next renewal.
   const customer = asRecord(data.customer);
   const billingEmail = typeof customer?.email === "string" ? customer.email : null;
   if (billingEmail && user.email) {
@@ -756,14 +814,7 @@ async function verifyAttribution(
     }
   }
 
-  const customerId = typeof data.customer_id === "string" ? data.customer_id : null;
-  if (existing && customerId && existing.paddle_customer_id && existing.user_id !== userId) {
-    // A Paddle customer cannot be re-bound to another account by replaying or
-    // forging `customData`.
-    return { ok: false, reason: "customer_bound_to_other_user" };
-  }
-
-  return { ok: true, userId };
+  return { ok: true, userId: claimedUserId, binding: "first" };
 }
 
 /**
@@ -782,8 +833,11 @@ async function verifyAttribution(
  *   account's. A customer who typed another address at checkout is a plausible
  *   and legitimate case; discarding their payment would be a bug. Retrying
  *   cannot fix it, so it is kept open for a human.
- * - `customer_bound_to_other_user` — a deliberate security refusal. A Paddle
- *   customer never changes owner because an event says so. Final.
+ * - `customer_bound_to_other_user`, `subscription_owner_mismatch`,
+ *   `customer_id_mismatch`, `missing_subscription_owner` — deliberate ownership
+ *   refusals. A subscription never changes owner because an event says so, and
+ *   no retry can turn another account's id into this subscription's owner.
+ *   Final, acknowledged and recorded.
  * - everything else (`missing_custom_data_user_id`, `missing_attribution_proof`,
  *   `unknown_user`, `unconfirmed_email`, `unknown_status`) — a fact about this
  *   event that no amount of retrying changes. Acknowledged and recorded.

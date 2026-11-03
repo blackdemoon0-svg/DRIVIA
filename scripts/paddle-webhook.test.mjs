@@ -1505,4 +1505,383 @@ function createVercelRequest({ payload, headers = {}, method = "POST" }) {
   pass("auto-réparation : 503 tant que le secret diverge, traité dès la correction, puis doublon");
 }
 
+// ---------------------------------------------------------------------------
+// 14. Renewals: the owner is the stored one, and no proof is required
+// ---------------------------------------------------------------------------
+// Paddle copies `custom_data` into the subscription and re-sends it with every
+// renewal. That copy is frozen at checkout time, so it still carries a proof
+// signed with whatever key existed then. Requiring it on renewal ties every
+// future payment to the signing secret: one rotation stops every renewal,
+// silently. These tests pin the opposite rule: the owner comes from the row,
+// and the payload may only ever *agree* with it.
+const RENEWAL_SUB_ID = "sub_01testsubscription000000";
+const RENEWAL_CUSTOMER_ID = "ctm_01testcustomer000000000";
+
+function existingRow(overrides = {}) {
+  return {
+    paddle_subscription_id: RENEWAL_SUB_ID,
+    user_id: USER_ID,
+    plan: "plus",
+    status: "active",
+    paddle_price_id: SANDBOX_PRICE_IDS.plus.month,
+    paddle_customer_id: RENEWAL_CUSTOMER_ID,
+    current_period_ends_at: "2026-11-01T00:00:00Z",
+    source_updated_at: "2026-10-01T00:00:00Z",
+    ...overrides,
+  };
+}
+
+{
+  // A proof minted with a secret that no longer exists must not block the
+  // renewal: the payment is the same subscription, the owner is already known.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [existingRow()] });
+  installQueryRouting(stub);
+  const out = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.updated",
+      data: {
+        status: "active",
+        custom_data: {
+          user_id: USER_ID,
+          attribution_proof: computeAttributionProof("secret-revoque-en-phase-2", USER_ID),
+        },
+        current_billing_period: { starts_at: "2026-11-01T00:00:00Z", ends_at: "2026-12-01T00:00:00Z" },
+      },
+    }),
+  );
+  assert.equal(out.status, 200);
+  assert.equal(out.body.outcome, undefined, "un renouvellement valide est traité");
+  assert.equal(out.body.reason, null);
+  const row = findStoredSubscription(stub.store, RENEWAL_SUB_ID);
+  assert.equal(row.user_id, USER_ID, "le propriétaire reste celui de la base");
+  assert.equal(row.current_period_ends_at, "2026-12-01T00:00:00Z", "la nouvelle période est appliquée");
+  assert.equal(
+    stub.store.requests.some((request) => request.includes("/auth/v1/admin/users/")),
+    false,
+    "un renouvellement ne consulte même pas le compte : rien à prouver",
+  );
+  stub.restore();
+  pass("renouvellement : preuve signée par un ancien secret acceptée, propriétaire inchangé, période mise à jour");
+}
+
+{
+  // Even a payload with no `custom_data` at all (older subscriptions, manual
+  // Paddle operations) must renew: the row is the authority.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [existingRow()] });
+  installQueryRouting(stub);
+  const out = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.updated",
+      data: {
+        status: "active",
+        custom_data: null,
+        current_billing_period: { starts_at: "2026-11-01T00:00:00Z", ends_at: "2026-12-01T00:00:00Z" },
+      },
+    }),
+  );
+  assert.equal(out.status, 200);
+  assert.equal(out.body.outcome, undefined);
+  const row = findStoredSubscription(stub.store, RENEWAL_SUB_ID);
+  assert.equal(row.user_id, USER_ID);
+  assert.equal(row.current_period_ends_at, "2026-12-01T00:00:00Z");
+  stub.restore();
+  pass("renouvellement : custom_data absent accepté, propriétaire inchangé");
+}
+
+{
+  // The decisive case: the claim is backed by a PERFECTLY VALID proof for
+  // another account. No amount of cryptography may move an existing
+  // subscription, so the refusal comes from ownership, not from the HMAC.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [existingRow()] });
+  installQueryRouting(stub);
+  const event = subscriptionEvent({
+    event_type: "subscription.updated",
+    data: {
+      status: "active",
+      custom_data: {
+        user_id: OTHER_USER_ID,
+        attribution_proof: computeAttributionProof(TEST_SECRET, OTHER_USER_ID),
+      },
+    },
+  });
+  const out = await deliver(event);
+  assert.equal(out.status, 200, "un refus est acquitté, il ne fait pas boucler Paddle");
+  assert.equal(out.body.outcome, "rejected");
+  assert.equal(out.body.reason, "customer_bound_to_other_user");
+  assert.equal(stub.store.writes.subscriptions, 0, "aucune écriture : le propriétaire ne bouge pas");
+  const row = findStoredSubscription(stub.store, RENEWAL_SUB_ID);
+  assert.equal(row.user_id, USER_ID);
+  assert.equal(row.plan, "plus");
+  assert.equal(stub.store.events.get(event.event_id).status, "rejected");
+  stub.restore();
+  pass("renouvellement : preuve VALIDE d'un autre compte refusée, propriétaire et plan intacts");
+}
+
+{
+  // Same attempt, but the event carries no `customer_id`. The historical guard
+  // only applied when both customer ids were present; ownership is now checked
+  // on its own, so this case can no longer slip through.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [existingRow()] });
+  installQueryRouting(stub);
+  const out = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.updated",
+      data: {
+        status: "active",
+        customer_id: undefined,
+        custom_data: {
+          user_id: OTHER_USER_ID,
+          attribution_proof: computeAttributionProof(TEST_SECRET, OTHER_USER_ID),
+        },
+      },
+    }),
+  );
+  assert.equal(out.status, 200);
+  assert.equal(out.body.outcome, "rejected");
+  assert.equal(out.body.reason, "subscription_owner_mismatch");
+  assert.equal(stub.store.writes.subscriptions, 0);
+  assert.equal(findStoredSubscription(stub.store, RENEWAL_SUB_ID).user_id, USER_ID);
+  stub.restore();
+  pass("renouvellement sans customer_id : revendication d'un autre compte refusée quand même");
+}
+
+{
+  // And the mirror case: the row itself has no stored customer id, so the old
+  // guard could not fire at all. Ownership is still enforced.
+  const stub = createSupabaseStub({
+    users: {},
+    seedSubscriptions: [existingRow({ paddle_customer_id: null })],
+  });
+  installQueryRouting(stub);
+  const out = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.updated",
+      data: {
+        status: "active",
+        custom_data: {
+          user_id: OTHER_USER_ID,
+          attribution_proof: computeAttributionProof(TEST_SECRET, OTHER_USER_ID),
+        },
+      },
+    }),
+  );
+  assert.equal(out.body.reason, "subscription_owner_mismatch");
+  assert.equal(stub.store.writes.subscriptions, 0);
+  assert.equal(findStoredSubscription(stub.store, RENEWAL_SUB_ID).user_id, USER_ID);
+  stub.restore();
+  pass("renouvellement, client Paddle non stocké : revendication refusée, propriétaire intact");
+}
+
+{
+  // A different Paddle customer under a known subscription is refused even when
+  // the owner matches: the subscription may not be re-pointed at another payer.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [existingRow()] });
+  installQueryRouting(stub);
+  const out = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.updated",
+      data: { status: "active", customer_id: "ctm_01unautrecustomer0000000" },
+    }),
+  );
+  assert.equal(out.body.reason, "customer_id_mismatch");
+  assert.equal(stub.store.writes.subscriptions, 0);
+  assert.equal(findStoredSubscription(stub.store, RENEWAL_SUB_ID).paddle_customer_id, RENEWAL_CUSTOMER_ID);
+  stub.restore();
+  pass("renouvellement : changement de client Paddle refusé, la ligne garde son payeur");
+}
+
+{
+  // A customer who edits their billing address in Paddle keeps their access:
+  // the email check belongs to the binding, not to the renewals.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [existingRow()] });
+  installQueryRouting(stub);
+  const out = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.updated",
+      data: {
+        status: "active",
+        customer: { email: "adresse-modifiee-dans-paddle@example.com" },
+        current_billing_period: { starts_at: "2026-11-01T00:00:00Z", ends_at: "2026-12-01T00:00:00Z" },
+      },
+    }),
+  );
+  assert.equal(out.status, 200, "un e-mail de facturation différent ne bloque pas un renouvellement");
+  assert.equal(out.body.outcome, undefined);
+  const row = findStoredSubscription(stub.store, RENEWAL_SUB_ID);
+  assert.equal(row.user_id, USER_ID);
+  assert.equal(row.current_period_ends_at, "2026-12-01T00:00:00Z", "l'accès est conservé");
+  stub.restore();
+  pass("renouvellement : adresse de facturation différente acceptée, accès conservé");
+}
+
+{
+  // A corrupted `custom_data.user_id` cannot claim anything, and cannot block
+  // either: it is not a claim about another account.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [existingRow()] });
+  installQueryRouting(stub);
+  const out = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.updated",
+      data: { status: "active", custom_data: { user_id: "pas-un-uuid" } },
+    }),
+  );
+  assert.equal(out.status, 200);
+  assert.equal(out.body.outcome, undefined);
+  assert.equal(findStoredSubscription(stub.store, RENEWAL_SUB_ID).user_id, USER_ID);
+  stub.restore();
+  pass("renouvellement : custom_data illisible ignoré, propriétaire inchangé");
+}
+
+{
+  // Non-regression of the binding rules: at binding time the email is still
+  // blocking, and a divergent address keeps the payment for a human.
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+  const out = await deliver(
+    subscriptionEvent({ data: { customer: { email: "quelqu-un-dautre@example.com" } } }),
+  );
+  assert.equal(out.status, 202);
+  assert.equal(out.body.reason, "email_mismatch");
+  assert.equal(stub.store.subscriptions.size, 0);
+  stub.restore();
+  pass("liaison : e-mail divergent toujours bloquant (202), aucune écriture");
+}
+
+{
+  // Non-regression: a first binding still requires a valid proof.
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+  const event = subscriptionEvent({
+    data: { custom_data: { user_id: USER_ID, attribution_proof: `v1.${"C".repeat(43)}` } },
+  });
+  const out = await deliver(event);
+  assert.equal(out.status, 503);
+  assert.equal(out.body.reason, "invalid_attribution_proof");
+  assert.equal(stub.store.subscriptions.size, 0);
+  assert.equal(stub.store.events.get(event.event_id).status, "received", "rejouable après correction");
+  stub.restore();
+  pass("liaison : preuve invalide toujours réessayée (503), aucune écriture");
+}
+
+{
+  // A cancellation is a renewal like any other: the owner is preserved.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [existingRow()] });
+  installQueryRouting(stub);
+  const out = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.canceled",
+      data: { status: "canceled", custom_data: null, canceled_at: new Date().toISOString() },
+    }),
+  );
+  assert.equal(out.status, 200);
+  const row = findStoredSubscription(stub.store, RENEWAL_SUB_ID);
+  assert.equal(row.status, "canceled");
+  assert.equal(row.user_id, USER_ID);
+  stub.restore();
+  pass("résiliation : statut mis à jour, propriétaire conservé");
+}
+
+{
+  // An out-of-order event cannot move the owner either: the ordering guard
+  // answers before attribution is even considered.
+  const stub = createSupabaseStub({
+    users: {},
+    seedSubscriptions: [existingRow({ source_updated_at: "2027-01-01T00:00:00Z" })],
+  });
+  installQueryRouting(stub);
+  const event = subscriptionEvent({
+    occurred_at: "2026-10-01T00:00:00Z",
+    event_type: "subscription.updated",
+    data: {
+      status: "active",
+      custom_data: {
+        user_id: OTHER_USER_ID,
+        attribution_proof: computeAttributionProof(TEST_SECRET, OTHER_USER_ID),
+      },
+    },
+  });
+  const out = await deliver(event);
+  assert.equal(out.body.outcome, "ignored");
+  assert.equal(out.body.reason, "stale_event");
+  assert.equal(stub.store.writes.subscriptions, 0);
+  assert.equal(findStoredSubscription(stub.store, RENEWAL_SUB_ID).user_id, USER_ID);
+  stub.restore();
+  pass("événement plus ancien : ignoré avant toute décision d'attribution, propriétaire intact");
+}
+
+{
+  // A processed event id is never re-interpreted: replaying it with a rewritten
+  // `custom_data` cannot reach the write path at all.
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+  const event = subscriptionEvent();
+  const first = await deliver(event);
+  assert.equal(first.status, 200);
+  assert.equal(stub.store.writes.subscriptions, 1);
+  assert.equal(findStoredSubscription(stub.store, RENEWAL_SUB_ID).user_id, USER_ID);
+
+  const tampered = {
+    ...event,
+    data: {
+      ...event.data,
+      custom_data: {
+        user_id: OTHER_USER_ID,
+        attribution_proof: computeAttributionProof(TEST_SECRET, OTHER_USER_ID),
+      },
+    },
+  };
+  const second = await deliver(tampered);
+  assert.equal(second.status, 200);
+  assert.equal(second.body.duplicate, true, "l'événement déjà traité est un doublon");
+  assert.equal(stub.store.writes.subscriptions, 1, "aucune seconde écriture");
+  assert.equal(findStoredSubscription(stub.store, RENEWAL_SUB_ID).user_id, USER_ID);
+  stub.restore();
+  pass("rejeu d'un événement traité avec custom_data réécrit : doublon, propriétaire intact");
+}
+
+{
+  // Neither a processing nor a refusal may echo an address, a secret or a key.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [existingRow()] });
+  installQueryRouting(stub);
+  const bodies = [];
+  bodies.push(
+    await deliver(
+      subscriptionEvent({
+        event_type: "subscription.updated",
+        data: {
+          status: "active",
+          customer: { email: USER_EMAIL },
+          current_billing_period: { starts_at: "2026-11-01T00:00:00Z", ends_at: "2026-12-01T00:00:00Z" },
+        },
+      }),
+    ),
+  );
+  bodies.push(
+    await deliver(
+      subscriptionEvent({
+        event_type: "subscription.updated",
+        data: {
+          status: "active",
+          custom_data: {
+            user_id: OTHER_USER_ID,
+            attribution_proof: computeAttributionProof(TEST_SECRET, OTHER_USER_ID),
+          },
+        },
+      }),
+    ),
+  );
+  const serialized = JSON.stringify(bodies);
+  assert.equal(serialized.includes(USER_EMAIL), false, "aucune adresse e-mail dans les réponses");
+  assert.equal(serialized.includes(TEST_SECRET), false, "aucun secret de signature");
+  assert.equal(serialized.includes(SERVICE_ROLE), false, "aucune clé service_role");
+  stub.restore();
+  pass("renouvellements : ni adresse, ni secret, ni clé dans les réponses HTTP");
+}
+
 console.log(`\n${checks} vérifications du webhook passées.`);
