@@ -3,7 +3,10 @@ import crypto from "node:crypto";
 // `"type": "module"` and Node rejects extensionless relative specifiers in ESM.
 // Omitting them makes the function fail to load, and Vercel answers
 // 500 FUNCTION_INVOCATION_FAILED without ever entering the handler.
-import { verifyAttributionProof } from "../server/attribution.js";
+import { verifyAttributionProofWithRing } from "../server/attribution.js";
+// The secret ring: the current signing secret, plus the one it replaces while an
+// explicit, bounded rotation window is open. See `server/webhookSecret.ts`.
+import { readSecretRing, ringSecrets, secretKeyId } from "../server/webhookSecret.js";
 import type { BillingInterval, PaidPlanId } from "../src/lib/paddleCore.js";
 // The price catalogue lives in one module shared with the plan-change route, so
 // an incoming price ID and the price ID sent to Paddle can never disagree.
@@ -180,6 +183,48 @@ export function verifySignature(options: {
   // Paddle may send several `h1` values while a secret is being rotated.
   const matched = parsed.h1.some((candidate) => safeEqual(candidate, expected));
   return matched ? { ok: true } : { ok: false, reason: "mismatch" };
+}
+
+/**
+ * Verify a `Paddle-Signature` against several secrets, current first.
+ *
+ * The freshness window is checked once, before any hashing: a stale delivery is
+ * refused whatever the key. Each secret is then tried with the same
+ * constant-time comparison, so the answer never reveals which key the server
+ * holds, only that one of them matched.
+ *
+ * `keyIndex` is returned on success for one purpose: an operator must be able to
+ * tell, after a rotation, whether deliveries are still arriving under the old
+ * secret. It is an index, not a secret.
+ */
+export function verifySignatureWithRing(options: {
+  rawBody: Buffer;
+  header: string | null | undefined;
+  secrets: readonly (string | null | undefined)[];
+  toleranceSeconds?: number;
+  nowSeconds?: number;
+}): SignatureVerdict & { keyIndex?: number } {
+  const usable = options.secrets.filter(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
+  if (usable.length === 0) return { ok: false, reason: "missing_secret" };
+
+  let last: SignatureVerdict = { ok: false, reason: "mismatch" };
+  for (let index = 0; index < usable.length; index += 1) {
+    const verdict = verifySignature({
+      rawBody: options.rawBody,
+      header: options.header,
+      secret: usable[index],
+      toleranceSeconds: options.toleranceSeconds,
+      nowSeconds: options.nowSeconds,
+    });
+    if (verdict.ok) return { ok: true, keyIndex: index };
+    // A header problem is the same for every key: stop at the first refusal
+    // that is not about the key itself, rather than repeating the work.
+    last = verdict;
+    if (verdict.reason !== "mismatch") break;
+  }
+  return last;
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +484,15 @@ async function upsertSubscription(
   // duplicates on the primary key, which the webhook never sends, so a retried
   // event would INSERT a second row instead of updating the first.
   // Migration 0002 creates the matching unique index on `paddle_subscription_id`.
+  //
+  // `currency_code` is dropped from the payload when unknown. The column is
+  // NOT NULL in the deployed table (with a `USD` default) while the migrations
+  // leave it nullable, so a literal `null` would fail the entire write and lose
+  // a payment over a field this handler never reads back. Omitting the key lets
+  // the default apply on insert, and keeps the stored value on update.
+  const payload: Record<string, unknown> = { ...row };
+  if (payload.currency_code === null) delete payload.currency_code;
+
   const response = await supabaseRequest(
     supabase,
     "/rest/v1/subscriptions?on_conflict=paddle_subscription_id",
@@ -448,7 +502,7 @@ async function upsertSubscription(
         // One row per Paddle subscription; a retried event overwrites, never doubles.
         Prefer: "resolution=merge-duplicates,return=minimal",
       },
-      body: JSON.stringify(row),
+      body: JSON.stringify(payload),
     },
   );
 
@@ -705,6 +759,24 @@ function readCurrencyCode(value: unknown): string | null {
   return /^[A-Z]{3}$/.test(code) ? code : null;
 }
 
+/**
+ * Paddle customer id of the subscription.
+ *
+ * The subscription entity carries it as `customer_id`; some payload versions
+ * nest it as `customer.id`. Both are accepted because the column is NOT NULL:
+ * a value must be found, or the write fails.
+ */
+function readPaddleCustomerId(data: Record<string, unknown>): string | null {
+  const direct = data.customer_id;
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+
+  const customer = asRecord(data.customer);
+  const nested = customer?.id;
+  if (typeof nested === "string" && nested.trim()) return nested.trim();
+
+  return null;
+}
+
 /** Paddle only ever schedules `cancel`, `pause` or `resume`. */
 const SCHEDULED_CHANGE_ACTIONS = ["cancel", "pause", "resume"] as const;
 
@@ -744,9 +816,9 @@ async function verifyAttribution(
   supabase: SupabaseEnv,
   data: Record<string, unknown>,
   existing: StoredSubscription | null,
-  secret: string | null,
+  secrets: readonly (string | null | undefined)[],
 ): Promise<
-  | { ok: true; userId: string; binding: "first" | "renewal" }
+  | { ok: true; userId: string; binding: "first" | "renewal"; keyIndex?: number }
   | { ok: false; reason: string }
 > {
   const claimedUserId = readCustomDataUserId(data);
@@ -792,12 +864,21 @@ async function verifyAttribution(
   // refused before any database write.
   const proof = readCustomDataProof(data);
   if (!proof) return { ok: false, reason: "missing_attribution_proof" };
-  if (!verifyAttributionProof(secret, claimedUserId, proof)) {
+
+  // The ring matters exactly here. A checkout opened just before a rotation
+  // mints its proof with the secret in force at that moment; the delivery
+  // arrives after the new secret is deployed. Trying only the current key would
+  // refuse a genuine, already-paid subscription — the failure that left this
+  // Preview project with `invalid_attribution_proof` and zero rows.
+  //
+  // The previous key is only ever tried while the documented rotation window is
+  // open (`server/webhookSecret.ts`), so this is a grace period, not a
+  // permanent second master key.
+  const proofVerdict = verifyAttributionProofWithRing(secrets, claimedUserId, proof);
+  if (!proofVerdict.ok) {
     return { ok: false, reason: "invalid_attribution_proof" };
   }
-  // Kept for the multi-key phase: today the check above already fails closed
-  // when the secret is missing, so this branch is a guard, not the main one.
-  if (!secret) return { ok: false, reason: "missing_attribution_secret" };
+  const proofKeyIndex = proofVerdict.keyIndex ?? undefined;
 
   const user = await fetchUser(supabase, claimedUserId);
   if (!user) return { ok: false, reason: "unknown_user" };
@@ -814,7 +895,7 @@ async function verifyAttribution(
     }
   }
 
-  return { ok: true, userId: claimedUserId, binding: "first" };
+  return { ok: true, userId: claimedUserId, binding: "first", keyIndex: proofKeyIndex };
 }
 
 /**
@@ -850,13 +931,26 @@ function classifyAttributionFailure(reason: string): HandleOutcome {
 
 export async function handleSubscriptionEvent(
   event: SubscriptionEvent,
-  options: { supabase: SupabaseEnv; now?: () => string; attributionSecret?: string | null },
+  options: {
+    supabase: SupabaseEnv;
+    now?: () => string;
+    attributionSecret?: string | null;
+    /**
+     * Extra keys to try when checking the attribution proof, in order.
+     *
+     * The caller passes the previous secret of an open rotation window; the
+     * current secret always comes first. Used only while *binding* — a renewal
+     * never needs a proof at all.
+     */
+    attributionSecrets?: readonly (string | null | undefined)[];
+  },
 ): Promise<HandleOutcome> {
   const { supabase } = options;
   const attributionSecret =
     options.attributionSecret ??
     process.env[WEBHOOK_ENV_KEYS.signatureSecret]?.trim() ??
     null;
+  const attributionSecrets = [attributionSecret, ...(options.attributionSecrets ?? [])];
   const nowIso = options.now?.() ?? new Date().toISOString();
 
   if (!(HANDLED_EVENT_TYPES as readonly string[]).includes(event.event_type)) {
@@ -881,8 +975,26 @@ export async function handleSubscriptionEvent(
     }
   }
 
-  const attribution = await verifyAttribution(supabase, data, existing, attributionSecret);
-  if (!attribution.ok) return classifyAttributionFailure(attribution.reason);
+  const attribution = await verifyAttribution(supabase, data, existing, attributionSecrets);
+  if (!attribution.ok) {
+    if (attribution.reason === "invalid_attribution_proof") {
+      // The exact failure this integration suffered in silence: a real payment,
+      // a proof that does not verify, and no way to tell why. One structured
+      // line, fingerprints only — never the secret, never the proof, never the
+      // user id. Comparing it with the secret actually used at checkout (a
+      // rotation, or two deployments) answers the question in one step.
+      console.warn(
+        JSON.stringify({
+          event: "paddle_attribution_rejected",
+          reason: attribution.reason,
+          acceptedKeyIds: attributionSecrets
+            .map((value) => secretKeyId(value))
+            .filter((value): value is string => value !== null),
+        }),
+      );
+    }
+    return classifyAttributionFailure(attribution.reason);
+  }
 
   const priceId = readFirstPriceId(data);
   const mapping = resolvePlanFromPriceId(priceId);
@@ -904,6 +1016,19 @@ export async function handleSubscriptionEvent(
   const period = asRecord(data.current_billing_period);
   const scheduledChange = asRecord(data.scheduled_change);
 
+  // `paddle_customer_id` is NOT NULL in the deployed database, and a
+  // subscription with no customer id could not be kept from being re-bound to
+  // another account. A renewal keeps the customer already stored — an event may
+  // not erase the payership — and a first binding must carry one.
+  //
+  // Refusing here would discard a real payment, so the outcome is a *retry*: the
+  // event stays open, Paddle redelivers, and nothing is written half-way. The
+  // reason is explicit, unlike the opaque write failure this used to produce.
+  const paddleCustomerId = readPaddleCustomerId(data) ?? existing?.paddle_customer_id ?? null;
+  if (!paddleCustomerId) return { kind: "retry", reason: "missing_customer_id" };
+
+  const currencyCode = readCurrencyCode(data.currency_code);
+
   const row: SubscriptionRow = {
     paddle_subscription_id: paddleSubscriptionId,
     user_id: attribution.userId,
@@ -911,9 +1036,9 @@ export async function handleSubscriptionEvent(
     status,
     paddle_price_id: priceId as string,
     paddle_product_id: readProductId(data),
-    paddle_customer_id: typeof data.customer_id === "string" ? data.customer_id : null,
+    paddle_customer_id: paddleCustomerId,
     billing_interval: mapping.interval,
-    currency_code: readCurrencyCode(data.currency_code),
+    currency_code: currencyCode,
     current_period_started_at: readTimestamp(period?.starts_at),
     current_period_ends_at: readTimestamp(period?.ends_at),
     scheduled_change_action: readScheduledAction(scheduledChange?.action),
@@ -1120,14 +1245,35 @@ async function handleWebhook(request: ApiRequest, response: ApiResponse) {
   }
   const rawBody = raw.buffer;
 
-  const secret = process.env[WEBHOOK_ENV_KEYS.signatureSecret]?.trim();
-  const verdict = verifySignature({
+  // The ring: the current secret, then the one it replaces while an explicit,
+  // bounded rotation window is open (`server/webhookSecret.ts`).
+  const ring = readSecretRing(process.env);
+  const verdict = verifySignatureWithRing({
     rawBody,
     header: readHeader(request, "paddle-signature"),
-    secret,
+    secrets: ringSecrets(ring),
   });
 
   if (!verdict.ok) {
+    // One structured line, no secret: only a one-way fingerprint, so an operator
+    // can compare two deployments after a rotation without either value ever
+    // leaving its environment. This is the diagnosis the silent
+    // `invalid_attribution_proof` failure was missing.
+    //
+    // Only the two reasons that mean "this deployment's configuration is wrong"
+    // are logged. A malformed or missing header is what random traffic looks
+    // like, and logging it would let anyone fill the function log.
+    if (verdict.reason === "mismatch" || verdict.reason === "missing_secret") {
+      console.warn(
+        JSON.stringify({
+          event: "paddle_webhook_rejected",
+          reason: verdict.reason,
+          expectedKeyId: secretKeyId(ring.current),
+          previousKeyId: secretKeyId(ring.previous),
+          previousRejection: ring.previousRejection,
+        }),
+      );
+    }
     // 401 lets Paddle retry, and tells an attacker nothing beyond "rejected".
     // `bodySource` says how the bytes were obtained, which is the one thing the
     // notification log cannot otherwise reveal: "stream" means the signed bytes
@@ -1176,7 +1322,13 @@ async function handleWebhook(request: ApiRequest, response: ApiResponse) {
 
     const outcome = await handleSubscriptionEvent(
       { event_id: eventId, event_type: eventType, occurred_at: readTimestamp(event.occurred_at) ?? undefined, data: asRecord(event.data) ?? {} },
-      { supabase },
+      {
+        supabase,
+        // The previous key is offered to the attribution check too: a checkout
+        // opened before the rotation signed its proof with it, and refusing
+        // that proof would discard a payment that has already been taken.
+        attributionSecrets: ring.previous ? [ring.previous] : [],
+      },
     );
 
     if (outcome.kind === "retry") {

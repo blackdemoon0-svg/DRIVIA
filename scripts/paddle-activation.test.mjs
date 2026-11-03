@@ -401,18 +401,37 @@ function subscriptionCreated({ customData, email = USER_EMAIL, priceId = SANDBOX
   const webhook = readFileSync(new URL("../api/paddle-webhook.ts", import.meta.url), "utf8");
   const checkout = readFileSync(new URL("../src/lib/paddleCheckout.ts", import.meta.url), "utf8");
   const proofModule = readFileSync(new URL("../server/attribution.ts", import.meta.url), "utf8");
+  const ringModule = readFileSync(new URL("../server/webhookSecret.ts", import.meta.url), "utf8");
 
   // The bug class that caused the incident: two sides signing/verifying with
   // keys that were allowed to diverge. One name, both sides, or nothing.
   const variableIn = (source) => [...source.matchAll(/"PADDLE_WEBHOOK_SECRET"/g)].length;
   assert.ok(variableIn(attribution) >= 1, "l'endpoint d'attribution lit PADDLE_WEBHOOK_SECRET");
   assert.ok(variableIn(webhook) >= 1, "le webhook lit PADDLE_WEBHOOK_SECRET");
-  assert.ok(!/PADDLE_WEBHOOK_SECRET_[A-Z]/.test(attribution + webhook), "aucun second secret divergent");
 
-  // One derivation, one computation, one verification.
-  assert.match(proofModule, /export function deriveAttributionKey/, "clé dérivée d'une fonction unique");
+  // Exactly one additional secret name exists, and it is the bounded rotation
+  // ring — not a second, permanent key. It is declared once, in the ring
+  // module, and the two callers only go through `readSecretRing`.
+  assert.ok(
+    !/PADDLE_WEBHOOK_SECRET_[A-Z]/.test(attribution + webhook),
+    "ni l'endpoint ni le webhook ne nomment un second secret directement",
+  );
+  const previousNames = [...ringModule.matchAll(/"PADDLE_WEBHOOK_SECRET_[A-Z_]+"/g)].map((m) => m[0]);
+  assert.deepEqual(
+    [...new Set(previousNames)].sort(),
+    ['"PADDLE_WEBHOOK_SECRET_PREVIOUS"', '"PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL"'],
+    "le trousseau ne connaît que le secret précédent et sa date de fin",
+  );
+  // The window is bounded in the code too, not only in the documentation.
+  assert.match(ringModule, /SECRET_RING_MAX_WINDOW_MS = 7 \* 24 \* 60 \* 60 \* 1000/);
+  assert.match(webhook, /readSecretRing\(process\.env\)/, "le webhook lit le trousseau");
   assert.match(attribution, /computeAttributionProof\(secret/, "la preuve est calculée par le module partagé");
-  assert.match(webhook, /verifyAttributionProof\(secret/, "et vérifiée par le même module");
+  // One verification path, and it tries the ring rather than a single key.
+  assert.match(webhook, /verifyAttributionProofWithRing\(secrets/, "et vérifiée par le même module");
+  assert.ok(
+    !/verifyAttributionProof\(secret,/.test(webhook),
+    "le webhook ne vérifie plus contre une seule clé",
+  );
 
   // custom_data keys: written by the checkout, read by the webhook.
   assert.match(checkout, /PADDLE_CUSTOM_DATA_USER_KEY = "user_id"/);

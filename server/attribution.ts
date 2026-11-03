@@ -87,20 +87,52 @@ export function verifyAttributionProof(
   userId: string,
   proof: string | null | undefined,
 ): boolean {
+  return verifyAttributionProofWithRing([secret], userId, proof).ok;
+}
+
+/**
+ * Verify a proof against several keys, in order.
+ *
+ * Why several: a checkout opened just before a rotation mints its proof with
+ * the secret in force at that moment, and the delivery may arrive after the new
+ * secret is deployed. Refusing that proof would mean a customer paid and got
+ * nothing. The ring is bounded in time (`server/webhookSecret.ts`) and the old
+ * key is only ever tried, never preferred.
+ *
+ * The same answer is returned as for a single key — a proof is valid or it is
+ * not — plus the index of the key that matched, so the caller can say *which*
+ * key verified without ever handling the key itself.
+ *
+ * Every key is tried, and the comparison is constant time, so a failure does
+ * not reveal how close a guess was, nor which key the server holds.
+ */
+export function verifyAttributionProofWithRing(
+  secrets: readonly (string | null | undefined)[],
+  userId: string,
+  proof: string | null | undefined,
+): { ok: boolean; keyIndex: number | null } {
   const candidate = (proof ?? "").trim();
   const id = (userId ?? "").trim();
-  if (!candidate || !id) return false;
+  if (!candidate || !id) return { ok: false, keyIndex: null };
 
   const separator = candidate.indexOf(".");
-  if (separator <= 0) return false;
-  if (candidate.slice(0, separator) !== ATTRIBUTION_PROOF_VERSION) return false;
-
-  let expected: string;
-  try {
-    expected = computeAttributionProof(secret, id);
-  } catch {
-    // Missing secret: fail closed.
-    return false;
+  if (separator <= 0) return { ok: false, keyIndex: null };
+  if (candidate.slice(0, separator) !== ATTRIBUTION_PROOF_VERSION) {
+    return { ok: false, keyIndex: null };
   }
-  return safeEqual(candidate, expected);
+
+  let index = 0;
+  for (const secret of secrets) {
+    const position = index;
+    index += 1;
+    let expected: string;
+    try {
+      expected = computeAttributionProof(secret, id);
+    } catch {
+      // Missing or unusable key: try the next one rather than crashing.
+      continue;
+    }
+    if (safeEqual(candidate, expected)) return { ok: true, keyIndex: position };
+  }
+  return { ok: false, keyIndex: null };
 }

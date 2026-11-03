@@ -1884,4 +1884,364 @@ function existingRow(overrides = {}) {
   pass("renouvellements : ni adresse, ni secret, ni clé dans les réponses HTTP");
 }
 
+// ---------------------------------------------------------------------------
+// N. Rotation du secret — trousseau borné, et le blocage observé en Preview
+//
+// The incident: a real `subscription.created` was stored as `rejected` with
+// `invalid_attribution_proof`, and no subscription row was written. The proof is
+// deterministic in (secret, user id), so a proof that does not verify means the
+// secret that signed it is not the one that reads it — a rotation, or two
+// deployments. These tests pin both halves of the correction: the bounded ring,
+// and the fact that a proof minted before a rotation still binds during it.
+// ---------------------------------------------------------------------------
+{
+  const { readSecretRing, ringSecrets, secretKeyId, SECRET_RING_MAX_WINDOW_MS } = await import(
+    "../server/webhookSecret.ts"
+  );
+  const NOW = Date.now();
+  const iso = (ms) => new Date(ms).toISOString();
+  const CURRENT = "secret-courant-pour-ce-test";
+  const OLD = "secret-precedent-pour-ce-test";
+
+  const ring = (env) => readSecretRing(env, NOW);
+
+  // No previous secret: the ring is a single key, as before.
+  {
+    const r = ring({ PADDLE_WEBHOOK_SECRET: CURRENT });
+    assert.equal(r.current, CURRENT);
+    assert.equal(r.previous, null);
+    assert.equal(r.previousDeclared, false);
+    assert.deepEqual(ringSecrets(r), [CURRENT]);
+  }
+
+  // Previous present and inside its window: two keys, current first.
+  {
+    const r = ring({
+      PADDLE_WEBHOOK_SECRET: CURRENT,
+      PADDLE_WEBHOOK_SECRET_PREVIOUS: OLD,
+      PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL: iso(NOW + 60_000),
+    });
+    assert.equal(r.previous, OLD);
+    assert.equal(r.previousRejection, null);
+    assert.deepEqual(ringSecrets(r), [CURRENT, OLD], "le secret courant reste prioritaire");
+  }
+
+  // Every way of declaring a previous secret wrongly must close the window.
+  // A grace period that cannot be bounded is not a grace period.
+  const refused = [
+    [{}, "missing_until"],
+    [{ PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL: "pas une date" }, "unreadable_until"],
+    [{ PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL: iso(NOW - 1_000) }, "expired"],
+    [
+      { PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL: iso(NOW + SECRET_RING_MAX_WINDOW_MS + 3_600_000) },
+      "window_too_long",
+    ],
+    [{ PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL: iso(NOW + 60_000) }, "duplicate_of_current"],
+  ];
+  for (const [extra, expected] of refused) {
+    const env = { PADDLE_WEBHOOK_SECRET: CURRENT, PADDLE_WEBHOOK_SECRET_PREVIOUS: OLD, ...extra };
+    if (expected === "duplicate_of_current") env.PADDLE_WEBHOOK_SECRET_PREVIOUS = CURRENT;
+    const r = ring(env);
+    assert.equal(r.previous, null, `${expected} : ancien secret ignoré`);
+    assert.equal(r.previousRejection, expected);
+    assert.deepEqual(ringSecrets(r), [CURRENT], `${expected} : une seule clé essayée`);
+  }
+
+  // The boundary is exclusive: at `_UNTIL` the old secret is already gone.
+  {
+    const r = ring({
+      PADDLE_WEBHOOK_SECRET: CURRENT,
+      PADDLE_WEBHOOK_SECRET_PREVIOUS: OLD,
+      PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL: iso(NOW),
+    });
+    assert.equal(r.previous, null);
+    assert.equal(r.previousRejection, "expired");
+  }
+
+  // Fail-closed on the *current* secret: a deployment that lost it must refuse
+  // everything, not quietly keep accepting deliveries under the retired key.
+  {
+    const r = ring({
+      PADDLE_WEBHOOK_SECRET_PREVIOUS: OLD,
+      PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL: iso(NOW + 60_000),
+    });
+    assert.equal(r.current, null);
+    assert.deepEqual(ringSecrets(r), [], "aucune clé utilisable sans secret courant");
+  }
+
+  // Fingerprint: stable, short, different per secret, never the secret itself.
+  {
+    const first = secretKeyId(CURRENT);
+    assert.match(first, /^[0-9a-f]{8}$/, "empreinte courte et hexadécimale");
+    assert.equal(secretKeyId(CURRENT), first, "stable pour un même secret");
+    assert.notEqual(secretKeyId(OLD), first, "deux secrets ont deux empreintes");
+    assert.equal(secretKeyId(""), null);
+    assert.equal(secretKeyId(null), null);
+    assert.equal(first.includes(CURRENT) || CURRENT.includes(first), false);
+  }
+
+  pass("trousseau : fenêtre bornée à 7 jours, refus explicite de chaque déclaration invalide");
+}
+
+// End-to-end through the real handler: rotation, then the incident itself.
+{
+  const OLD_SECRET = crypto.randomBytes(32).toString("hex");
+  const users = {
+    [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" },
+  };
+  const openWindow = {
+    PADDLE_WEBHOOK_SECRET_PREVIOUS: OLD_SECRET,
+    PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL: new Date(Date.now() + 3_600_000).toISOString(),
+  };
+  const closedWindow = {
+    PADDLE_WEBHOOK_SECRET_PREVIOUS: OLD_SECRET,
+    PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL: new Date(Date.now() - 1_000).toISOString(),
+  };
+
+  // 1. A delivery still signed with the old secret, inside the window.
+  {
+    const stub = createSupabaseStub({ users });
+    installQueryRouting(stub);
+    const payload = subscriptionEvent();
+    const body = JSON.stringify(payload);
+    const out = await deliver(payload, {
+      rawBody: body,
+      signature: sign(body, { secret: OLD_SECRET }),
+      env: openWindow,
+    });
+
+    assert.equal(out.status, 200, "signature sous l'ancien secret acceptée dans la fenêtre");
+    assert.equal(stub.store.writes.subscriptions, 1, "une seule écriture");
+    assert.ok(findStoredSubscription(stub.store, payload.data.id), "l'abonnement est bien créé");
+    stub.restore();
+  }
+
+  // 2. Same delivery once the window has closed: back to 401, nothing written.
+  {
+    const stub = createSupabaseStub({ users });
+    installQueryRouting(stub);
+    const payload = subscriptionEvent();
+    const body = JSON.stringify(payload);
+    const out = await deliver(payload, {
+      rawBody: body,
+      signature: sign(body, { secret: OLD_SECRET }),
+      env: closedWindow,
+    });
+
+    assert.equal(out.status, 401);
+    assert.equal(out.body.reason, "mismatch");
+    assert.equal(stub.store.writes.subscriptions, 0);
+    assert.equal(stub.store.writes.webhookEvents, 0, "rien n'est journalisé, comme avant");
+    // The refusal must not hand back the key it expected.
+    assert.equal(JSON.stringify(out.body).includes(TEST_SECRET), false);
+    assert.equal(JSON.stringify(out.body).includes(OLD_SECRET), false);
+    stub.restore();
+  }
+
+  // 3. The incident, reproduced then fixed: the checkout minted its proof before
+  //    the rotation, Paddle signs the delivery with the new secret, and the
+  //    proof must still bind during the window.
+  {
+    const stub = createSupabaseStub({ users });
+    installQueryRouting(stub);
+    const payload = subscriptionEvent({
+      data: {
+        custom_data: {
+          user_id: USER_ID,
+          attribution_proof: computeAttributionProof(OLD_SECRET, USER_ID),
+        },
+      },
+    });
+    const out = await deliver(payload, { env: openWindow });
+
+    assert.equal(out.status, 200, "la preuve d'avant rotation n'est plus un refus définitif");
+    assert.equal(out.body.outcome, undefined, "traité, pas rejeté");
+    const row = findStoredSubscription(stub.store, payload.data.id);
+    assert.ok(row, "l'abonnement payé est enfin écrit");
+    assert.equal(row.user_id, USER_ID, "rattaché au bon compte");
+    assert.equal(row.plan, "plus");
+    assert.equal(row.status, "active");
+    stub.restore();
+  }
+
+  // 4. The same proof once the window is closed: refused, and retryable —
+  //    never a silent, final discard of a real payment.
+  {
+    const stub = createSupabaseStub({ users });
+    installQueryRouting(stub);
+    const payload = subscriptionEvent({
+      data: {
+        custom_data: {
+          user_id: USER_ID,
+          attribution_proof: computeAttributionProof(OLD_SECRET, USER_ID),
+        },
+      },
+    });
+    const out = await deliver(payload, { env: closedWindow });
+
+    assert.equal(out.status, 503);
+    assert.equal(out.body.outcome, "retry");
+    assert.equal(out.body.reason, "invalid_attribution_proof");
+    assert.equal(stub.store.writes.subscriptions, 0);
+    stub.restore();
+  }
+
+  // 5. Without a previous secret, behaviour is exactly what it was.
+  {
+    const stub = createSupabaseStub({ users });
+    installQueryRouting(stub);
+    const payload = subscriptionEvent({
+      data: {
+        custom_data: {
+          user_id: USER_ID,
+          attribution_proof: computeAttributionProof(OLD_SECRET, USER_ID),
+        },
+      },
+    });
+    const out = await deliver(payload);
+
+    assert.equal(out.status, 503);
+    assert.equal(out.body.reason, "invalid_attribution_proof");
+    assert.equal(stub.store.writes.subscriptions, 0);
+    stub.restore();
+  }
+
+  // 6. The ring widens the *key*, never the *account*: a proof valid under the
+  //    previous secret for another user is still refused.
+  {
+    const stub = createSupabaseStub({ users });
+    installQueryRouting(stub);
+    const payload = subscriptionEvent({
+      data: {
+        custom_data: {
+          user_id: USER_ID,
+          attribution_proof: computeAttributionProof(OLD_SECRET, OTHER_USER_ID),
+        },
+      },
+    });
+    const out = await deliver(payload, { env: openWindow });
+
+    assert.equal(out.status, 503);
+    assert.equal(out.body.reason, "invalid_attribution_proof");
+    assert.equal(stub.store.writes.subscriptions, 0, "aucune ligne pour un compte non prouvé");
+    stub.restore();
+  }
+
+  // 7. Losing the current secret must not be silently compensated by the old one.
+  {
+    const stub = createSupabaseStub({ users });
+    installQueryRouting(stub);
+    const payload = subscriptionEvent();
+    const body = JSON.stringify(payload);
+    const saved = process.env.PADDLE_WEBHOOK_SECRET;
+    const out = await deliver(payload, {
+      rawBody: body,
+      signature: sign(body, { secret: OLD_SECRET }),
+      env: { PADDLE_WEBHOOK_SECRET: "", ...openWindow },
+    });
+    if (saved !== undefined) process.env.PADDLE_WEBHOOK_SECRET = saved;
+
+    assert.equal(out.status, 401);
+    assert.equal(out.body.reason, "missing_secret", "le secret courant reste obligatoire");
+    assert.equal(stub.store.writes.subscriptions, 0);
+    assert.equal(stub.store.writes.webhookEvents, 0);
+    stub.restore();
+  }
+
+  pass("rotation : signature et preuve acceptées sous l'ancien secret pendant la fenêtre, refusées après");
+}
+
+// ---------------------------------------------------------------------------
+// O. Colonnes NOT NULL de la base réelle : ne jamais perdre un paiement dessus
+//
+// `paddle_customer_id` and `currency_code` are NOT NULL in the deployed
+// database, while both are nullable in the migrations. Sending a literal null
+// fails the whole write, so a real payment would be retried until it expired.
+// ---------------------------------------------------------------------------
+{
+  const users = {
+    [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" },
+  };
+
+  // `customer_id` absent, nested `customer.id` present: the id is found.
+  {
+    const stub = createSupabaseStub({ users });
+    installQueryRouting(stub);
+    const payload = subscriptionEvent();
+    delete payload.data.customer_id;
+    payload.data.customer = { id: "ctm_01nestedcustomervalue0000", email: USER_EMAIL };
+
+    const out = await deliver(payload);
+    assert.equal(out.status, 200);
+    const row = findStoredSubscription(stub.store, payload.data.id);
+    assert.ok(row);
+    assert.equal(row.paddle_customer_id, "ctm_01nestedcustomervalue0000", "identifiant lu dans customer.id");
+    stub.restore();
+  }
+
+  // No customer id at all: retryable, explicit, and nothing written half-way.
+  {
+    const stub = createSupabaseStub({ users });
+    installQueryRouting(stub);
+    const payload = subscriptionEvent();
+    delete payload.data.customer_id;
+
+    const out = await deliver(payload);
+    assert.equal(out.status, 503, "jamais un 500 opaque, jamais un succès");
+    assert.equal(out.body.outcome, "retry");
+    assert.equal(out.body.reason, "missing_customer_id");
+    assert.equal(stub.store.writes.subscriptions, 0, "aucune écriture partielle");
+    stub.restore();
+  }
+
+  // Currency absent: the key is omitted so the column default applies on insert.
+  {
+    const stub = createSupabaseStub({ users });
+    installQueryRouting(stub);
+    const payload = subscriptionEvent();
+    delete payload.data.currency_code;
+
+    const out = await deliver(payload);
+    assert.equal(out.status, 200, "une devise absente ne fait plus échouer l'écriture");
+    const sent = stub.store.sentRows.at(-1);
+    assert.equal("currency_code" in sent, false, "clé omise, pas null");
+    assert.ok(findStoredSubscription(stub.store, payload.data.id));
+    stub.restore();
+  }
+
+  // On a renewal the stored value must survive an event that carries no currency.
+  {
+    const payload = subscriptionEvent();
+    const stub = createSupabaseStub({
+      users,
+      seedSubscriptions: [
+        {
+          user_id: USER_ID,
+          paddle_subscription_id: payload.data.id,
+          paddle_customer_id: payload.data.customer_id,
+          status: "active",
+          plan: "plus",
+          currency_code: "USD",
+        },
+      ],
+    });
+    installQueryRouting(stub);
+    const renewal = subscriptionEvent({
+      event_type: "subscription.updated",
+      data: { id: payload.data.id, status: "active" },
+    });
+    delete renewal.data.currency_code;
+
+    const out = await deliver(renewal);
+    assert.equal(out.status, 200);
+    const sent = stub.store.sentRows.at(-1);
+    assert.equal("currency_code" in sent, false, "la clé n'est pas renvoyée, donc pas écrasée");
+    const stored = findStoredSubscription(stub.store, payload.data.id);
+    assert.equal(stored?.currency_code, "USD", "la devise stockée est conservée");
+    stub.restore();
+  }
+
+  pass("colonnes NOT NULL : customer.id accepté, customer manquant → retry explicite, devise omise et conservée");
+}
+
 console.log(`\n${checks} vérifications du webhook passées.`);
