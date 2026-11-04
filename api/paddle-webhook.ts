@@ -325,20 +325,114 @@ async function recordEvent(
   return true;
 }
 
-async function readEventStatus(
+/** What a stored event row says, for the deduplication decision. */
+export type StoredEventRecord = {
+  status: WebhookEventRecord["status"];
+  /** Paddle's event type, kept so a replay cannot change the subject. */
+  event_type: string | null;
+};
+
+async function readEventRecord(
   supabase: SupabaseEnv,
   eventId: string,
-): Promise<WebhookEventRecord["status"] | null> {
+): Promise<StoredEventRecord | null> {
   const response = await supabaseRequest(
     supabase,
-    `/rest/v1/webhook_events?event_id=eq.${encodeURIComponent(eventId)}&select=status`,
+    `/rest/v1/webhook_events?event_id=eq.${encodeURIComponent(
+      eventId,
+    )}&select=status,event_type`,
   );
   if (!response.ok) {
     throw new InfraError(`webhook_events read failed (${response.status})`);
   }
-  const rows = (await response.json()) as Array<{ status?: string }>;
-  const status = rows[0]?.status;
-  return (status as WebhookEventRecord["status"]) ?? null;
+  const rows = (await response.json()) as Array<{ status?: string; event_type?: string }>;
+  const row = rows[0];
+  if (!row?.status) return null;
+  return {
+    status: row.status as WebhookEventRecord["status"],
+    event_type: typeof row.event_type === "string" ? row.event_type : null,
+  };
+}
+
+/**
+ * Decide what a second delivery of an already stored event may do.
+ *
+ * `processed` and `ignored` are **final**: replaying them would either re-apply
+ * a state that is already stored, or re-litigate a decision nobody asked to
+ * revisit. Only `rejected` is replayable, and only because a rejection writes
+ * nothing: the subscription table is untouched, so re-examining the event can
+ * neither duplicate a right nor move an owner.
+ *
+ * The event type is compared too. A replay is supposed to be the *same* event
+ * delivered again; one whose subject changed is not a replay, and treating it
+ * as one would let a stale identifier carry a different decision.
+ *
+ * Pure and exported so every branch is testable without a network.
+ */
+export type ReplayDecision =
+  | { kind: "continue" }
+  | { kind: "replay" }
+  | { kind: "duplicate"; reason: string | null };
+
+export function decideReplay(
+  stored: StoredEventRecord | null,
+  incomingEventType: string,
+): ReplayDecision {
+  if (!stored) {
+    // The insert conflicted but the row cannot be read: never guess.
+    return { kind: "duplicate", reason: "event_unreadable" };
+  }
+
+  if (stored.status === "received") {
+    // A previous attempt died mid-flight: finishing it is the original design.
+    return { kind: "continue" };
+  }
+
+  if (stored.status === "rejected") {
+    if (stored.event_type !== null && stored.event_type !== incomingEventType) {
+      return { kind: "duplicate", reason: "replay_event_type_mismatch" };
+    }
+    return { kind: "replay" };
+  }
+
+  // `processed` and `ignored`, and any unknown stored value: nothing to do.
+  return { kind: "duplicate", reason: null };
+}
+
+/**
+ * Take exclusive ownership of a rejected event, for one replay only.
+ *
+ * The transition is a compare-and-swap performed by PostgREST itself:
+ * `PATCH … ?status=eq.rejected` with `return=representation`. Postgres
+ * serialises the two writers, so of two simultaneous deliveries exactly one
+ * sees a row updated and the other sees an empty result — the second answers
+ * "duplicate" instead of processing the event twice. An in-memory flag could not
+ * do this: Vercel runs each request in its own instance.
+ *
+ * The event is moved to `received` first, which is the honest state while the
+ * replay runs: if the function dies half-way it stays visible as unfinished
+ * work, and the next delivery finishes it through the `continue` path.
+ */
+async function claimRejectedEvent(
+  supabase: SupabaseEnv,
+  eventId: string,
+): Promise<boolean> {
+  const response = await supabaseRequest(
+    supabase,
+    `/rest/v1/webhook_events?event_id=eq.${encodeURIComponent(
+      eventId,
+    )}&status=eq.rejected`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ status: "received", reason: null }),
+    },
+  );
+  if (!response.ok) {
+    throw new InfraError(`webhook_events replay claim failed (${response.status})`);
+  }
+  const rows = (await response.json()) as unknown;
+  return Array.isArray(rows) && rows.length === 1;
 }
 
 /**
@@ -419,6 +513,15 @@ export type StoredSubscription = {
   user_id: string;
   paddle_customer_id: string | null;
   source_updated_at: string | null;
+  /**
+   * The paid period already stored.
+   *
+   * Read so an event that carries no billing period cannot erase it: the period
+   * end is the only thing that grants access, so losing it would cut a paying
+   * customer off over a partially-shaped payload.
+   */
+  current_period_started_at: string | null;
+  current_period_ends_at: string | null;
 };
 
 async function findSubscriptionByPaddleId(
@@ -429,7 +532,7 @@ async function findSubscriptionByPaddleId(
     supabase,
     `/rest/v1/subscriptions?paddle_subscription_id=eq.${encodeURIComponent(
       paddleSubscriptionId,
-    )}&select=user_id,paddle_customer_id,source_updated_at`,
+    )}&select=user_id,paddle_customer_id,source_updated_at,current_period_started_at,current_period_ends_at`,
   );
   if (!response.ok) {
     throw new InfraError(`subscriptions read failed (${response.status})`);
@@ -780,6 +883,63 @@ function readPaddleCustomerId(data: Record<string, unknown>): string | null {
 /** Paddle only ever schedules `cancel`, `pause` or `resume`. */
 const SCHEDULED_CHANGE_ACTIONS = ["cancel", "pause", "resume"] as const;
 
+/**
+ * Decide which paid period to store.
+ *
+ * The period end is the only field that grants access (`toGrant` refuses a row
+ * without a future end), and the upsert replaces the whole row. Writing `null`
+ * there because one event carried no `current_billing_period` would therefore
+ * cut off a customer who has paid — the mirror image of the `currency_code` and
+ * `paddle_customer_id` bugs fixed earlier.
+ *
+ * Rules, in order:
+ * 1. a complete, self-consistent period from the event always wins;
+ * 2. otherwise the missing side is filled from what is already stored, so an
+ *    event may extend or correct a period but never erase it;
+ * 3. if the merged pair would be inconsistent (`ends_at <= starts_at`, which the
+ *    table's CHECK would refuse), the start is dropped and the end kept: a null
+ *    start is legal and grants access, while a null end grants nothing.
+ *
+ * The returned `source` exists for one reason: an operator needs to know from
+ * the response whether a period was taken from Paddle or inherited.
+ */
+export type ResolvedBillingPeriod = {
+  start: string | null;
+  end: string | null;
+  source: "event" | "stored" | "merged" | "absent";
+};
+
+export function resolveBillingPeriod(
+  period: Record<string, unknown> | null | undefined,
+  existing: StoredSubscription | null | undefined,
+): ResolvedBillingPeriod {
+  const incomingStart = readTimestamp(period?.starts_at);
+  const incomingEnd = readTimestamp(period?.ends_at);
+  const storedStart = readTimestamp(existing?.current_period_started_at);
+  const storedEnd = readTimestamp(existing?.current_period_ends_at);
+
+  const ordered = (start: string | null, end: string | null): boolean =>
+    start !== null && end !== null && Date.parse(end) > Date.parse(start);
+
+  // 1. A complete, coherent period straight from the event.
+  if (ordered(incomingStart, incomingEnd)) {
+    return { start: incomingStart, end: incomingEnd, source: "event" };
+  }
+
+  // 2. Fill only what the event omitted.
+  const start = incomingStart ?? storedStart;
+  const end = incomingEnd ?? storedEnd;
+
+  if (start === null && end === null) return { start: null, end: null, source: "absent" };
+  if (start !== null && end !== null && Date.parse(end) <= Date.parse(start)) {
+    // 3. Never trade a usable end for a coherent-looking pair.
+    return { start: null, end, source: "merged" };
+  }
+
+  const untouched = incomingStart === null && incomingEnd === null;
+  return { start, end, source: untouched ? "stored" : "merged" };
+}
+
 function readScheduledAction(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const action = value.trim().toLowerCase();
@@ -1027,6 +1187,8 @@ export async function handleSubscriptionEvent(
   const paddleCustomerId = readPaddleCustomerId(data) ?? existing?.paddle_customer_id ?? null;
   if (!paddleCustomerId) return { kind: "retry", reason: "missing_customer_id" };
 
+  const billingPeriod = resolveBillingPeriod(period, existing);
+
   const currencyCode = readCurrencyCode(data.currency_code);
 
   const row: SubscriptionRow = {
@@ -1039,8 +1201,10 @@ export async function handleSubscriptionEvent(
     paddle_customer_id: paddleCustomerId,
     billing_interval: mapping.interval,
     currency_code: currencyCode,
-    current_period_started_at: readTimestamp(period?.starts_at),
-    current_period_ends_at: readTimestamp(period?.ends_at),
+    // Never `readTimestamp(period?.ends_at)` alone: an event without a period
+    // would null the end date and silently revoke a paid customer's access.
+    current_period_started_at: billingPeriod.start,
+    current_period_ends_at: billingPeriod.end,
     scheduled_change_action: readScheduledAction(scheduledChange?.action),
     scheduled_change_effective_at: readTimestamp(scheduledChange?.effective_at),
     canceled_at: readTimestamp(data.canceled_at),
@@ -1311,13 +1475,56 @@ async function handleWebhook(request: ApiRequest, response: ApiResponse) {
       occurred_at: readTimestamp(event.occurred_at),
     });
 
+    let replayed = false;
     if (!created) {
-      // Already seen: do not touch `subscriptions` again.
-      const status = await readEventStatus(supabase, eventId);
-      if (status && status !== "received") {
-        return response.status(200).json({ received: true, duplicate: true, event_id: eventId });
+      const stored = await readEventRecord(supabase, eventId);
+      const decision = decideReplay(stored, eventType);
+
+      if (decision.kind === "duplicate") {
+        // Nothing is touched. The reason is returned only when it names a real
+        // anomaly (a changed event type), never for the ordinary duplicate.
+        if (decision.reason) {
+          console.warn(
+            JSON.stringify({
+              event: "paddle_webhook_replay_refused",
+              reason: decision.reason,
+              event_id: eventId,
+              event_type: eventType,
+              stored_event_type: stored?.event_type ?? null,
+              stored_status: stored?.status ?? null,
+            }),
+          );
+        }
+        return response.status(200).json({
+          received: true,
+          duplicate: true,
+          event_id: eventId,
+          ...(decision.reason ? { reason: decision.reason } : {}),
+        });
       }
-      // A previous attempt crashed mid-flight: fall through and finish it.
+
+      if (decision.kind === "replay") {
+        // A rejection left no right behind; the delivery is genuine (the
+        // signature was verified above), so the event may be examined again.
+        // Everything is re-checked from scratch: no verdict is reused.
+        if (!(await claimRejectedEvent(supabase, eventId))) {
+          return response.status(200).json({
+            received: true,
+            duplicate: true,
+            event_id: eventId,
+            reason: "replay_in_progress",
+          });
+        }
+        replayed = true;
+        console.info(
+          JSON.stringify({
+            event: "paddle_webhook_replay",
+            event_id: eventId,
+            event_type: eventType,
+          }),
+        );
+      }
+      // `continue`: a previous attempt crashed mid-flight — finish it.
     }
 
     const outcome = await handleSubscriptionEvent(
@@ -1371,7 +1578,7 @@ async function handleWebhook(request: ApiRequest, response: ApiResponse) {
     await finalizeEvent(supabase, eventId, "processed", reason);
     return response
       .status(200)
-      .json({ received: true, reason, event_id: eventId });
+      .json({ received: true, reason, event_id: eventId, ...(replayed ? { replayed: true } : {}) });
   } catch (error) {
     const reason = error instanceof InfraError ? error.message : "unexpected_error";
     // 5xx so Paddle retries; no internal detail is echoed to the caller.

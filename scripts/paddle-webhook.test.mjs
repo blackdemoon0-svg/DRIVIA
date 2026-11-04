@@ -10,13 +10,16 @@ import { EventEmitter } from "node:events";
 import assert from "node:assert";
 import handler, {
   computeSignature,
+  decideReplay,
   handleSubscriptionEvent,
   isUserIdShaped,
   parseSignatureHeader,
   readRawBody,
+  resolveBillingPeriod,
   resolvePlanFromPriceId,
   verifySignature,
 } from "../api/paddle-webhook.ts";
+import { toGrant } from "../src/lib/subscriptionAccess.ts";
 import { SANDBOX_PRICE_IDS } from "../src/lib/paddleCore";
 import {
   computeAttributionProof,
@@ -45,7 +48,7 @@ function createSupabaseStub({ users = {}, seedSubscriptions = [] } = {}) {
   const store = {
     events: new Map(),
     subscriptions: new Map(),
-    writes: { webhookEvents: 0, subscriptions: 0, finalize: 0 },
+    writes: { webhookEvents: 0, subscriptions: 0, finalize: 0, claims: 0 },
     users: { ...users },
     // Every request issued by the handler: "METHOD /path?query".
     requests: [],
@@ -98,9 +101,24 @@ function createSupabaseStub({ users = {}, seedSubscriptions = [] } = {}) {
         const patch = JSON.parse(init.body);
         const existing = store.events.get(id);
         if (!existing) return json({ message: "not found" }, 404);
-        store.writes.finalize += 1;
-        store.events.set(id, { ...existing, ...patch });
-        return json(null, 204);
+
+        // PostgREST fidelity: a filtered PATCH only touches rows the filter
+        // matches, and `return=representation` echoes what was written. This is
+        // what makes the replay claim a real compare-and-swap rather than an
+        // unconditional overwrite: the second of two writers gets [].
+        const prefer = new Headers(init.headers ?? {}).get("prefer") ?? "";
+        const wantsRows = prefer.includes("return=representation");
+        const statusFilter = target.searchParams.get("status");
+        if (statusFilter?.startsWith("eq.") && existing.status !== statusFilter.slice(3)) {
+          return wantsRows ? json([], 200) : json(null, 204);
+        }
+
+        if (statusFilter) store.writes.claims += 1;
+        else store.writes.finalize += 1;
+
+        const merged = { ...existing, ...patch };
+        store.events.set(id, merged);
+        return wantsRows ? json([merged], 200) : json(null, 204);
       }
       return json({ message: "method not allowed" }, 405);
     }
@@ -220,7 +238,11 @@ function installQueryRouting(stub) {
     if (method === "GET" && target.pathname === "/rest/v1/webhook_events") {
       const id = decodeURIComponent((target.searchParams.get("event_id") ?? "").slice(3));
       const row = stub.store.events.get(id);
-      return new Response(JSON.stringify(row ? [{ status: row.status }] : []), { status: 200 });
+      // The handler selects `status,event_type`: echo both, as PostgREST would.
+      return new Response(
+        JSON.stringify(row ? [{ status: row.status, event_type: row.event_type }] : []),
+        { status: 200 },
+      );
     }
     if (method === "GET" && target.pathname === "/rest/v1/subscriptions") {
       const idFilter = target.searchParams.get("paddle_subscription_id");
@@ -2242,6 +2264,444 @@ function existingRow(overrides = {}) {
   }
 
   pass("colonnes NOT NULL : customer.id accepté, customer manquant → retry explicite, devise omise et conservée");
+}
+
+
+// ---------------------------------------------------------------------------
+// P. La période payée ne s'efface jamais : elle porte le droit d'accès
+// ---------------------------------------------------------------------------
+// `current_period_ends_at` est le seul champ qui accorde un accès (`toGrant`
+// refuse une date absente ou passée). L'upsert remplace la ligne entière : un
+// événement sans `current_billing_period` écrasait donc la date par `null` et
+// coupait un client qui avait payé. Même famille de bug que `currency_code` et
+// `paddle_customer_id`, corrigés au round précédent.
+const PERIOD_SUB_ID = "sub_01testsubscription000000";
+const PERIOD_CUSTOMER_ID = "ctm_01testcustomer000000000";
+const PERIOD_START = "2026-11-01T00:00:00Z";
+const PERIOD_END = "2026-12-01T00:00:00Z";
+
+function periodRow(overrides = {}) {
+  return {
+    paddle_subscription_id: PERIOD_SUB_ID,
+    user_id: USER_ID,
+    plan: "plus",
+    status: "active",
+    paddle_price_id: SANDBOX_PRICE_IDS.plus.month,
+    paddle_customer_id: PERIOD_CUSTOMER_ID,
+    current_period_started_at: PERIOD_START,
+    current_period_ends_at: PERIOD_END,
+    source_updated_at: "2026-11-01T00:00:00Z",
+    ...overrides,
+  };
+}
+
+// The pure decision, before any I/O: four sources, each named.
+{
+  assert.deepEqual(
+    resolveBillingPeriod(
+      { starts_at: "2026-12-01T00:00:00Z", ends_at: "2027-01-01T00:00:00Z" },
+      periodRow(),
+    ),
+    { start: "2026-12-01T00:00:00Z", end: "2027-01-01T00:00:00Z", source: "event" },
+    "une période complète de l'événement est retenue telle quelle",
+  );
+  assert.deepEqual(
+    resolveBillingPeriod(null, periodRow()),
+    { start: PERIOD_START, end: PERIOD_END, source: "stored" },
+    "sans période dans l'événement, la période stockée est conservée",
+  );
+  assert.deepEqual(
+    resolveBillingPeriod({ ends_at: "2027-02-01T00:00:00Z" }, periodRow()),
+    { start: PERIOD_START, end: "2027-02-01T00:00:00Z", source: "merged" },
+    "une fin de période nouvelle est appliquée, le début vient du stockage",
+  );
+  assert.deepEqual(
+    resolveBillingPeriod({ starts_at: "2027-06-01T00:00:00Z", ends_at: "2027-01-01T00:00:00Z" }, periodRow()),
+    { start: null, end: "2027-01-01T00:00:00Z", source: "merged" },
+    "une paire incohérente garde la date de fin et abandonne le début (jamais l'inverse)",
+  );
+  assert.deepEqual(
+    resolveBillingPeriod({ starts_at: "2027-01-01T00:00:00Z" }, periodRow()),
+    { start: null, end: PERIOD_END, source: "merged" },
+    "un début postérieur à la fin stockée ne fabrique pas une période : la fin reste celle qui est connue",
+  );
+  assert.deepEqual(
+    resolveBillingPeriod({}, null),
+    { start: null, end: null, source: "absent" },
+    "ni événement ni stockage : rien à inventer",
+  );
+  assert.deepEqual(
+    resolveBillingPeriod({ starts_at: "pas une date", ends_at: "2027-01-01T00:00:00Z" }, periodRow()),
+    { start: PERIOD_START, end: "2027-01-01T00:00:00Z", source: "merged" },
+    "une date illisible est ignorée, jamais écrite",
+  );
+  pass("période : paire de l'événement prioritaire, stockage conservé, cohérence préservée");
+}
+
+{
+  // Le cas réel : un renouvellement dont le payload ne porte pas la période.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [periodRow()] });
+  installQueryRouting(stub);
+  const event = subscriptionEvent({ event_type: "subscription.updated", data: { status: "active" } });
+  delete event.data.current_billing_period;
+
+  const out = await deliver(event);
+  assert.equal(out.status, 200);
+  assert.equal(out.body.outcome, undefined, "l'événement est traité, pas rejeté");
+
+  const sent = stub.store.sentRows.at(-1);
+  assert.equal(sent.current_period_ends_at, PERIOD_END, "la date de fin stockée n'est pas effacée");
+  assert.equal(sent.current_period_started_at, PERIOD_START, "le début non plus");
+
+  const stored = findStoredSubscription(stub.store, PERIOD_SUB_ID);
+  assert.equal(toGrant(stored, USER_ID), "plus", "l'accès du client payant est conservé");
+  stub.restore();
+  pass("renouvellement sans current_billing_period : période conservée, accès intact");
+}
+
+{
+  // Une résiliation n'envoie pas toujours de période : elle ne doit pas non plus
+  // effacer la date jusqu'à laquelle le client a payé.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [periodRow()] });
+  installQueryRouting(stub);
+  const event = subscriptionEvent({ event_type: "subscription.canceled", data: { status: "canceled" } });
+  delete event.data.current_billing_period;
+
+  const out = await deliver(event);
+  assert.equal(out.status, 200);
+  const stored = findStoredSubscription(stub.store, PERIOD_SUB_ID);
+  assert.equal(stored.status, "canceled");
+  assert.equal(stored.current_period_ends_at, PERIOD_END, "l'accès court jusqu'à la fin payée");
+  assert.equal(toGrant(stored, USER_ID), "plus", "résiliation ≠ perte immédiate de l'accès");
+  stub.restore();
+  pass("résiliation sans période : statut mis à jour, fin de droit payée conservée");
+}
+
+{
+  // Une période réellement nouvelle est appliquée : la conservation n'est pas un
+  // refus de mise à jour.
+  const stub = createSupabaseStub({ users: {}, seedSubscriptions: [periodRow()] });
+  installQueryRouting(stub);
+  const out = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.updated",
+      data: {
+        status: "active",
+        current_billing_period: { starts_at: PERIOD_END, ends_at: "2027-01-01T00:00:00Z" },
+      },
+    }),
+  );
+  assert.equal(out.status, 200);
+  const stored = findStoredSubscription(stub.store, PERIOD_SUB_ID);
+  assert.equal(stored.current_period_started_at, PERIOD_END);
+  assert.equal(stored.current_period_ends_at, "2027-01-01T00:00:00Z");
+  stub.restore();
+  pass("période complète fournie : elle remplace bien la précédente");
+}
+
+{
+  // Un premier abonnement sans aucune période ne fabrique pas de droit : la
+  // ligne est écrite, mais `toGrant` refuse. C'est le comportement honnête, et
+  // il est vérifié ici pour qu'il ne devienne pas un accès implicite.
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+  const event = subscriptionEvent();
+  delete event.data.current_billing_period;
+  const out = await deliver(event);
+  assert.equal(out.status, 200);
+  const stored = findStoredSubscription(stub.store, PERIOD_SUB_ID);
+  assert.equal(stored.current_period_ends_at, null);
+  assert.equal(toGrant(stored, USER_ID), null, "aucune période ⇒ aucun droit, jamais l'inverse");
+  stub.restore();
+  pass("premier abonnement sans période : ligne écrite, aucun droit inventé");
+}
+
+// ---------------------------------------------------------------------------
+// Q. Rejeu d'un événement rejeté : une seule porte, et elle est signée
+// ---------------------------------------------------------------------------
+// Un rejet n'écrit rien dans `subscriptions` : l'événement peut donc être
+// réexaminé sans risque de doubler un droit. Tout le reste reste définitif.
+// La seule façon de déclencher un rejeu est une livraison authentique de Paddle
+// (signature du trousseau + fenêtre de 5 s) : il n'y a ni route publique, ni
+// secret supplémentaire, ni bouton dans l'interface.
+{
+  const REJECTED_ID = "evt_01replayrejected000000000";
+
+  const replayable = (stored, type) => decideReplay(stored, type);
+  assert.deepEqual(
+    replayable({ status: "rejected", event_type: "subscription.created" }, "subscription.created"),
+    { kind: "replay" },
+    "un rejet est rejouable",
+  );
+  for (const status of ["processed", "ignored"]) {
+    assert.deepEqual(
+      replayable({ status, event_type: "subscription.created" }, "subscription.created"),
+      { kind: "duplicate", reason: null },
+      `« ${status} » reste définitif : jamais rejoué`,
+    );
+  }
+  assert.deepEqual(
+    replayable({ status: "received", event_type: "subscription.created" }, "subscription.created"),
+    { kind: "continue" },
+    "une tentative interrompue est terminée, pas rejouée depuis zéro",
+  );
+  assert.deepEqual(
+    replayable({ status: "rejected", event_type: "subscription.created" }, "subscription.updated"),
+    { kind: "duplicate", reason: "replay_event_type_mismatch" },
+    "un rejeu ne peut pas changer le sujet de l'événement",
+  );
+  assert.deepEqual(
+    replayable(null, "subscription.created"),
+    { kind: "duplicate", reason: "event_unreadable" },
+    "une ligne illisible n'autorise aucun rejeu",
+  );
+  pass("rejeu : seuls les rejets sont rejouables, traités/ignorés définitifs, type vérifié");
+
+  // L'état réel de la base : la ligne a été écrite par un déploiement plus
+  // ancien, qui classait « preuve invalide » en `rejected`. Le code actuel la
+  // classe en `retry` (503), mais la ligne existe et c'est elle qu'il faut
+  // pouvoir réexaminer. Le rejeu doit écrire l'abonnement pour le bon compte.
+  {
+    const stub = createSupabaseStub({
+      users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+    });
+    installQueryRouting(stub);
+    stub.store.events.set(REJECTED_ID, {
+      event_id: REJECTED_ID,
+      event_type: "subscription.created",
+      status: "rejected",
+      reason: "invalid_attribution_proof",
+      occurred_at: "2026-11-01T00:00:00Z",
+    });
+
+    const event = subscriptionEvent({ event_id: REJECTED_ID });
+    const body = JSON.stringify(event);
+
+    const replayed = await deliver(event, { rawBody: body });
+    assert.equal(replayed.status, 200, "le rejeu est accepté, pas traité comme un doublon");
+    assert.equal(replayed.body.replayed, true);
+    assert.equal(stub.store.writes.subscriptions, 1, "le rejeu écrit enfin l'abonnement");
+    assert.equal(stub.store.writes.claims, 1, "un seul verrou de rejeu pris");
+    assert.equal(stub.store.events.get(REJECTED_ID).status, "processed");
+    assert.equal(stub.store.events.get(REJECTED_ID).reason, null);
+
+    const stored = findStoredSubscription(stub.store, PERIOD_SUB_ID);
+    assert.equal(stored.user_id, USER_ID, "l'abonnement revient au propriétaire de la preuve");
+    assert.equal(stored.plan, "plus");
+
+    // Une fois traité, l'événement est définitif.
+    const third = await deliver(event, { rawBody: body });
+    assert.equal(third.body.duplicate, true);
+    assert.equal(third.body.replayed, undefined);
+    assert.equal(stub.store.writes.subscriptions, 1, "aucune écriture supplémentaire");
+    stub.restore();
+  }
+  pass("rejeu d'un rejet réel : abonnement écrit pour le bon compte, puis définitif");
+
+  // L'incident tel qu'il se produit avec le code actuel : une preuve invalide
+  // n'est PAS un rejet définitif mais un `retry` (503). L'événement reste
+  // `received`, Paddle le redélivre, et l'ouverture de la fenêtre le termine —
+  // sans aucune écriture manuelle en base.
+  {
+    const oldSecret = crypto.randomBytes(32).toString("hex");
+    const stub = createSupabaseStub({
+      users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+    });
+    installQueryRouting(stub);
+    const event = subscriptionEvent({
+      event_id: "evt_01retrythenwindow00000000",
+      data: {
+        custom_data: { user_id: USER_ID, attribution_proof: computeAttributionProof(oldSecret, USER_ID) },
+      },
+    });
+    const body = JSON.stringify(event);
+
+    const first = await deliver(event, { rawBody: body });
+    assert.equal(first.status, 503, "preuve invalide : réessayable, jamais rejetée");
+    assert.equal(first.body.outcome, "retry");
+    assert.equal(stub.store.writes.subscriptions, 0);
+    assert.equal(stub.store.events.get("evt_01retrythenwindow00000000").status, "received");
+    assert.equal(stub.store.writes.claims, 0, "un retry n'est pas un rejeu");
+
+    const second = await deliver(event, {
+      rawBody: body,
+      env: {
+        PADDLE_WEBHOOK_SECRET_PREVIOUS: oldSecret,
+        PADDLE_WEBHOOK_SECRET_PREVIOUS_UNTIL: new Date(Date.now() + 3_600_000).toISOString(),
+      },
+    });
+    assert.equal(second.status, 200);
+    assert.equal(stub.store.writes.subscriptions, 1, "la redélivrance termine l'événement");
+    assert.equal(stub.store.writes.claims, 0, "chemin « tentative interrompue », pas « rejeu »");
+    assert.equal(stub.store.events.get("evt_01retrythenwindow00000000").status, "processed");
+    stub.restore();
+  }
+  pass("incident actuel : preuve invalide → 503 réessayable → fenêtre ouverte → traité, sans écriture manuelle");
+
+  // Le rejeu ne contourne rien : si la preuve reste invalide, il redevient un
+  // rejet. Le code ne « débloque » jamais un événement, il le réexamine.
+  {
+    const stub = createSupabaseStub({
+      users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+    });
+    installQueryRouting(stub);
+    // Un statut inconnu est un rejet franc (contrairement à une preuve invalide,
+    // qui est réessayable). Le rejeu le réexamine et le rejette de nouveau.
+    const event = subscriptionEvent({
+      event_id: "evt_01replaystillbad0000000000",
+      event_type: "subscription.updated",
+      data: { status: "expired" },
+    });
+    const body = JSON.stringify(event);
+
+    const first = await deliver(event, { rawBody: body });
+    assert.equal(first.status, 200);
+    assert.equal(first.body.outcome, "rejected");
+    assert.equal(first.body.reason, "unknown_status");
+
+    const again = await deliver(event, { rawBody: body });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.outcome, "rejected", "un rejeu qui échoue reste un rejet");
+    assert.equal(again.body.reason, "unknown_status");
+    assert.equal(stub.store.writes.claims, 1, "le rejeu a bien été tenté une fois");
+    assert.equal(stub.store.writes.subscriptions, 0, "aucun droit créé par un rejeu infructueux");
+    assert.equal(
+      stub.store.events.get("evt_01replaystillbad0000000000").status,
+      "rejected",
+      "l'état reste honnête : toujours rejeté",
+    );
+    stub.restore();
+  }
+  pass("rejeu infructueux : rejeté de nouveau, aucune écriture, aucun droit");
+
+  // Un événement ignoré ou déjà traité ne se rejoue jamais, même si Paddle le
+  // renvoie : c'était déjà vrai, c'est vérifié explicitement après ce changement.
+  {
+    const stub = createSupabaseStub({
+      users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+    });
+    installQueryRouting(stub);
+    const ignoredEvent = subscriptionEvent({
+      event_id: "evt_01replayignored0000000000",
+      event_type: "transaction.updated",
+      data: { status: "completed" },
+    });
+    const ignoredBody = JSON.stringify(ignoredEvent);
+    const firstIgnore = await deliver(ignoredEvent, { rawBody: ignoredBody });
+    assert.equal(firstIgnore.body.outcome, "ignored");
+    assert.equal(stub.store.events.get("evt_01replayignored0000000000").status, "ignored");
+
+    const ignoreAgain = await deliver(ignoredEvent, { rawBody: ignoredBody });
+    assert.equal(ignoreAgain.body.duplicate, true);
+    assert.equal(ignoreAgain.body.replayed, undefined);
+    assert.equal(stub.store.writes.claims, 0, "un événement ignoré n'est jamais verrouillé pour rejeu");
+    assert.equal(stub.store.events.get("evt_01replayignored0000000000").status, "ignored");
+
+    const processedEvent = subscriptionEvent({ event_id: "evt_01replayprocessed000000000" });
+    const processedBody = JSON.stringify(processedEvent);
+    await deliver(processedEvent, { rawBody: processedBody });
+    assert.equal(stub.store.writes.subscriptions, 1);
+    const processedAgain = await deliver(processedEvent, { rawBody: processedBody });
+    assert.equal(processedAgain.body.duplicate, true);
+    assert.equal(processedAgain.body.replayed, undefined);
+    assert.equal(stub.store.writes.subscriptions, 1, "un événement traité ne réécrit rien");
+    assert.equal(stub.store.writes.claims, 0);
+    stub.restore();
+  }
+  pass("jamais de rejeu automatique d'un événement ignoré ou déjà traité");
+
+  // Un rejeu ne peut pas changer le sujet : même identifiant, autre type.
+  {
+    const stub = createSupabaseStub({
+      users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+    });
+    installQueryRouting(stub);
+    stub.store.events.set("evt_01replaymismatch0000000000", {
+      event_id: "evt_01replaymismatch0000000000",
+      event_type: "subscription.created",
+      status: "rejected",
+      occurred_at: "2026-11-01T00:00:00Z",
+    });
+    const out = await deliver(
+      subscriptionEvent({ event_id: "evt_01replaymismatch0000000000", event_type: "subscription.updated" }),
+    );
+    assert.equal(out.status, 200);
+    assert.equal(out.body.duplicate, true);
+    assert.equal(out.body.reason, "replay_event_type_mismatch");
+    assert.equal(stub.store.writes.claims, 0);
+    assert.equal(stub.store.writes.subscriptions, 0);
+    assert.equal(stub.store.events.get("evt_01replaymismatch0000000000").status, "rejected");
+    stub.restore();
+  }
+  pass("rejeu avec un autre type d'événement : refusé, rien n'est touché");
+
+  // Deux livraisons simultanées : une seule prend le verrou, l'autre répond
+  // « doublon ». Le verrou est le PATCH conditionnel exécuté par PostgREST, pas
+  // un drapeau en mémoire — deux instances Vercel ne partagent rien.
+  {
+    const stub = createSupabaseStub({
+      users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+    });
+    installQueryRouting(stub);
+    stub.store.events.set("evt_01replayconcurrent00000000", {
+      event_id: "evt_01replayconcurrent00000000",
+      event_type: "subscription.created",
+      status: "rejected",
+      occurred_at: "2026-11-01T00:00:00Z",
+    });
+
+    // Une autre instance a déjà pris le verrou : le compare-and-swap ne renvoie
+    // aucune ligne, ce que le handler doit interpréter comme « en cours ».
+    const routed = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const target = new URL(String(url));
+      const method = (init.method ?? "GET").toUpperCase();
+      if (method === "PATCH" && target.pathname === "/rest/v1/webhook_events") {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return routed(url, init);
+    };
+
+    const out = await deliver(subscriptionEvent({ event_id: "evt_01replayconcurrent00000000" }));
+    globalThis.fetch = routed;
+
+    assert.equal(out.status, 200);
+    assert.equal(out.body.duplicate, true);
+    assert.equal(out.body.reason, "replay_in_progress");
+    assert.equal(stub.store.writes.subscriptions, 0, "aucune double écriture");
+    stub.restore();
+  }
+  pass("rejeu concurrent : un seul traite, l'autre répond « en cours », zéro double écriture");
+
+  // Sans signature fraîche, aucun rejeu : la porte est la signature, pas l'id.
+  {
+    const stub = createSupabaseStub({
+      users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+    });
+    installQueryRouting(stub);
+    stub.store.events.set("evt_01replayunsigned000000000", {
+      event_id: "evt_01replayunsigned000000000",
+      event_type: "subscription.created",
+      status: "rejected",
+      occurred_at: "2026-11-01T00:00:00Z",
+    });
+    const event = subscriptionEvent({ event_id: "evt_01replayunsigned000000000" });
+    const body = JSON.stringify(event);
+    const stale = sign(body, { ts: Math.floor(Date.now() / 1000) - 600 });
+
+    const out = await deliver(event, { rawBody: body, signature: stale });
+    assert.equal(out.status, 401, "une livraison périmée ne déclenche aucun rejeu");
+    assert.equal(stub.store.writes.claims, 0);
+    assert.equal(stub.store.writes.subscriptions, 0);
+    assert.equal(stub.store.events.get("evt_01replayunsigned000000000").status, "rejected");
+    stub.restore();
+  }
+  pass("rejeu refusé sans signature fraîche : un identifiant d'événement n'ouvre aucune porte");
 }
 
 console.log(`\n${checks} vérifications du webhook passées.`);
