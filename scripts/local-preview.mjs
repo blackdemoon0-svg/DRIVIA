@@ -13,6 +13,8 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import handler from "../api/chat.ts";
+import paddleConfigHandler from "../api/paddle-config.ts";
+import planChangeHandler from "../api/paddle-plan-change.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.resolve(__dirname, "..", "dist");
@@ -42,6 +44,12 @@ function adaptResponse(res) {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.end(JSON.stringify(body));
   };
+  // `setHeader` is inherited from ServerResponse and uses internal state bound to
+  // `this`; calling it on the wrapper would target the wrapper instead of the
+  // real response (headers silently dropped). Bind it explicitly so both
+  // /api/chat (SSE headers) and /api/paddle-config (Cache-Control) behave like
+  // the deployed functions.
+  adapted.setHeader = (name, value) => res.setHeader(name, value);
   return adapted;
 }
 
@@ -66,6 +74,24 @@ async function serveStatic(res, pathname) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
+
+  if (url.pathname === "/api/paddle-config") {
+    return paddleConfigHandler({ method: req.method }, adaptResponse(res));
+  }
+
+  if (url.pathname === "/api/paddle-plan-change") {
+    let body;
+    if (req.method === "POST") {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      } catch {
+        body = undefined;
+      }
+    }
+    return planChangeHandler({ method: req.method, headers: req.headers, body }, adaptResponse(res));
+  }
 
   if (url.pathname === "/api/chat") {
     let body;

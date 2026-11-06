@@ -9,9 +9,23 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "check:seo": "node scripts/check-seo-build.mjs",
-    "verify": "npm run typecheck && npm run build && npm run check:seo"
+    "verify": "npm run typecheck && npm run build && npm run check:seo && npm test",
+    "test:paddle": "tsx scripts/paddle-flow.test.mjs",
+    "test:attribution": "tsx scripts/paddle-attribution.test.mjs",
+    "test:webhook": "tsx scripts/paddle-webhook.test.mjs",
+    "test": "npm run test:paddle && npm run test:attribution && npm run test:webhook && npm run test:activation && npm run test:entitlement && npm run test:auth && npm run test:access && npm run test:quotas && npm run test:chat-access && npm run test:plan-change && npm run test:purchase-guard && npm run test:schema",
+    "test:entitlement": "tsx scripts/entitlement.test.mjs",
+    "test:schema": "tsx scripts/schema-alignment.test.mjs",
+    "test:auth": "tsx scripts/auth.test.mjs",
+    "test:access": "tsx scripts/access.test.mjs",
+    "test:chat-access": "tsx scripts/chat-access.test.mjs",
+    "test:quotas": "tsx scripts/quotas.test.mjs",
+    "test:purchase-guard": "tsx scripts/purchase-guard.test.mjs",
+    "test:plan-change": "tsx scripts/paddle-plan-change.test.mjs",
+    "test:activation": "tsx scripts/paddle-activation.test.mjs"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.118.0",
     "@vercel/analytics": "^2.0.1",
     "clsx": "2.1.1",
     "pdfjs-dist": "6.4.299",
@@ -26,6 +40,7 @@
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.1",
     "tailwindcss": "4.1.17",
+    "tsx": "^4.23.15",
     "typescript": "5.9.3",
     "vite": "7.3.2",
     "vite-plugin-singlefile": "2.3.0"

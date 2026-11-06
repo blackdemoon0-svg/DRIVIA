@@ -15,8 +15,11 @@ import {
   type VeyvroMessage,
 } from "./lib/veyvroApi";
 import { prepareQuoteDocument } from "./lib/quoteDocument";
+import { isSignedIn, useAuthSession } from "./lib/auth";
+import PricingView from "./components/PricingView";
+import AuthView, { AccountView } from "./components/AuthView";
 
-type View = "ai" | "battle";
+type View = "ai" | "battle" | "pricing" | "connexion" | "inscription" | "compte";
 
 const QUICK_PROMPTS = [
   { label: "Comparer deux voitures", prompt: "Compare la BMW M3 et la Mercedes-AMG C 63." },
@@ -713,6 +716,8 @@ export default function App() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const conversationEndRef = useRef<HTMLDivElement>(null);
   const isChatting = view === "ai" && messages.length > 0;
+  const auth = useAuthSession();
+  const signedIn = isSignedIn(auth);
 
   useEffect(() => {
     if (!aboutOpen) return undefined;
@@ -744,6 +749,27 @@ export default function App() {
     if (error instanceof VeyvroApiError) {
       const code = error.code;
 
+      // Access control, decided server-side. The wording invites the visitor to
+      // create a free account instead of presenting a technical failure.
+      if (error.status === 401 || code === "auth_required" || code === "invalid_token") {
+        return "Connectez-vous ou créez un compte gratuit pour utiliser VEYVRO. La formule Découverte est gratuite. / Sign in or create a free account to use VEYVRO. The Découverte plan is free.";
+      }
+      if (code === "plan_required") {
+        return "L'analyse de photos et de PDF fait partie des formules VEYVRO Plus et Pro. / Photo and PDF analysis is part of VEYVRO Plus and Pro.";
+      }
+      // Quotas, decided server-side from the plan in the database.
+      if (code === "daily_messages") {
+        return "Vous avez atteint votre quota de messages pour aujourd'hui. Il se réinitialise à minuit (UTC). Passez à VEYVRO Plus ou Pro pour un quota plus élevé. / You have reached today's message allowance. It resets at midnight UTC. Upgrade to VEYVRO Plus or Pro for a larger allowance.";
+      }
+      if (code === "daily_quotes") {
+        return "Vous avez utilisé votre analyse de devis du jour avec la formule Découverte. Elle revient demain à minuit (UTC), ou passez à VEYVRO Plus pour des analyses illimitées. / You have used today's single garage-quote analysis on the Découverte plan. It returns tomorrow at midnight UTC, or upgrade to VEYVRO Plus for unlimited analyses.";
+      }
+      if (code === "rate_minute" || error.status === 429) {
+        return "Trop de requêtes en peu de temps pour votre formule. Patientez un instant avant de réessayer. / Too many requests for your plan in a short time. Please wait a moment before trying again.";
+      }
+      if (code === "identity_unavailable" || code === "not_configured") {
+        return "Le service de compte VEYVRO est momentanément indisponible. Réessayez dans un instant. / VEYVRO's account service is temporarily unavailable. Please retry shortly.";
+      }
       if (error.status === 413) {
         return "La pièce jointe dépasse la limite d'envoi. Réduisez la taille de la photo ou le nombre de pages du PDF. / Attachment exceeds the size limit. Reduce the image size or PDF page count.";
       }
@@ -764,7 +790,8 @@ export default function App() {
       if (code === "insufficient_quota") {
         return "Quota API insuffisant ou facturation non activée sur le compte du fournisseur IA. / Insufficient API quota or inactive billing on the AI provider account.";
       }
-      if (code === "rate_limited" || error.status === 429) {
+      // The IP-level guard, distinct from the per-plan minute window handled above.
+      if (code === "rate_limited") {
         return "Trop de requêtes envoyées (limite de débit atteinte). Patientez quelques instants avant de réessayer. / Rate limit reached. Please wait a moment before trying again.";
       }
       if (error.status === 503 || code === "busy") {
@@ -817,10 +844,17 @@ export default function App() {
             return [...current, { role: "assistant", content: delta }];
           });
         },
-        options,
+        { ...options, accessToken: auth.session?.access_token ?? null },
       );
     } catch (error) {
       if (isQuoteAnalysis) setQuoteRetryAvailable(true);
+
+      // 401 means "no valid session": send the visitor to the sign-in view
+      // instead of leaving a dead conversation on screen.
+      if (error instanceof VeyvroApiError && error.status === 401) {
+        setView("connexion");
+      }
+
       setMessages((current) => {
         const lastMessage = current[current.length - 1];
         return lastMessage?.role === "assistant" && !lastMessage.content
@@ -895,8 +929,24 @@ export default function App() {
           >
             Battle
           </button>
+          <button
+            type="button"
+            className={view === "pricing" ? "nav-link active" : "nav-link"}
+            aria-current={view === "pricing" ? "page" : undefined}
+            onClick={() => setView("pricing")}
+          >
+            Tarifs
+          </button>
           <button type="button" className="nav-link" onClick={() => setAboutOpen(true)}>
             About
+          </button>
+          <button
+            type="button"
+            className={view === "compte" || view === "connexion" || view === "inscription" ? "nav-link active" : "nav-link"}
+            aria-current={view === "compte" || view === "connexion" || view === "inscription" ? "page" : undefined}
+            onClick={() => setView(signedIn ? "compte" : "connexion")}
+          >
+            {signedIn ? "Compte" : "Connexion"}
           </button>
         </nav>
 
@@ -905,8 +955,39 @@ export default function App() {
         </button>
       </header>
 
-      {view === "battle" ? (
+      {view === "connexion" || view === "inscription" ? (
+        <AuthView
+          mode={view}
+          onModeChange={(mode) => setView(mode)}
+          onSignedIn={() => setView("compte")}
+        />
+      ) : view === "compte" ? (
+        auth.status === "loading" ? (
+          <main className="pricing-stage auth-stage" aria-busy="true" aria-label="Chargement du compte">
+            <p className="pricing-subtitle">Vérification de votre session…</p>
+          </main>
+        ) : signedIn && auth.user ? (
+          <AccountView
+            user={auth.user}
+            onGoToPricing={() => setView("pricing")}
+            onSignedOut={() => setView("connexion")}
+          />
+        ) : (
+          <AuthView
+            mode="connexion"
+            onModeChange={(mode) => setView(mode)}
+            onSignedIn={() => setView("compte")}
+          />
+        )
+      ) : view === "battle" ? (
         <BattleMode />
+      ) : view === "pricing" ? (
+        <PricingView
+          onStartFree={openChat}
+          userId={auth.user?.id ?? null}
+          accessToken={auth.session?.access_token ?? null}
+          onRequireSignIn={() => setView("connexion")}
+        />
       ) : quoteDialogOpen ? (
         <QuoteUploadDialog
           onClose={() => setQuoteDialogOpen(false)}
