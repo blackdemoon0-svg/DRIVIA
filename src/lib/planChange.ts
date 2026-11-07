@@ -36,7 +36,7 @@ import {
   type PaidAccessPlan,
   type StoredSubscriptionRow,
   type SubscriptionStatus,
-} from "./subscriptionAccess";
+} from "./subscriptionAccess.js";
 
 /** Ordering of the paid plans. Higher is more capable. */
 const PLAN_RANK: Record<PaidAccessPlan, number> = { plus: 1, pro: 2 };

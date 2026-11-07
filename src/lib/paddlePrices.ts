@@ -44,7 +44,7 @@ import {
   type BillingInterval,
   type PaddleEnvironment,
   type PaidPlanId,
-} from "./paddleCore";
+} from "./paddleCore.js";
 
 type Env = Record<string, string | undefined>;
 

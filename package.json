@@ -13,7 +13,7 @@
     "test:paddle": "tsx scripts/paddle-flow.test.mjs",
     "test:attribution": "tsx scripts/paddle-attribution.test.mjs",
     "test:webhook": "tsx scripts/paddle-webhook.test.mjs",
-    "test": "npm run test:paddle && npm run test:attribution && npm run test:webhook && npm run test:activation && npm run test:entitlement && npm run test:auth && npm run test:access && npm run test:chat-access && npm run test:chat-quota && npm run test:plan-change && npm run test:purchase-guard && npm run test:schema && npm run test:usage-schema && npm run test:quota-store && npm run test:rate-limits && npm run test:rate-layers && npm run test:consumption-id && npm run test:migration-0004 && npm run test:api-harness && npm run test:net",
+    "test": "npm run test:paddle && npm run test:attribution && npm run test:webhook && npm run test:activation && npm run test:entitlement && npm run test:auth && npm run test:access && npm run test:chat-access && npm run test:chat-quota && npm run test:plan-change && npm run test:purchase-guard && npm run test:schema && npm run test:usage-schema && npm run test:quota-store && npm run test:rate-limits && npm run test:rate-layers && npm run test:consumption-id && npm run test:migration-0004 && npm run test:imports && npm run test:api-harness && npm run test:net",
     "test:entitlement": "tsx scripts/entitlement.test.mjs",
     "test:schema": "tsx scripts/schema-alignment.test.mjs",
     "test:auth": "tsx scripts/auth.test.mjs",
@@ -29,6 +29,7 @@
     "test:rate-layers": "tsx scripts/rate-limit-layers.test.mjs",
     "test:consumption-id": "tsx scripts/consumption-id.test.mjs",
     "test:migration-0004": "tsx scripts/migration-0004.test.mjs",
+    "test:imports": "tsx scripts/api-import-resolution.test.mjs",
     "test:api-harness": "tsx scripts/local-api-harness.test.mjs",
     "test:net": "tsx scripts/test-net.test.mjs"
   },
