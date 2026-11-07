@@ -48,9 +48,28 @@ type PricingViewProps = {
   userId: string | null;
   /** Supabase access token, used once to obtain the attribution proof. */
   accessToken: string | null;
+  /**
+   * Whether the signed-in account has a confirmed address.
+   *
+   * The webhook refuses to bind a subscription to an unconfirmed account, so a
+   * checkout opened from one takes the money and grants nothing until the
+   * address is confirmed and Paddle redelivers. The button is refused instead
+   * (see `decideCta`), and the server refuses the change of formula too.
+   */
+  emailConfirmed: boolean;
   /** Opens the sign-in view; a paid checkout requires an account. */
   onRequireSignIn: () => void;
 };
+
+/**
+ * When to re-read the account after the Paddle window closes.
+ *
+ * Four reads in total, then silence: a bounded confirmation, not a poll. The
+ * webhook usually lands within a second or two, but network and Paddle's own
+ * retries can take longer, and showing "nothing recorded" after a real payment
+ * is the one answer that must not be given too early.
+ */
+const CHECKOUT_CONFIRMATION_DELAYS_MS = [0, 2_000, 5_000, 15_000] as const;
 
 const INTERVAL_LABELS: Record<BillingInterval, string> = {
   month: "Mensuel",
@@ -99,7 +118,13 @@ function isPaidPlan(plan: PricingPlan): plan is PricingPlan & { id: PaidPlanId }
   return plan.id !== "decouverte";
 }
 
-export default function PricingView({ onStartFree, userId, accessToken, onRequireSignIn }: PricingViewProps) {
+export default function PricingView({
+  onStartFree,
+  userId,
+  accessToken,
+  emailConfirmed,
+  onRequireSignIn,
+}: PricingViewProps) {
   const [interval, setInterval] = useState<BillingInterval>("month");
   // What the database says about this account. `checking` until the read lands:
   // nothing is claimed and nothing may be bought before then.
@@ -172,6 +197,96 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
     setSnapshot(next);
     return next;
   }, [readPlan]);
+
+  /** Every delayed confirmation is abandoned the moment the view goes away. */
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  /**
+   * Background refresh: re-reads the database **without** flipping the snapshot
+   * to `checking`.
+   *
+   * The foreground read disables every button while it runs, which is right for
+   * a first load and wrong for a background check: a `focus` must not make the
+   * page look like it is reloading. One read at a time, too — a burst of focus
+   * events would otherwise open as many queries as events.
+   */
+  const reading = useRef(false);
+  const refreshQuietly = useCallback(async (): Promise<PlanSnapshot | null> => {
+    if (!userId || reading.current) return null;
+    reading.current = true;
+    try {
+      const next = await readPlan();
+      if (mounted.current) setSnapshot(next);
+      return next;
+    } finally {
+      reading.current = false;
+    }
+  }, [userId, readPlan]);
+
+  /** A newer confirmation supersedes the one in flight. */
+  const confirmationRun = useRef(0);
+
+  /**
+   * After the Paddle window closes, ask the database — several times.
+   *
+   * The webhook is asynchronous: it can land seconds after the window closes,
+   * and a single read would show "not registered yet" to a customer who has
+   * paid. Four reads at most (immediately, then 2 s, 5 s, 15 s), stopped at the
+   * first success and on unmount. Bounded on purpose: no polling loop, no
+   * request every second, and nothing left running in the background.
+   */
+  const confirmCheckout = useCallback(
+    async (plan: PaidPlanId) => {
+      const runId = ++confirmationRun.current;
+      for (const delay of CHECKOUT_CONFIRMATION_DELAYS_MS) {
+        if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+        if (!mounted.current || runId !== confirmationRun.current) return;
+        const next = await refreshQuietly();
+        if (next && next.kind === "subscribed" && next.plan === plan) {
+          if (mounted.current) setNotice(`${planLabel(plan)} est maintenant enregistré sur votre compte.`);
+          return;
+        }
+      }
+      if (mounted.current && runId === confirmationRun.current) {
+        setNotice(
+          "Fenêtre de paiement fermée : aucun abonnement n'est encore enregistré à votre nom. L'ouverture du paiement ne vaut pas confirmation — l'accès n'est accordé qu'après l'enregistrement de l'abonnement par Paddle, ce qui peut prendre quelques instants.",
+        );
+      }
+    },
+    [refreshQuietly],
+  );
+
+  /**
+   * Coming back to the tab re-checks the account.
+   *
+   * A payment finished in another window, a subscription cancelled from the
+   * Paddle portal, an expiry that passed while the page slept: all of these
+   * change the database while this view is still mounted. One read per focus,
+   * one per return to the tab, and never while another read is in flight.
+   */
+  useEffect(() => {
+    if (!userId) return;
+    const onFocus = () => {
+      void refreshQuietly();
+    };
+    const onVisibility = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "visible") {
+        void refreshQuietly();
+      }
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [userId, refreshQuietly]);
 
   useEffect(() => {
     let active = true;
@@ -357,7 +472,7 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
     // Belt to the button's braces: the guard is re-evaluated at click time, so a
     // stale render can never open a checkout the current state refuses.
     const catalogue = PRICING_PLANS.find((item) => item.id === plan);
-    const decision = decideCta(plan, catalogue?.cta ?? "Choisir", snapshot, guardActivity);
+    const decision = decideCta(plan, catalogue?.cta ?? "Choisir", snapshot, guardActivity, { emailConfirmed });
     if (decision.disabled) {
       if (decision.hint) setNotice(decision.hint);
       return;
@@ -390,17 +505,11 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
           ),
         onClosed: () => {
           // The window is gone; the payment may or may not have happened. Ask the
-          // database instead of assuming either way.
+          // database instead of assuming either way — and ask again a few times,
+          // because the webhook lands on its own schedule.
           checkoutLock.current = false;
           setActivity(IDLE_ACTIVITY);
-          void refreshPlan().then((next) => {
-            const recorded = next.kind === "subscribed" && next.plan === plan;
-            setNotice(
-              recorded
-                ? `${planLabel(plan)} est maintenant enregistré sur votre compte.`
-                : "Fenêtre de paiement fermée : aucun abonnement n'est encore enregistré à votre nom. L'ouverture du paiement ne vaut pas confirmation — l'accès n'est accordé qu'après l'enregistrement de l'abonnement par Paddle, ce qui peut prendre quelques instants.",
-            );
-          });
+          void confirmCheckout(plan);
         },
         onVerified: (verdict) => {
           setVerdicts((current) => [
@@ -438,7 +547,7 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
    */
   const handlePlanAction = (plan: PaidPlanId) => {
     const catalogue = PRICING_PLANS.find((item) => item.id === plan);
-    const decision = decideCta(plan, catalogue?.cta ?? "Choisir", snapshot, guardActivity);
+    const decision = decideCta(plan, catalogue?.cta ?? "Choisir", snapshot, guardActivity, { emailConfirmed });
 
     if (decision.disabled) {
       if (decision.hint) setNotice(decision.hint);
@@ -667,7 +776,9 @@ export default function PricingView({ onStartFree, userId, accessToken, onRequir
           const paid = isPaidPlan(plan);
           // One decision per card, taken from the guard: it owns whether the
           // button may be pressed, what it says, and why it is refused.
-          const decision = paid ? decideCta(plan.id, plan.cta, snapshot, guardActivity) : null;
+          const decision = paid
+            ? decideCta(plan.id, plan.cta, snapshot, guardActivity, { emailConfirmed })
+            : null;
           const isPending = guardActivity.kind === "creating" && guardActivity.plan === plan.id;
           // A change in flight on this plan says what it is doing, instead of the
           // generic "opening a payment" wording that belongs to a checkout.

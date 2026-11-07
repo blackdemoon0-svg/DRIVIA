@@ -67,13 +67,57 @@ const SUBSCRIPTION_STATUSES: readonly SubscriptionStatus[] = [
   "canceled",
 ];
 
-/** Events this endpoint acts on. Everything else is acknowledged and ignored. */
+/**
+ * Events this endpoint acts on. Everything else is acknowledged and ignored.
+ *
+ * The lifecycle rule, stated once because it decides who keeps access:
+ *
+ * - `created` / `updated` / `activated`-shaped events carry the subscription's
+ *   own status, which is stored as sent (`trialing`, `active`, `past_due`,
+ *   `paused`, `canceled`). `activated` is the one that says "this subscription
+ *   now exists and bills": it is handled like `created`, with the status the
+ *   payload carries, so a conversion of a trial is stored as `trialing` and not
+ *   promoted to `active` by guesswork.
+ * - `canceled`: the customer stops paying from now on, and **keeps access until
+ *   the end of the period already paid** (`canceled` is an entitled status; the
+ *   period end is the cut-off). That is what was sold, so it is what is granted.
+ * - `past_due`: payment failed; access continues to the period end while Paddle
+ *   retries, and a new purchase is refused meanwhile (arrears are settled with
+ *   Paddle, not by paying twice).
+ * - `paused`: billing is suspended, so the service is too — `paused` is not an
+ *   entitled status, access stops at once rather than at the period end.
+ *   `resumed` restores whatever status the payload carries (normally `active`),
+ *   and with it the access. The subscription stays recorded while paused, which
+ *   also keeps a second subscription for the same customer impossible.
+ */
 export const HANDLED_EVENT_TYPES = [
   "subscription.created",
+  // Paddle emits `activated` when a subscription actually starts: the first
+  // payment of a flow that only sends `created` as a draft, and a trial that
+  // converts. Left unhandled, it was acknowledged with 200
+  // `unhandled_event_type` — Paddle recorded a successful delivery while no
+  // subscription was written and no access was granted (money, no rights).
+  // The status stored is the one the payload carries, never a guess: a
+  // conversion sends `active`, a converted trial may send `trialing`, and the
+  // access rule (`toGrant`) decides from that status and the period end.
+  "subscription.activated",
   "subscription.updated",
   "subscription.canceled",
   "subscription.past_due",
+  "subscription.paused",
+  "subscription.resumed",
 ] as const;
+
+/**
+ * Money returned, or taken back by the bank.
+ *
+ * Paddle reports both as *adjustments* of the transaction, not as subscription
+ * events: they carry `action` (`refund`, `chargeback`, ...) and a `status` of
+ * their own (`pending_approval`, `approved`, `rejected`, `reversed`). Until this
+ * pair was handled, a refunded customer kept access until the period ended and
+ * the event was silently acknowledged.
+ */
+export const ADJUSTMENT_EVENT_TYPES = ["adjustment.created", "adjustment.updated"] as const;
 
 export type HandledEventType = (typeof HANDLED_EVENT_TYPES)[number];
 
@@ -511,6 +555,14 @@ async function fetchUser(supabase: SupabaseEnv, userId: string): Promise<Supabas
 
 export type StoredSubscription = {
   user_id: string;
+  /**
+   * Stored status, read only to recognise work that is already done.
+   *
+   * A refund applied twice must leave the row byte-identical: without this
+   * field the second event would rewrite `canceled_at` and `source_updated_at`
+   * with new values and break the idempotence the claim table promises.
+   */
+  status: string | null;
   paddle_customer_id: string | null;
   source_updated_at: string | null;
   /**
@@ -1170,7 +1222,9 @@ export async function handleSubscriptionEvent(
       ? "canceled"
       : event.event_type === "subscription.past_due"
         ? "past_due"
-        : null;
+        : event.event_type === "subscription.paused"
+          ? "paused"
+          : null;
   if (!status) return { kind: "rejected", reason: "unknown_status" };
 
   const period = asRecord(data.current_billing_period);
@@ -1228,6 +1282,172 @@ export async function handleSubscriptionEvent(
   // Unresolved: the payment is preserved, never discarded and never counted as
   // processed. The caller leaves the event for a human.
   return { kind: "conflict", reason: verdict.reason };
+}
+
+// ---------------------------------------------------------------------------
+// Refunds and chargebacks
+// ---------------------------------------------------------------------------
+
+/**
+ * Policy, stated here because it is a commercial decision, not a technical one.
+ *
+ * - An **approved** `refund` or `chargeback` ends the subscription **at once**:
+ *   the money has been returned or reversed. Access is revoked by writing
+ *   `status = canceled` and truncating the paid period end to the instant of
+ *   revocation — the two fields `toGrant` reads. Nothing is deleted: the row
+ *   keeps every Paddle identifier, so the payment can still be found;
+ * - a **partial** refund revokes as well: the amount is deliberately not used
+ *   to arbitrate, so the rule has no threshold to argue about;
+ * - `pending_approval`, `rejected` and `reversed` change nothing — the money has
+ *   not moved yet, or it came back. Access returns when Paddle sends a newer
+ *   subscription event carrying the paid period (the row's dates come from the
+ *   payload, never from a value this handler truncated);
+ * - `credit`, `chargeback_warning` and every other action are not money leaving
+ *   the business, and are ignored.
+ *
+ * Idempotence: the row is written with absolute values, never with a delta, so
+ * applying the same adjustment twice leaves the same state; and the event claims
+ * table already refuses a redelivery of the same `event_id`.
+ */
+export type AdjustmentDecision =
+  | { kind: "revoke"; action: "refund" | "chargeback"; subscriptionId: string }
+  | {
+      kind: "ignore";
+      reason: "invalid_data" | "unhandled_action" | "not_approved" | "no_subscription";
+      action: string | null;
+    };
+
+/** The two actions that mean money went back to the customer. */
+const REVOKING_ACTIONS = ["refund", "chargeback"] as const;
+
+/** Only an approved adjustment is money that actually moved. */
+const APPROVED_ADJUSTMENT_STATUS = "approved";
+
+/**
+ * Decide what an adjustment event means for access.
+ *
+ * Pure and exported: the whole refund/chargeback policy is therefore testable
+ * without HTTP, without Paddle and without a database.
+ */
+export function classifyAdjustment(data: Record<string, unknown>): AdjustmentDecision {
+  const action = typeof data.action === "string" ? data.action.trim().toLowerCase() : null;
+  const status = typeof data.status === "string" ? data.status.trim().toLowerCase() : null;
+
+  if (!action) return { kind: "ignore", reason: "invalid_data", action: null };
+  if (!(REVOKING_ACTIONS as readonly string[]).includes(action)) {
+    return { kind: "ignore", reason: "unhandled_action", action };
+  }
+  if (status !== APPROVED_ADJUSTMENT_STATUS) {
+    return { kind: "ignore", reason: "not_approved", action };
+  }
+
+  const subscriptionId =
+    typeof data.subscription_id === "string" ? data.subscription_id.trim() : "";
+  if (!subscriptionId) return { kind: "ignore", reason: "no_subscription", action };
+
+  return { kind: "revoke", action: action as "refund" | "chargeback", subscriptionId };
+}
+
+/**
+ * The instant access ends.
+ *
+ * Never moves a period end *forward*: refunding a subscription that already
+ * expired must not hand back a few milliseconds of access.
+ */
+function resolveRevocationInstant(existingEnd: string | null, nowIso: string): string {
+  if (existingEnd) {
+    const parsed = Date.parse(existingEnd);
+    if (Number.isFinite(parsed) && parsed <= Date.parse(nowIso)) return existingEnd;
+  }
+  return nowIso;
+}
+
+/**
+ * Revoke access on the stored row, in one write.
+ *
+ * `PATCH` and not the upsert: an adjustment must never be able to create a
+ * subscription row, nor to touch a plan, a price or a customer binding it does
+ * not own. Only the four access-relevant fields are named.
+ */
+async function revokeSubscriptionAccess(
+  supabase: SupabaseEnv,
+  paddleSubscriptionId: string,
+  patch: {
+    status: SubscriptionStatus;
+    current_period_ends_at: string;
+    canceled_at: string;
+    source_updated_at: string;
+  },
+): Promise<void> {
+  const response = await supabaseRequest(
+    supabase,
+    `/rest/v1/subscriptions?paddle_subscription_id=eq.${encodeURIComponent(paddleSubscriptionId)}`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify(patch),
+    },
+  );
+  if (!response.ok) {
+    throw new InfraError(`subscriptions revoke failed (${response.status})`);
+  }
+}
+
+/**
+ * Handle one refund or chargeback event.
+ *
+ * Shares the caller's claim table with subscription events, so a redelivery is
+ * refused before this function runs — the idempotence of the whole webhook is
+ * unchanged by the new event family.
+ */
+export async function handleAdjustmentEvent(
+  event: { event_id: string; event_type: string; occurred_at?: string; data: Record<string, unknown> },
+  options: { supabase: SupabaseEnv; now?: () => string },
+): Promise<HandleOutcome> {
+  const { supabase } = options;
+  const nowIso = options.now?.() ?? new Date().toISOString();
+
+  const decision = classifyAdjustment(event.data);
+  if (decision.kind === "ignore") return { kind: "ignored", reason: decision.reason };
+
+  const existing = await findSubscriptionByPaddleId(supabase, decision.subscriptionId);
+  if (!existing) {
+    // Nothing was ever recorded for this subscription: there is no right to
+    // revoke. Acknowledged so Paddle stops delivering, and named so the refund
+    // stays visible in the log instead of disappearing as a silent success.
+    return { kind: "ignored", reason: "unknown_subscription" };
+  }
+
+  const incomingAt = readTimestamp(event.occurred_at) ?? nowIso;
+  if (existing.source_updated_at) {
+    const stored = Date.parse(existing.source_updated_at);
+    if (Number.isFinite(stored) && stored > Date.parse(incomingAt)) {
+      // The subscription moved after this adjustment: a refund arriving behind
+      // a re-subscription must not cut the newer one. Paddle's own ordering.
+      return { kind: "ignored", reason: "stale_event" };
+    }
+  }
+
+  // Already done: a subscription revoked (or naturally expired) before this
+  // event needs nothing. Recognising it keeps the second event from rewriting
+  // `canceled_at` with a later timestamp — the row stays byte-identical, which
+  // is what "idempotent" has to mean for an audit.
+  const alreadyRevoked =
+    existing.status === "canceled" &&
+    existing.current_period_ends_at !== null &&
+    Date.parse(existing.current_period_ends_at) <= Date.parse(nowIso);
+  if (alreadyRevoked) {
+    return { kind: "processed", status: "canceled", reason: "already_revoked" };
+  }
+
+  await revokeSubscriptionAccess(supabase, decision.subscriptionId, {
+    status: "canceled",
+    current_period_ends_at: resolveRevocationInstant(existing.current_period_ends_at, nowIso),
+    canceled_at: nowIso,
+    source_updated_at: incomingAt,
+  });
+
+  return { kind: "processed", status: "canceled", reason: `access_revoked_${decision.action}` };
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,9 +1622,17 @@ async function handleWebhook(request: ApiRequest, response: ApiResponse) {
   if (!raw.ok) {
     // Never fall back to an unverified body. The reason is returned so a
     // delivery log answers "why" without needing server logs.
-    return response.status(500).json({
+    //
+    // 503, not 500: the bytes were unreadable for *this* invocation — a runtime
+    // or platform condition, not a fact about the event. Paddle retries on 5xx,
+    // so the same delivery can still be processed; the reason
+    // (`body_empty` / `body_unreadable`) says which shape failed. A 500 told a
+    // machine the same thing while looking like a crash to whoever reads the
+    // notification log.
+    return response.status(503).json({
       error: "Raw request body unavailable; the signature cannot be verified.",
       reason: raw.reason,
+      retry: true,
     });
   }
   const rawBody = raw.buffer;
@@ -1527,16 +1755,25 @@ async function handleWebhook(request: ApiRequest, response: ApiResponse) {
       // `continue`: a previous attempt crashed mid-flight — finish it.
     }
 
-    const outcome = await handleSubscriptionEvent(
-      { event_id: eventId, event_type: eventType, occurred_at: readTimestamp(event.occurred_at) ?? undefined, data: asRecord(event.data) ?? {} },
-      {
-        supabase,
-        // The previous key is offered to the attribution check too: a checkout
-        // opened before the rotation signed its proof with it, and refusing
-        // that proof would discard a payment that has already been taken.
-        attributionSecrets: ring.previous ? [ring.previous] : [],
-      },
-    );
+    const payloadEvent = {
+      event_id: eventId,
+      event_type: eventType,
+      occurred_at: readTimestamp(event.occurred_at) ?? undefined,
+      data: asRecord(event.data) ?? {},
+    };
+
+    // Two families, one claim table. An adjustment carries no subscription
+    // status of its own, so it is dispatched before the subscription handler
+    // rather than being forced through it.
+    const outcome = (ADJUSTMENT_EVENT_TYPES as readonly string[]).includes(eventType)
+      ? await handleAdjustmentEvent(payloadEvent, { supabase })
+      : await handleSubscriptionEvent(payloadEvent, {
+          supabase,
+          // The previous key is offered to the attribution check too: a checkout
+          // opened before the rotation signed its proof with it, and refusing
+          // that proof would discard a payment that has already been taken.
+          attributionSecrets: ring.previous ? [ring.previous] : [],
+        });
 
     if (outcome.kind === "retry") {
       // Left open on purpose: `received`, never `processed` and never

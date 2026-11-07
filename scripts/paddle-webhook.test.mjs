@@ -19,7 +19,8 @@ import handler, {
   resolvePlanFromPriceId,
   verifySignature,
 } from "../api/paddle-webhook.ts";
-import { toGrant } from "../src/lib/subscriptionAccess.ts";
+import { findBlockingSubscription, resolveAccessPlan, toGrant } from "../src/lib/subscriptionAccess.ts";
+import { limitsFor } from "../src/lib/planLimits.ts";
 import { SANDBOX_PRICE_IDS } from "../src/lib/paddleCore";
 import {
   computeAttributionProof,
@@ -48,7 +49,7 @@ function createSupabaseStub({ users = {}, seedSubscriptions = [] } = {}) {
   const store = {
     events: new Map(),
     subscriptions: new Map(),
-    writes: { webhookEvents: 0, subscriptions: 0, finalize: 0, claims: 0 },
+    writes: { webhookEvents: 0, subscriptions: 0, revocations: 0, finalize: 0, claims: 0 },
     users: { ...users },
     // Every request issued by the handler: "METHOD /path?query".
     requests: [],
@@ -206,6 +207,19 @@ function createSupabaseStub({ users = {}, seedSubscriptions = [] } = {}) {
         });
         return json(null, 201);
       }
+
+      if (method === "PATCH") {
+        // A filtered PATCH, exactly as PostgREST serves it: only the row the
+        // filter names is touched, and only the fields sent are replaced.
+        const idFilter = target.searchParams.get("paddle_subscription_id");
+        const patch = JSON.parse(init.body);
+        if (!idFilter?.startsWith("eq.")) return json([], 200);
+        const existing = findStoredSubscription(store, decodeURIComponent(idFilter.slice(3)));
+        if (!existing) return json([], 200);
+        store.writes.revocations += 1;
+        store.subscriptions.set(existing.id, { ...existing, ...patch, id: existing.id });
+        return json(null, 204);
+      }
       return json({ message: "method not allowed" }, 405);
     }
 
@@ -330,6 +344,34 @@ function subscriptionEvent(overrides = {}) {
       ...(overrides.data ?? {}),
     },
     ...Object.fromEntries(Object.entries(overrides).filter(([k]) => k !== "data")),
+  };
+}
+
+/** A Paddle adjustment: the shape refunds and chargebacks arrive in. */
+function adjustmentEvent({
+  action = "refund",
+  status = "approved",
+  subscription_id = "sub_01testsubscription000000",
+  event_type = "adjustment.created",
+  occurred_at = new Date().toISOString(),
+  id = `adj_${crypto.randomBytes(8).toString("hex")}`,
+  event_id = `evt_${crypto.randomBytes(10).toString("hex")}`,
+} = {}) {
+  return {
+    event_id,
+    event_type,
+    occurred_at,
+    data: {
+      id,
+      action,
+      status,
+      subscription_id,
+      customer_id: "ctm_01testcustomer000000000",
+      transaction_id: "txn_01testtransaction0000000",
+      currency_code: "USD",
+      created_at: occurred_at,
+      updated_at: occurred_at,
+    },
   };
 }
 
@@ -2703,5 +2745,494 @@ function periodRow(overrides = {}) {
   }
   pass("rejeu refusé sans signature fraîche : un identifiant d'événement n'ouvre aucune porte");
 }
+
+// ---------------------------------------------------------------------------
+// 10. La chaîne payante, prise à la jointure : la ligne écrite par le webhook
+//     est celle que le contrôle d'accès lit, avec les mêmes valeurs.
+// ---------------------------------------------------------------------------
+// Everywhere else, the webhook is tested against rows and the access layer
+// against rows: each half can be right while the pair disagrees. This block
+// takes what the handler actually wrote to `subscriptions` and feeds it, as-is,
+// to the rule the chat applies. It is the closest thing to "Paddle → webhook →
+// Supabase → droits" that can be done without a real project — and it is not
+// a substitute for one (see the S5 report, §"ce qui n'est pas vérifié").
+{
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+
+  const startsAt = new Date().toISOString();
+  const endsAt = new Date(Date.now() + 20 * 86_400_000).toISOString();
+
+  const created = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.created",
+      data: {
+        status: "active",
+        current_billing_period: { starts_at: startsAt, ends_at: endsAt },
+      },
+    }),
+  );
+  assert.equal(created.status, 200, "l'événement d'achat est accepté");
+
+  const stored = [...stub.store.subscriptions.values()];
+  assert.equal(stored.length, 1, "une seule ligne d'abonnement écrite");
+  const row = stored[0];
+
+  // Ce que le chat décidera, à partir de cette ligne et de rien d'autre.
+  assert.equal(row.plan, "plus", "la formule payée est celle enregistrée");
+  assert.equal(row.status, "active");
+  assert.equal(toGrant(row, USER_ID), "plus", "le contrôle d'accès accorde la formule achetée");
+  assert.equal(toGrant(row, OTHER_USER_ID), null, "et à personne d'autre");
+  assert.equal(resolveAccessPlan([row], USER_ID), "plus");
+  assert.equal(limitsFor(resolveAccessPlan([row], USER_ID)).messagesPerDay, 200, "les quotas suivent la formule accordée");
+
+  // Résiliation : le statut suit l'événement, et le droit payant tient jusqu'à
+  // la fin de la période déjà payée — c'est la promesse commerciale.
+  const canceled = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.canceled",
+      data: {
+        status: "canceled",
+        current_billing_period: { starts_at: startsAt, ends_at: endsAt },
+      },
+    }),
+  );
+  assert.equal(canceled.status, 200);
+  const afterCancel = [...stub.store.subscriptions.values()][0];
+  assert.equal(afterCancel.status, "canceled", "le statut de la ligne suit l'événement");
+  assert.equal(toGrant(afterCancel, USER_ID), "plus", "la période payée reste due après résiliation");
+
+  // La même ligne, une fois la période échue : plus aucun droit payant.
+  assert.equal(
+    toGrant({ ...afterCancel, current_period_ends_at: new Date(Date.now() - 1_000).toISOString() }, USER_ID),
+    null,
+    "période échue : plus de droit payant",
+  );
+  assert.equal(
+    resolveAccessPlan(
+      [{ ...afterCancel, current_period_ends_at: new Date(Date.now() - 1_000).toISOString() }],
+      USER_ID,
+    ),
+    "decouverte",
+    "période échue : retour à la formule gratuite",
+  );
+
+  stub.restore();
+  pass("chaîne payante : la ligne écrite par le webhook donne la formule achetée, tient jusqu'à la fin payée, puis s'éteint");
+}
+
+// ---------------------------------------------------------------------------
+// 11. Pause et reprise : la règle de cycle de vie, testée des deux côtés
+// ---------------------------------------------------------------------------
+// Policy under test: paused stops access at once (billing is suspended, so the
+// service is), resumed restores the status Paddle sends, and a paused row still
+// occupies the customer so a second subscription cannot be sold on top of it.
+{
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+
+  const startsAt = new Date(Date.now() - 5 * 86_400_000).toISOString();
+  const endsAt = new Date(Date.now() + 25 * 86_400_000).toISOString();
+
+  const created = await deliver(
+    subscriptionEvent({ data: { status: "active", current_billing_period: { starts_at: startsAt, ends_at: endsAt } } }),
+  );
+  assert.equal(created.status, 200);
+  assert.equal(toGrant([...stub.store.subscriptions.values()][0], USER_ID), "plus");
+
+  // --- pause ---------------------------------------------------------------
+  const paused = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.paused",
+      data: { status: "paused", current_billing_period: { starts_at: startsAt, ends_at: endsAt } },
+    }),
+  );
+  assert.equal(paused.status, 200, "l'événement de pause est traité, plus ignoré");
+  assert.notEqual(paused.body.outcome, "ignored", "la pause n'est plus un événement non géré");
+  const afterPause = [...stub.store.subscriptions.values()][0];
+  assert.equal(afterPause.status, "paused", "le statut stocké suit la pause");
+  assert.equal(toGrant(afterPause, USER_ID), null, "en pause : plus d'accès, immédiatement");
+  assert.equal(resolveAccessPlan([afterPause], USER_ID), "decouverte");
+  assert.equal(afterPause.current_period_ends_at, endsAt, "la période payée reste enregistrée, elle n'est pas effacée");
+  assert.equal(
+    findBlockingSubscription([afterPause], USER_ID)?.status,
+    "paused",
+    "une ligne en pause occupe le client : aucun second abonnement ne peut être vendu par-dessus",
+  );
+
+  // --- reprise -------------------------------------------------------------
+  const resumed = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.resumed",
+      data: { status: "active", current_billing_period: { starts_at: startsAt, ends_at: endsAt } },
+    }),
+  );
+  assert.equal(resumed.status, 200);
+  const afterResume = [...stub.store.subscriptions.values()][0];
+  assert.equal(afterResume.status, "active");
+  assert.equal(toGrant(afterResume, USER_ID), "plus", "la reprise rend l'accès, sans nouvelle période inventée");
+  assert.equal(afterResume.current_period_ends_at, endsAt);
+
+  // --- pause sans statut dans le corps ------------------------------------
+  const silent = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.paused",
+      data: { status: undefined, current_billing_period: { starts_at: startsAt, ends_at: endsAt } },
+    }),
+  );
+  assert.equal(silent.status, 200);
+  assert.equal([...stub.store.subscriptions.values()][0].status, "paused", "l'événement de pause porte son propre statut");
+
+  stub.restore();
+  pass("pause : accès coupé immédiatement, période conservée, client toujours occupé ; reprise : accès rendu");
+}
+
+// ---------------------------------------------------------------------------
+// 12. Remboursements et contestations : révocation, périmètre, idempotence
+// ---------------------------------------------------------------------------
+{
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+
+  const startsAt = new Date(Date.now() - 5 * 86_400_000).toISOString();
+  const endsAt = new Date(Date.now() + 25 * 86_400_000).toISOString();
+  await deliver(
+    subscriptionEvent({ data: { status: "active", current_billing_period: { starts_at: startsAt, ends_at: endsAt } } }),
+  );
+  assert.equal(toGrant([...stub.store.subscriptions.values()][0], USER_ID), "plus");
+
+  // --- remboursement approuvé ---------------------------------------------
+  const before = Date.now();
+  const refunded = await deliver(adjustmentEvent({ action: "refund", status: "approved" }));
+  assert.equal(refunded.status, 200);
+  // The processed path answers `reason` without an `outcome` field (the event
+  // reached the end of the pipeline); the revoked state is asserted below.
+  assert.equal(refunded.body.reason, "access_revoked_refund");
+  const afterRefund = [...stub.store.subscriptions.values()][0];
+  assert.equal(afterRefund.status, "canceled", "un remboursement met fin à l'abonnement");
+  const revokedEnd = Date.parse(afterRefund.current_period_ends_at);
+  assert.ok(revokedEnd >= before - 1000 && revokedEnd <= Date.now() + 1000, "la période payée est ramenée à l'instant de la révocation");
+  assert.equal(toGrant(afterRefund, USER_ID), null, "plus aucun droit après un remboursement");
+  assert.equal(resolveAccessPlan([afterRefund], USER_ID), "decouverte");
+  assert.equal(afterRefund.plan, "plus", "la ligne garde sa formule : rien n'est effacé, seulement le droit");
+  assert.equal(afterRefund.paddle_customer_id, "ctm_01testcustomer000000000", "les identifiants Paddle restent, pour retrouver le paiement");
+  assert.equal(
+    findBlockingSubscription([afterRefund], USER_ID),
+    null,
+    "après révocation, le client n'est plus occupé : il peut reprendre un abonnement",
+  );
+
+  // --- idempotence : le même événement rejoué -----------------------------
+  const writesBefore = stub.store.writes.revocations;
+  const replay = await deliver(adjustmentEvent({ action: "refund", status: "approved", event_id: refunded.body.event_id }));
+  assert.equal(replay.status, 200);
+  assert.equal(replay.body.duplicate, true, "le rejeu est reconnu comme doublon");
+  assert.equal(stub.store.writes.revocations, writesBefore, "aucune seconde révocation");
+  assert.deepEqual([...stub.store.subscriptions.values()][0], afterRefund, "l'état est inchangé");
+
+  // --- idempotence : deux événements distincts, même adjustment -----------
+  const writesAfterReplay = stub.store.writes.revocations;
+  const again = await deliver(adjustmentEvent({ action: "refund", status: "approved", event_type: "adjustment.updated" }));
+  assert.equal(again.body.reason, "already_revoked", "le second événement constate que le travail est fait");
+  assert.equal(stub.store.writes.revocations, writesAfterReplay, "et n'écrit pas une seconde fois");
+  assert.deepEqual(
+    [...stub.store.subscriptions.values()][0],
+    afterRefund,
+    "un second événement pour le même remboursement laisse l'état strictement identique",
+  );
+
+  stub.restore();
+  pass("remboursement : droits révoqués à l'instant, ligne conservée, rejeu et double événement sans effet supplémentaire");
+}
+
+{
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+
+  const startsAt = new Date(Date.now() - 5 * 86_400_000).toISOString();
+  const endsAt = new Date(Date.now() + 25 * 86_400_000).toISOString();
+  await deliver(
+    subscriptionEvent({ data: { status: "active", current_billing_period: { starts_at: startsAt, ends_at: endsAt } } }),
+  );
+
+  // --- contestation bancaire approuvée ------------------------------------
+  const chargedBack = await deliver(adjustmentEvent({ action: "chargeback", status: "approved" }));
+  assert.equal(chargedBack.body.reason, "access_revoked_chargeback");
+  assert.equal(toGrant([...stub.store.subscriptions.values()][0], USER_ID), null, "une contestation révoque comme un remboursement");
+
+  stub.restore();
+  pass("contestation bancaire : même révocation, motif distinct dans la réponse");
+}
+
+{
+  // Ce qui ne révoque pas — chaque refus a son motif, aucune écriture.
+  const cases = [
+    { label: "remboursement en attente d'approbation", event: { action: "refund", status: "pending_approval" }, reason: "not_approved" },
+    { label: "remboursement refusé", event: { action: "refund", status: "rejected" }, reason: "not_approved" },
+    { label: "contestation annulée (client débouté)", event: { action: "chargeback", status: "reversed" }, reason: "not_approved" },
+    { label: "avoir commercial (crédit)", event: { action: "credit", status: "approved" }, reason: "unhandled_action" },
+    { label: "avertissement de contestation", event: { action: "chargeback_warning", status: "approved" }, reason: "unhandled_action" },
+    { label: "ajustement sans abonnement", event: { action: "refund", status: "approved", subscription_id: null }, reason: "no_subscription" },
+    { label: "ajustement sans action", event: { action: null, status: "approved" }, reason: "invalid_data" },
+  ];
+
+  for (const testCase of cases) {
+    const stub = createSupabaseStub({
+      users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+    });
+    installQueryRouting(stub);
+    const startsAt = new Date(Date.now() - 5 * 86_400_000).toISOString();
+    const endsAt = new Date(Date.now() + 25 * 86_400_000).toISOString();
+    await deliver(
+      subscriptionEvent({ data: { status: "active", current_billing_period: { starts_at: startsAt, ends_at: endsAt } } }),
+    );
+    const before = [...stub.store.subscriptions.values()][0];
+
+    const out = await deliver(adjustmentEvent(testCase.event));
+    assert.equal(out.status, 200, testCase.label);
+    assert.equal(out.body.outcome, "ignored", testCase.label);
+    assert.equal(out.body.reason, testCase.reason, testCase.label);
+    assert.equal(stub.store.writes.revocations, 0, `${testCase.label} : aucune écriture`);
+    assert.deepEqual([...stub.store.subscriptions.values()][0], before, `${testCase.label} : état intact`);
+    assert.equal(toGrant([...stub.store.subscriptions.values()][0], USER_ID), "plus", `${testCase.label} : l'accès reste`);
+    stub.restore();
+  }
+
+  pass(`remboursements sans effet : ${cases.length} cas refusés avec leur motif, zéro écriture`);
+}
+
+{
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+
+  // Un remboursement pour un abonnement que nous n'avons jamais enregistré :
+  // rien à révoquer, rien à créer non plus.
+  const orphan = await deliver(adjustmentEvent({ action: "refund", status: "approved", subscription_id: "sub_01neverstored00000000000" }));
+  assert.equal(orphan.status, 200);
+  assert.equal(orphan.body.outcome, "ignored");
+  assert.equal(orphan.body.reason, "unknown_subscription");
+  assert.equal(stub.store.subscriptions.size, 0, "aucune ligne inventée");
+  assert.equal(stub.store.writes.revocations, 0);
+
+  // Un remboursement plus ancien que l'abonnement en cours ne le coupe pas.
+  const startsAt = new Date(Date.now() - 2 * 86_400_000).toISOString();
+  const endsAt = new Date(Date.now() + 28 * 86_400_000).toISOString();
+  await deliver(
+    subscriptionEvent({
+      occurred_at: new Date(Date.now() - 60_000).toISOString(),
+      data: { status: "active", current_billing_period: { starts_at: startsAt, ends_at: endsAt } },
+    }),
+  );
+  const stale = await deliver(
+    adjustmentEvent({ action: "refund", status: "approved", occurred_at: new Date(Date.now() - 3_600_000).toISOString() }),
+  );
+  assert.equal(stale.body.outcome, "ignored");
+  assert.equal(stale.body.reason, "stale_event");
+  assert.equal(stub.store.writes.revocations, 0);
+  assert.equal(toGrant([...stub.store.subscriptions.values()][0], USER_ID), "plus", "un remboursement périmé ne coupe pas un abonnement plus récent");
+
+  stub.restore();
+  pass("remboursement orphelin ou périmé : ignoré, nommé, sans écriture ni révocation");
+}
+
+{
+  // Un remboursement ne RALLONGE jamais un droit déjà éteint.
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+
+  const startedAt = "2026-01-01T00:00:00Z";
+  const alreadyEnded = "2026-02-01T00:00:00Z";
+  await deliver(
+    subscriptionEvent({
+      occurred_at: "2026-01-05T00:00:00Z",
+      data: {
+        status: "active",
+        current_billing_period: { starts_at: startedAt, ends_at: alreadyEnded },
+      },
+    }),
+  );
+  const out = await deliver(adjustmentEvent({ action: "refund", status: "approved", occurred_at: "2026-03-01T00:00:00Z" }));
+  assert.equal(out.body.reason, "access_revoked_refund");
+  assert.equal(
+    [...stub.store.subscriptions.values()][0].current_period_ends_at,
+    alreadyEnded,
+    "la fin de période déjà révolue est conservée telle quelle, jamais repoussée à l'instant du remboursement",
+  );
+  assert.equal(toGrant([...stub.store.subscriptions.values()][0], USER_ID), null);
+
+  stub.restore();
+  pass("remboursement tardif : la période reste éteinte, aucune seconde de droit rendue par accident");
+}
+
+// ---------------------------------------------------------------------------
+// 13. `subscription.activated` : l'événement qui ouvre réellement les droits
+// ---------------------------------------------------------------------------
+// Paddle Sandbox a réellement émis `subscription.activated` et l'endpoint
+// répondait 200 `ignored / unhandled_event_type` : une livraison comptée comme
+// réussie, aucun abonnement écrit, aucun droit accordé. Ces blocs vérifient deux
+// choses distinctes — l'événement est désormais traité, ET le statut enregistré
+// est celui du payload (une conversion d'essai ne doit pas être promue `active`
+// par supposition), parce que c'est ce statut que la règle d'accès lira.
+{
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+
+  const startsAt = new Date().toISOString();
+  const endsAt = new Date(Date.now() + 25 * 86_400_000).toISOString();
+
+  const event = subscriptionEvent({
+    event_type: "subscription.activated",
+    data: { status: "active", current_billing_period: { starts_at: startsAt, ends_at: endsAt } },
+  });
+  const out = await deliver(event);
+
+  assert.equal(out.status, 200, `activated doit être accepté, reçu ${out.status} ${JSON.stringify(out.body)}`);
+  assert.equal(out.body.received, true);
+  assert.notEqual(
+    out.body.reason,
+    "unhandled_event_type",
+    "activated n'est plus acquitté sans être traité (le défaut qui laissait un paiement sans droits)",
+  );
+
+  const row = findStoredSubscription(stub.store, event.data.id);
+  assert.ok(row, "l'abonnement doit être enregistré");
+  assert.equal(row.plan, "plus", "la formule suit le prix du payload");
+  assert.equal(row.status, "active", "le statut enregistré est exactement celui du payload");
+  assert.equal(toGrant(row, USER_ID), "plus", "les droits payants sont accordés dès l'activation");
+  assert.equal(resolveAccessPlan([row], USER_ID), "plus", "le contrôle d'accès rend la formule achetée");
+  assert.equal(limitsFor(resolveAccessPlan([row], USER_ID)).messagesPerDay, 200, "les quotas suivent la formule accordée");
+  assert.equal(toGrant(row, OTHER_USER_ID), null, "et à aucun autre compte");
+
+  const logged = stub.store.events.get(event.event_id);
+  assert.ok(logged, "une ligne webhook_events doit être écrite");
+  assert.equal(logged.status, "processed", "l'événement est finalisé en `processed`, plus en `ignored`");
+
+  stub.restore();
+  pass("activated (status `active`) : traité, abonnement enregistré, droits et quotas accordés");
+}
+
+{
+  // Le statut réel, pas une promotion : un essai converti reste `trialing`.
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+
+  const startsAt = new Date().toISOString();
+  const endsAt = new Date(Date.now() + 10 * 86_400_000).toISOString();
+
+  const event = subscriptionEvent({
+    event_type: "subscription.activated",
+    data: { status: "trialing", current_billing_period: { starts_at: startsAt, ends_at: endsAt } },
+  });
+  const out = await deliver(event);
+
+  assert.equal(out.status, 200);
+  const row = findStoredSubscription(stub.store, event.data.id);
+  assert.ok(row);
+  assert.equal(row.status, "trialing", "un statut `trialing` est enregistré tel quel, jamais promu `active`");
+  assert.equal(toGrant(row, USER_ID), "plus", "un essai en cours, dans sa période, ouvre bien les droits");
+
+  stub.restore();
+  pass("activated (status `trialing`) : le statut réel du payload est conservé, les droits suivent ce statut");
+}
+
+{
+  // Ni fallback inventé ni écriture : un `activated` sans statut exploitable est
+  // refusé. Deviner `active` ici accorderait des droits sur une supposition.
+  const stub = createSupabaseStub({
+    users: { [USER_ID]: { id: USER_ID, email: USER_EMAIL, email_confirmed_at: "2026-10-01T00:00:00Z" } },
+  });
+  installQueryRouting(stub);
+
+  const out = await deliver(
+    subscriptionEvent({
+      event_type: "subscription.activated",
+      data: { status: "unknown_state" },
+    }),
+  );
+
+  assert.equal(out.body.outcome, "rejected", "un statut inconnu est refusé, pas deviné");
+  assert.equal(out.body.reason, "unknown_status");
+  assert.equal(stub.store.subscriptions.size, 0, "aucune ligne d'abonnement écrite sur un statut inconnu");
+
+  stub.restore();
+  pass("activated sans statut exploitable : refus explicite, aucune écriture, aucun statut inventé");
+}
+
+// ---------------------------------------------------------------------------
+// 14. Corps illisible : 503 + motif, pour que Paddle réessaie
+// ---------------------------------------------------------------------------
+// C'était le seul 500 que ce code produisait, et il ne disait rien d'exploitable
+// dans le journal de notification. 503 = même famille (Paddle réessaie) avec un
+// motif nommé : `body_empty` (aucun octet reçu) ou `body_unreadable` (octets
+// reçus, mais non récupérables).
+{
+  const saved = { ...process.env };
+  Object.assign(process.env, {
+    PADDLE_WEBHOOK_SECRET: TEST_SECRET,
+    SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY: SERVICE_ROLE,
+  });
+
+  const { res, out } = makeResponse();
+  await handler(
+    { method: "POST", headers: { "paddle-signature": `ts=${Math.floor(Date.now() / 1000)};h1=${"ab".repeat(32)}` } },
+    res,
+  );
+  process.env = saved;
+
+  assert.equal(out.status, 503, `corps absent : 503 attendu (Paddle réessaie), reçu ${out.status}`);
+  assert.notEqual(out.status, 500, "plus de 500 opaque sur ce chemin");
+  assert.equal(out.body.reason, "body_empty", "le motif nomme précisément la cause");
+  assert.equal(out.body.retry, true, "la réponse dit explicitement qu'une nouvelle livraison est attendue");
+  assert.equal(out.body.received, undefined, "rien n'est accepté sans corps vérifiable");
+  pass("corps absent : 503 `body_empty` + `retry: true`, jamais 500 et jamais une acceptation");
+}
+
+{
+  const saved = { ...process.env };
+  Object.assign(process.env, {
+    PADDLE_WEBHOOK_SECRET: TEST_SECRET,
+    SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY: SERVICE_ROLE,
+  });
+
+  // Un corps présent mais non ré-sérialisable : les octets signés sont perdus.
+  const circular = { event_id: "evt_circular" };
+  circular.self = circular;
+
+  const { res, out } = makeResponse();
+  await handler(
+    {
+      method: "POST",
+      headers: { "paddle-signature": `ts=${Math.floor(Date.now() / 1000)};h1=${"ab".repeat(32)}` },
+      body: circular,
+    },
+    res,
+  );
+  process.env = saved;
+
+  assert.equal(out.status, 503, `corps illisible : 503 attendu, reçu ${out.status}`);
+  assert.equal(out.body.reason, "body_unreadable");
+  assert.equal(out.body.retry, true);
+  assert.equal(out.body.received, undefined, "rien n'est accepté sans octets vérifiables");
+  pass("corps illisible : 503 `body_unreadable` + `retry: true`, jamais une acceptation non vérifiée");
+}
+
 
 console.log(`\n${checks} vérifications du webhook passées.`);

@@ -8,12 +8,24 @@
  * from promising something the server refuses.
  *
  * The figures mirror the public catalogue in `src/lib/paddleCore.ts`:
- * - Découverte: "Analyse d'un devis" (one), no photo or PDF capability;
- * - Plus: "Devis et factures de garage illimités" and "Analyse de photos et de PDF";
- * - Pro: everything in Plus, with a larger allowance.
+ * - Découverte: one garage-quote analysis a day, with its document;
+ * - Plus: unlimited garage-quote analyses, documents included;
+ * - Pro: everything in Plus, with a larger message allowance.
  *
- * `scripts/plan-limits.test.mjs` asserts the two sides against each other, so a
- * change on either side fails the build instead of shipping a contradiction.
+ * There is deliberately **no** "general photo/PDF" flag here. The chat route
+ * refuses an attachment outside a garage-quote analysis for every plan, so a
+ * boolean saying otherwise would describe a capability nothing exercises — the
+ * exact defect P9/S5 found in the catalogue (the pricing page promised "Analyse
+ * de photos et de PDF" that the API answered with a 400). The promise was
+ * withdrawn rather than faked; opening the general path is a feature, not a
+ * configuration switch (see `docs` in the S6 report: route + entry point in the
+ * composer + browser validation).
+ *
+ * `scripts/access.test.mjs` asserts the two sides against each other — the
+ * figures below, the prices in `paddleCore.ts` and the sentences the pricing page
+ * renders — so a change on either side fails the build instead of shipping a
+ * contradiction. (This header used to name a file that did not exist: the check
+ * lives in the access suite, where the rest of the plan rules are.)
  */
 
 export type PlanId = "decouverte" | "plus" | "pro";
@@ -23,14 +35,6 @@ export type PlanLimits = {
   messagesPerDay: number | null;
   /** Garage-quote analyses per UTC day. `null` means unlimited. */
   quoteAnalysesPerDay: number | null;
-  /**
-   * Whether photos and PDFs may be attached *outside* a garage-quote analysis.
-   *
-   * A garage-quote analysis is a separate right: Découverte may attach the
-   * document it is entitled to analyse once a day, but gets no general
-   * photo/PDF capability.
-   */
-  attachments: boolean;
   /**
    * Whether a garage-quote analysis — document attached — is available at all.
    * True on every plan: it is a catalogue promise on Découverte too.
@@ -48,23 +52,18 @@ export const PLAN_LIMITS: Record<PlanId, PlanLimits> = {
   decouverte: {
     messagesPerDay: 15,
     quoteAnalysesPerDay: 1,
-    // No general photo/PDF capability, but the daily garage-quote analysis
-    // (which needs its document) is part of the offer.
-    attachments: false,
     quoteAnalysis: true,
     requestsPerMinute: 10,
   },
   plus: {
     messagesPerDay: 200,
     quoteAnalysesPerDay: null,
-    attachments: true,
     quoteAnalysis: true,
     requestsPerMinute: 20,
   },
   pro: {
     messagesPerDay: 600,
     quoteAnalysesPerDay: null,
-    attachments: true,
     quoteAnalysis: true,
     requestsPerMinute: 30,
   },
@@ -101,8 +100,10 @@ export function describeLimits(plan: PlanId): string {
     );
   }
 
-  if (limits.attachments) parts.push("photos et PDF acceptés");
-  else if (limits.quoteAnalysis) parts.push("document joint uniquement pour l'analyse de devis");
+  // Deliberately precise: the document is accepted *for the quote analysis*,
+  // never as a general photo/PDF capability (the route refuses that for every
+  // plan). The sentence therefore cannot out-promise the handler.
+  if (limits.quoteAnalysis) parts.push("document joint accepté pour l'analyse de devis");
   else parts.push("sans pièce jointe");
 
   return `${parts.join(", ")}.`;

@@ -38,6 +38,7 @@ import {
   resolvePaddleConfig,
   validatePaddleConfig,
 } from "../src/lib/paddleCore.ts";
+import { fetchAttributionProof } from "../src/lib/paddleCheckout.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(root, path), "utf8");
@@ -315,8 +316,15 @@ assert.doesNotMatch(sources, /sk-[A-Za-z0-9_-]{20,}/);
 pass("aucune clé Paddle secrète dans le code front (token client et price IDs uniquement)");
 
 // 16. The component really renders: names, USD, both buttons, config warning.
+//
+// `emailConfirmed: true` is passed explicitly: since P10/S6 the guard refuses a
+// payment from an unconfirmed account, and a render without the prop would
+// therefore exercise that refusal instead of the ordinary page. The unconfirmed
+// case is rendered on purpose in block 24 below.
 const { default: PricingView } = await import("../src/components/PricingView.tsx");
-const markup = renderToStaticMarkup(createElement(PricingView, { onStartFree: () => {} }));
+const markup = renderToStaticMarkup(
+  createElement(PricingView, { onStartFree: () => {}, emailConfirmed: true }),
+);
 assert.match(markup, /VEYVRO Plus/);
 assert.match(markup, /VEYVRO Pro/);
 // Default interval is monthly, so the annual amounts are asserted through
@@ -337,6 +345,45 @@ assert.match(markup, new RegExp(REAL_IDS.plus.month));
 assert.match(markup, new RegExp(REAL_IDS.pro.month));
 assert.match(markup, /Sandbox/);
 pass("rendu réel : Plus/Pro, prix USD, 2 boutons, price IDs Sandbox réels affichés, seul le token manque");
+
+// 24. B1 at render level: an unconfirmed account sees no openable payment.
+//
+// The pure rule is tested in `purchase-guard.test.mjs`; this asserts that the
+// rule actually reaches the markup — a guard that nobody renders is a guard
+// that does not exist. Both paid buttons must be disabled, the reason must be
+// in the DOM (so the page is auditable and testable), and the screen must say
+// what to do rather than leaving the customer with a dead button.
+{
+  const unconfirmed = renderToStaticMarkup(
+    createElement(PricingView, { onStartFree: () => {}, emailConfirmed: false }),
+  );
+
+  const paidButtons = unconfirmed.match(/<button[^>]*class="pricing-cta"[^>]*>/g) ?? [];
+  assert.equal(paidButtons.length, PAID_PLAN_IDS.length, "les deux boutons payants sont rendus");
+  for (const button of paidButtons) {
+    assert.match(button, /disabled/, "un compte non confirmé ne peut pas ouvrir de paiement");
+    assert.match(button, /data-cta-reason="unconfirmed"/, "le motif est exposé dans le DOM");
+  }
+  assert.match(
+    unconfirmed,
+    /Confirmez votre adresse e-mail avant de payer/,
+    "le message dit quoi faire, en français",
+  );
+  assert.match(unconfirmed, /Aucun abonnement ne peut être rattaché à un compte non confirmé/);
+
+  // The free plan keeps working: the refusal is about money, not about access.
+  const freeButton = (unconfirmed.match(/<button[^>]*class="pricing-cta secondary"[^>]*>/) ?? [])[0];
+  assert.ok(freeButton, "le bouton gratuit reste rendu");
+  assert.doesNotMatch(freeButton, /disabled/, "Découverte reste accessible sans adresse confirmée");
+
+  // And the confirmed render is the control: nothing disabled for the same page.
+  const confirmedButtons = markup.match(/<button[^>]*class="pricing-cta"[^>]*>/g) ?? [];
+  for (const button of confirmedButtons) {
+    assert.doesNotMatch(button, /data-cta-reason="unconfirmed"/, "un compte confirmé n'est pas bloqué par l'adresse");
+  }
+
+  pass("B1 rendu : compte non confirmé → deux boutons payants désactivés et motif « unconfirmed », Découverte intacte");
+}
 
 // 20. The server route accepts the variable name actually saved in Vercel.
 assert.equal(readClientToken({ PADDLE_CLIENT_TOKEN: "test_server_token" }), "test_server_token");
@@ -663,6 +710,50 @@ const checkoutMod = await import("../src/lib/paddleCheckout.ts");
   assert.ok(caught, "un identifiant trop long doit être refusé");
   assert.equal(calls.open, 0);
   pass("identifiant utilisateur trop long : refusé, aucun checkout ouvert");
+}
+
+// 10. B1 — un compte non confirmé ne peut pas obtenir de preuve d'attribution
+// ---------------------------------------------------------------------------
+// The guard disables the button, but a disabled attribute is a courtesy. The
+// real barrier is here: the server refuses to certify an unconfirmed account,
+// and the client turns that refusal into an instruction in French rather than
+// an English dead end.
+{
+  const original = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, init = {}) => {
+    requests.push({ url: String(url), method: init.method });
+    return new Response(JSON.stringify({ error: "Email address must be confirmed before subscribing." }), {
+      status: 403,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  let raised = null;
+  try {
+    await fetchAttributionProof("jeton-de-test");
+  } catch (error) {
+    raised = error;
+  } finally {
+    globalThis.fetch = original;
+  }
+
+  assert.ok(raised, "une preuve refusée doit interrompre le checkout");
+  assert.match(raised.message, /Confirmez votre adresse e-mail/, "le refus 403 est expliqué en français");
+  assert.match(raised.message, /lien reçu par e-mail/, "et dit quoi faire");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/api/paddle-attribution", "le refus vient du serveur, pas d'un contrôle local");
+  assert.equal(requests[0].method, "POST");
+
+  // Le checkout attend la preuve : aucune ouverture de fenêtre avant elle.
+  const source = read("src/lib/paddleCheckout.ts");
+  const body = source.slice(source.indexOf("export async function openPaddleCheckout"));
+  const proofIndex = body.indexOf("await fetchAttributionProof");
+  const openIndex = body.indexOf("Checkout.open");
+  assert.ok(proofIndex > 0, "openPaddleCheckout demande la preuve au serveur");
+  assert.ok(openIndex > proofIndex, "et ne l'ouvre qu'après l'avoir obtenue");
+
+  pass("B1 : le serveur refuse de certifier un compte non confirmé, le message est explicite et le checkout n'ouvre pas");
 }
 
 console.log(`\n${checks} vérifications du parcours d'abonnement passées.`);

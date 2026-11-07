@@ -31,6 +31,21 @@
  * subscription. Offering a purchase there takes the customer's money and then
  * leaves the webhook with an unresolvable conflict. The pricing page must
  * therefore reason on `BLOCKING_STATUSES`, not on `ENTITLED_STATUSES`.
+ *
+ * The lifecycle rule these lists encode, decided in P10/S6 and implemented by
+ * the webhook:
+ *
+ * - `canceled` keeps access until `current_period_ends_at`: the period was paid
+ *   for, so it is served. The subscription stops renewing, not serving;
+ * - `past_due` keeps access until the same date while Paddle retries the card,
+ *   and refuses a new purchase meanwhile (arrears are settled with Paddle);
+ * - `paused` stops access at once, because billing is suspended: nothing is
+ *   being paid, so nothing is served. The customer is not abandoned — the row
+ *   keeps its period, `subscription.resumed` restores the status Paddle sends,
+ *   and the same row is why a second subscription cannot be sold on top;
+ * - an approved refund or chargeback ends the subscription immediately: the
+ *   webhook writes `canceled` and moves the period end to the revocation
+ *   instant, so `toGrant` refuses it from that second on.
  */
 
 /** Plan identifiers, matching the public catalogue in `src/lib/paddleCore.ts`. */

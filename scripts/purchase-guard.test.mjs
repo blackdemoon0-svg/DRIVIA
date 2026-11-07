@@ -56,8 +56,12 @@ const subscribed = (plan, status) => ({ kind: "subscribed", plan, status });
 
 const PLAN_LABEL = Object.fromEntries(PRICING_PLANS.map((plan) => [plan.id, plan.cta]));
 
-function decide(plan, snapshot, activity = IDLE) {
-  return decideCta(plan, PLAN_LABEL[plan] ?? "Choisir", snapshot, activity);
+/** A confirmed account: the ordinary case, used by every pre-existing case. */
+const CONFIRMED = { emailConfirmed: true };
+const UNCONFIRMED = { emailConfirmed: false };
+
+function decide(plan, snapshot, activity = IDLE, account = CONFIRMED) {
+  return decideCta(plan, PLAN_LABEL[plan] ?? "Choisir", snapshot, activity, account);
 }
 
 // ---------------------------------------------------------------------------
@@ -335,8 +339,8 @@ function decide(plan, snapshot, activity = IDLE) {
   // must see both.
   assert.match(
     source,
-    /decideCta\(plan\.id, plan\.cta, snapshot, guardActivity\)/,
-    "chaque bouton payant passe par la garde",
+    /decideCta\(\s*plan\.id,\s*plan\.cta,\s*snapshot,\s*guardActivity,\s*\{ emailConfirmed \},?\s*\)/,
+    "chaque bouton payant passe par la garde, confirmation d'adresse comprise",
   );
   assert.match(
     source,
@@ -345,7 +349,11 @@ function decide(plan, snapshot, activity = IDLE) {
   );
   assert.match(source, /disabled=\{decision\.disabled\}/, "la décision doit atteindre l'attribut disabled");
   assert.match(source, /if \(checkoutLock\.current\) return;/, "verrou synchrone avant toute création de checkout");
-  assert.match(source, /decideCta\(plan, catalogue\?\.cta/, "la garde est réévaluée au moment du clic");
+  assert.match(
+    source,
+    /decideCta\(plan, catalogue\?\.cta[^)]*\{ emailConfirmed \}\)/,
+    "la garde est réévaluée au moment du clic",
+  );
   assert.ok(
     !/setSnapshot\(\{\s*kind:\s*"subscribed"/.test(source),
     "l'interface ne doit jamais se déclarer elle-même une formule",
@@ -359,12 +367,172 @@ function decide(plan, snapshot, activity = IDLE) {
   const closed = source.slice(source.indexOf("onClosed:"), source.indexOf("onVerified:"));
 
   assert.match(closed, /checkoutLock\.current = false;/, "la fermeture libère le verrou");
-  assert.match(closed, /refreshPlan\(\)/, "la fermeture relit la base au lieu de supposer un paiement");
-  assert.match(closed, /aucun abonnement n'est encore enregistré/, "la fermeture ne prétend pas que le paiement a abouti");
+  assert.match(closed, /confirmCheckout\(plan\)/, "la fermeture relit la base au lieu de supposer un paiement");
+  assert.match(
+    source,
+    /aucun abonnement n'est encore enregistré/,
+    "la fermeture ne prétend pas que le paiement a abouti",
+  );
 
   const opened = source.slice(source.indexOf("onOpened:"), source.indexOf("onClosed:"));
   assert.match(opened, /ne change pas/, "l'ouverture annonce explicitement qu'aucune formule ne change");
   pass("ouverture ≠ confirmation : la fermeture relit la base, l'ouverture ne promet rien");
+}
+
+// ---------------------------------------------------------------------------
+// 9. Actualisation des droits : reprise bornée, focus, aucune boucle
+// ---------------------------------------------------------------------------
+// Two failure modes are guarded here, and they pull in opposite directions:
+// reading once too early (a paying customer sees "nothing recorded"), and
+// polling forever (a request every second, for every visitor, on a page whose
+// data only changes when Paddle says so).
+{
+  const source = readFileSync(new URL("../src/components/PricingView.tsx", import.meta.url), "utf8");
+
+  // 1. The schedule is a fixed list of delays, not a loop condition.
+  const schedule = source.match(/CHECKOUT_CONFIRMATION_DELAYS_MS = \[([^\]]+)\]/);
+  assert.ok(schedule, "une liste de délais explicite doit exister");
+  const delays = schedule[1].split(",").map((value) => value.trim()).filter(Boolean);
+  assert.equal(delays.length, 4, "quatre lectures au plus, pas une boucle");
+  assert.equal(delays[0], "0", "la première lecture est immédiate");
+  const numeric = delays.map((value) => Number(value.replace(/_/g, "")));
+  assert.ok(numeric.every((value) => Number.isFinite(value)), "les délais sont des nombres");
+  assert.deepEqual(numeric, [...numeric].sort((a, b) => a - b), "les délais sont croissants");
+  assert.ok(Math.max(...numeric) <= 15_000, "la dernière tentative reste dans les 15 s");
+  assert.ok(
+    numeric.reduce((total, value) => total + value, 0) <= 22_000,
+    "l'attente totale reste bornée (aucun sondage long)",
+  );
+
+  // 2. No interval-based polling of the account. The view does own a one-second
+  //    clock (the quote countdown), so the guard is precise: no interval may run
+  //    a read of the subscription.
+  assert.ok(
+    !/setInterval\s*\(\s*\(\)\s*=>\s*(refresh|readPlan|refreshQuietly|confirmCheckout)/.test(source),
+    "aucun `setInterval` ne relit les droits : pas de sondage en boucle",
+  );
+  assert.ok(
+    !/refreshQuietly\(\)[^;]{0,80}\};\s*,\s*\d{3,}/.test(source),
+    "aucune relecture répétée par minuterie",
+  );
+  const confirmBody = source.slice(source.indexOf("const confirmCheckout"), source.indexOf("/**\n   * Coming back to the tab"));
+  assert.match(confirmBody, /runId !== confirmationRun\.current/, "une confirmation plus récente remplace la précédente");
+  assert.match(confirmBody, /if \(!mounted\.current/, "tout s'arrête au démontage");
+  assert.match(confirmBody, /return;/, "la boucle sort dès que l'abonnement est enregistré");
+
+  // 3. Coming back to the tab re-reads the account, without the `checking` flash.
+  for (const event of ["focus", "visibilitychange"]) {
+    assert.ok(source.includes(`"${event}"`), `l'événement ${event} doit être écouté`);
+  }
+  assert.match(
+    source,
+    /window\.addEventListener\("focus", onFocus\)/,
+    "le retour sur la page relit les droits",
+  );
+  assert.match(
+    source,
+    /document\.addEventListener\("visibilitychange", onVisibility\)/,
+    "le retour sur l'onglet relit les droits",
+  );
+  assert.match(source, /removeEventListener\("focus", onFocus\)/, "l'écouteur est retiré au démontage");
+  assert.match(source, /removeEventListener\("visibilitychange", onVisibility\)/, "idem pour l'onglet");
+  const quiet = source.slice(source.indexOf("const refreshQuietly"), source.indexOf("const confirmationRun"));
+  assert.ok(
+    !/setSnapshot\(\{\s*kind:\s*"checking"/.test(quiet),
+    "la relecture de fond ne repasse pas l'écran en « vérification »",
+  );
+  assert.match(quiet, /if \(!userId \|\| reading\.current\) return null;/, "une seule lecture à la fois");
+
+  pass("actualisation : reprise bornée après le checkout, relecture au retour sur la page, aucune boucle ni sondage");
+}
+
+// ---------------------------------------------------------------------------
+// 8. Adresse non confirmée : aucun paiement, sur aucune formule
+// ---------------------------------------------------------------------------
+// The webhook refuses to bind a subscription to an unconfirmed account, so a
+// checkout opened from one is money taken for nothing. The rule is checked for
+// every plan, every snapshot and every activity: the refusal must come first,
+// not after the plan logic.
+{
+  const unconfirmed = decide("plus", FREE, IDLE, UNCONFIRMED);
+  assert.equal(unconfirmed.disabled, true, "un compte non confirmé ne peut pas payer");
+  assert.equal(unconfirmed.reason, "unconfirmed");
+  assert.match(unconfirmed.hint, /[Cc]onfirmez votre adresse e-mail/);
+  assert.equal(isBlocked("unconfirmed"), true);
+
+  // Every entrance to a paid action is closed, including the upgrade path,
+  // which would otherwise call the plan-change endpoint (403 on its side too).
+  for (const plan of ["plus", "pro"]) {
+    for (const snapshot of [FREE, CHECKING, UNKNOWN, subscribed("plus", "active"), subscribed("plus", "past_due"), subscribed("plus", "paused")]) {
+      for (const activity of [IDLE, { kind: "creating", plan }, { kind: "open", plan }]) {
+        const decision = decide(plan, snapshot, activity, UNCONFIRMED);
+        assert.equal(decision.disabled, true, `${plan} / ${JSON.stringify(snapshot)} : un compte non confirmé ne paie pas`);
+        assert.equal(decision.reason, "unconfirmed", "le refus vient de l'adresse, pas de la formule");
+        assert.notEqual(decision.reason, "upgrade", "aucun changement de formule ne part d'un compte non confirmé");
+      }
+    }
+  }
+
+  // A confirmed account is unaffected: the very same call is allowed.
+  assert.equal(decide("plus", FREE, IDLE, CONFIRMED).reason, "checkout");
+  assert.equal(decide("pro", subscribed("plus", "active"), IDLE, CONFIRMED).reason, "upgrade");
+
+  // And the screen really is fed by the session, not by a default.
+  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(
+    app,
+    /emailConfirmed=\{Boolean\(auth\.user\?\.email_confirmed_at\)\}/,
+    "PricingView reçoit la confirmation lue dans la session Supabase",
+  );
+  const view = readFileSync(new URL("../src/components/PricingView.tsx", import.meta.url), "utf8");
+  assert.match(view, /emailConfirmed: boolean;/, "la prop est typée");
+  assert.match(view, /\{ emailConfirmed \}\)/, "le contexte de compte atteint la garde");
+
+  pass("adresse non confirmée : aucun paiement, aucune élévation de formule, et le refus précède toute logique de plan");
+}
+
+// ---------------------------------------------------------------------------
+// 10. Pause : le message dit où agir, sans promettre un bouton inexistant
+// ---------------------------------------------------------------------------
+// P11/S7, R4 option B: VEYVRO has no Paddle portal, so "reprenez-le depuis
+// Paddle" sent the customer to a screen that does not exist. Both paused hints
+// now name the two places that do. Guarded so the vague wording cannot come
+// back: a customer in pause must always be told where to click.
+{
+  const currentPaused = decide("plus", subscribed("plus", "paused"));
+  const upgradePaused = decide("pro", subscribed("plus", "paused"));
+
+  for (const [label, decision] of [
+    ["formule en pause (bouton « Formule actuelle »)", currentPaused],
+    ["montée vers Pro depuis une pause", upgradePaused],
+  ]) {
+    assert.equal(decision.disabled, true, `${label} : bouton désactivé`);
+    assert.ok(decision.hint, `${label} : un message accompagne le refus`);
+    assert.match(
+      decision.hint,
+      /lien de gestion reçu par e-mail/,
+      `${label} : le message désigne le lien reçu par e-mail`,
+    );
+    assert.match(
+      decision.hint,
+      /tableau de bord Paddle/,
+      `${label} : et le tableau de bord Paddle`,
+    );
+    assert.doesNotMatch(
+      decision.hint,
+      /reprenez-le depuis Paddle\./,
+      `${label} : plus de renvoi vague vers « Paddle » sans destination`,
+    );
+  }
+
+  // The in-app wording no longer claims a resume button exists.
+  assert.match(currentPaused.hint, /Aucun bouton de reprise n'est disponible dans VEYVRO/);
+
+  // Unrelated messages are untouched by this change.
+  assert.doesNotMatch(decide("plus", subscribed("plus", "active")).hint ?? "", /Paddle/);
+  assert.match(decide("plus", subscribed("pro", "active")).hint ?? "", /Paddle/);
+
+  pass("pause : les deux messages renvoient au lien e-mail et au tableau de bord Paddle, aucun bouton promis");
 }
 
 console.log(`\n${checks} vérifications de la garde d'achat passées.`);

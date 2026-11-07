@@ -7,11 +7,31 @@
  * gap: it compares the SQL with the TypeScript *without* a database, so a
  * rename on one side fails the suite immediately.
  *
+ * Since P9/S5 the file also cross-checks the two quota migrations (0003, 0004)
+ * against the code that calls them, and the two directions of the billing
+ * contract: what the Paddle webhook writes must be what the access layer reads.
+ *
+ * Division of labour, so nothing is claimed twice:
+ *   • `ai-usage-schema.test.mjs` and `migration-0004.test.mjs` verify the SQL
+ *     *by itself* — 41 and 16 static checks about guards, ACLs, transactions;
+ *   • this file verifies that the SQL and the TypeScript **agree**: names,
+ *     parameters, returned columns, refused vocabulary, privileges vs the key
+ *     actually used, statuses the code knows vs statuses the table accepts.
+ * A rename on either side fails here even when both suites above stay green.
+ *
  * No network, no Supabase client, no environment variable: pure parsing.
  */
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
 import { SUBSCRIPTION_COLUMNS } from "../src/lib/entitlement.ts";
+import {
+  ACCESS_COLUMNS,
+  ENTITLED_STATUSES,
+  resolveAccessPlan,
+} from "../server/access.ts";
+import { BLOCKING_STATUSES } from "../src/lib/subscriptionAccess.ts";
+import { PLAN_LIMITS } from "../src/lib/planLimits.ts";
+import { USAGE_ENV_KEYS, USAGE_RPC } from "../server/usageStore.ts";
 
 let checks = 0;
 function pass(label) {
@@ -300,6 +320,308 @@ const realColumns = [...sqlColumns.keys()];
     "aucune validation ne doit être forcée : les lignes existantes ne sont jamais rejetées",
   );
   pass(`contraintes : ${added} ajoutées, toutes NOT VALID (aucune ligne existante rejetée)`);
+}
+
+
+// ===========================================================================
+// 7. Migrations 0003 / 0004 ↔ server/usageStore.ts
+// ===========================================================================
+const usageSql = readFileSync("supabase/migrations/0003_ai_usage_quotas.sql", "utf8");
+const usageFix = readFileSync("supabase/migrations/0004_ai_usage_consume_conflict_target.sql", "utf8");
+const usageStoreSource = readFileSync("server/usageStore.ts", "utf8");
+
+/** Statements only: a comment explaining a rule is never the rule. */
+const stripComments = (source) =>
+  source
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("--"))
+    .join("\n");
+
+const usageStatements = stripComments(usageSql);
+const usageFixStatements = stripComments(usageFix);
+
+{
+  // 7a. Tables and primary keys — the two objects every RPC writes.
+  for (const table of ["ai_usage_daily", "ai_usage_events"]) {
+    assert.match(
+      usageStatements,
+      new RegExp(`create table if not exists public\\.${table} \\(`),
+      `0003 doit créer public.${table}`,
+    );
+    assert.match(
+      usageStatements,
+      new RegExp(`alter table public\\.${table}\\s+enable row level security`),
+      `RLS doit être active sur ${table}`,
+    );
+  }
+  assert.match(usageStatements, /primary key \(user_id, usage_day\)/, "le compteur est clé par (compte, journée)");
+  assert.match(usageStatements, /primary key \(consumption_id\)/, "le registre est clé par consommation");
+  pass("0003 ↔ code : les deux tables existent, avec les clés primaires que les RPC utilisent");
+}
+
+{
+  // 7b. The RPC names the client calls are exactly the functions the SQL creates:
+  // a name that drifts on one side would be a 404 at runtime, on the one path
+  // that decides whether a message is paid for.
+  // A trigger function is not a route: it is invoked by the trigger, never over
+  // HTTP, and must not be granted to the API. Both facts are checked here so
+  // the distinction cannot quietly disappear.
+  const declared = [...usageStatements.matchAll(/create or replace function public\.([a-z_]+)\(([\s\S]*?)language/g)]
+    .map((match) => ({ name: match[1], isTrigger: /returns trigger/i.test(match[2]) }));
+
+  const rpcFunctions = declared.filter((entry) => !entry.isTrigger).map((entry) => entry.name).sort();
+  const triggerFunctions = declared.filter((entry) => entry.isTrigger).map((entry) => entry.name).sort();
+  const called = Object.values(USAGE_RPC).sort();
+
+  assert.deepEqual(rpcFunctions, called, `fonctions appelables (${rpcFunctions.join(", ")}) ≠ RPC appelées (${called.join(", ")})`);
+  assert.deepEqual(triggerFunctions, ["ai_usage_events_guard_fn"], "une seule fonction de trigger, interne");
+  assert.ok(
+    !usageStatements.includes("grant execute on function public.ai_usage_events_guard_fn"),
+    "la fonction de trigger ne doit jamais être exécutable par l'API",
+  );
+  pass(`0003 ↔ usageStore : les ${called.length} RPC appelées (${called.join(", ")}) sont exactement les fonctions exposées`);
+}
+
+{
+  // 7c. Signatures. PostgREST matches named arguments, so what matters is the
+  // *set of names*: a name the client sends but the SQL does not declare is a
+  // 404 with no obvious cause, and a declared parameter nobody sends takes its
+  // default — silently charging the wrong day.
+  const signature = (functionName) => {
+    const start = usageStatements.indexOf(`create or replace function public.${functionName}(`);
+    assert.ok(start !== -1, `signature introuvable pour ${functionName}`);
+    return usageStatements.slice(start, usageStatements.indexOf("\nreturns table", start));
+  };
+  const parametersOf = (functionName) =>
+    [...signature(functionName).matchAll(/\b(p_[a-z_]+)\s+[a-z]/g)].map((match) => match[1]).sort();
+
+  const consumedKeys = [...new Set([...usageStoreSource.matchAll(/\bp_(?:user_id|consumption_id|limit_messages|limit_quotes|is_quote|now)\b/g)]
+    .map((match) => match[0]))].sort();
+
+  const consumeParams = parametersOf("ai_usage_consume");
+  assert.deepEqual(consumeParams, ["p_consumption_id", "p_is_quote", "p_limit_messages", "p_limit_quotes", "p_now", "p_user_id"]);
+  const unknownConsume = consumedKeys.filter((key) => !consumeParams.includes(key));
+  assert.deepEqual(unknownConsume, [], `usageStore envoie des paramètres absents de la signature : ${unknownConsume.join(", ")}`);
+
+  const refundParams = parametersOf("ai_usage_refund");
+  assert.deepEqual(refundParams, ["p_consumption_id", "p_now", "p_user_id"]);
+  const readParams = parametersOf("ai_usage_read");
+  assert.deepEqual(readParams, ["p_now", "p_user_id"]);
+
+  // `p_now` must stay optional everywhere: production never sends it, so the
+  // day is always derived by PostgreSQL from `now()`.
+  for (const name of Object.values(USAGE_RPC)) {
+    assert.match(signature(name), /p_now\s+timestamptz default null/, `${name} : p_now doit rester optionnel`);
+  }
+  pass("signatures : paramètres nommés conformes, p_now optionnel partout (jamais fourni en production)");
+}
+
+{
+  // 7d. Returned columns ↔ the fields the client parses. Reading a column that
+  // does not exist yields `undefined`, which the client reports as an unusable
+  // answer — but only after a real request. Caught here instead.
+  const returnedColumns = (functionName) => {
+    const start = usageSql.indexOf(`create or replace function public.${functionName}(`);
+    const block = usageSql.slice(start, usageSql.indexOf("language plpgsql", start));
+    const table = block.slice(block.indexOf("returns table ("));
+    return [...table.matchAll(/^\s{2}([a-z_]+)\s+[a-z]/gm)].map((match) => match[1]).sort();
+  };
+
+  assert.deepEqual(returnedColumns("ai_usage_consume"), [
+    "allowed",
+    "reason",
+    "replayed",
+    "usage_day",
+    "used_messages",
+    "used_quotes",
+  ]);
+  assert.deepEqual(returnedColumns("ai_usage_refund"), ["reason", "refunded", "usage_day"]);
+  assert.deepEqual(returnedColumns("ai_usage_read"), ["usage_day", "used_messages", "used_quotes"]);
+
+  for (const field of ["allowed", "reason", "used_messages", "used_quotes", "usage_day", "replayed"]) {
+    assert.ok(usageStoreSource.includes(`${field}?:`), `usageStore doit lire ${field}`);
+  }
+  assert.ok(usageStoreSource.includes("refunded?:"), "usageStore doit lire refunded");
+  pass("colonnes retournées : les 6 du consume, les 3 du refund et les 3 de la lecture sont toutes lues par le client");
+}
+
+{
+  // 7e. ACL ↔ the key actually used. Only service_role may execute the RPC;
+  // a client that authenticated with the anonymous key would be refused at
+  // runtime, on every message, with a 404 that looks like a missing function.
+  for (const name of Object.values(USAGE_RPC)) {
+    const grant = new RegExp(`grant execute on function public\\.${name}\\([^)]*\\)\\s*\\n?\\s*to service_role`, "i");
+    assert.match(usageStatements, grant, `${name} : EXECUTE doit être accordé au seul service_role`);
+    assert.ok(
+      !new RegExp(`grant execute on function public\\.${name}\\([^)]*\\)[^;]*\\b(anon|authenticated|public)\\b`, "i").test(
+        usageStatements,
+      ),
+      `${name} : aucun droit ne doit être accordé à anon/authenticated/PUBLIC`,
+    );
+  }
+  // Tables: nothing is granted to anyone, and the client never touches them.
+  assert.ok(!/grant .* on (table )?public\.ai_usage_(daily|events)/i.test(usageStatements), "aucun GRANT de table");
+  assert.ok(!/\/rest\/v1\/ai_usage_/i.test(usageStoreSource), "le client ne contacte jamais une table, seulement les RPC");
+  assert.equal(USAGE_ENV_KEYS.serviceRoleKey, "SUPABASE_SERVICE_ROLE_KEY");
+  assert.match(
+    usageStoreSource,
+    /apikey:\s*env\.serviceRoleKey/,
+    "l'en-tête apikey des RPC doit porter la clé de service (la seule autorisée par l'ACL)",
+  );
+  assert.ok(!/anonKey/.test(usageStoreSource), "la clé anonyme n'a aucun rôle dans le magasin d'usage");
+  pass("ACL : EXECUTE réservé au service_role, aucun privilège de table, et le client emploie bien cette clé");
+}
+
+{
+  // 7f. Vocabulary. Every `reason` the SQL can return must be understood by the
+  // client; a new reason added to the SQL and forgotten here would be treated as
+  // an outage — safe, but wrong, and invisible.
+  const emitSql = usageStatements.slice(
+    usageStatements.indexOf("create or replace function public.ai_usage_consume"),
+    usageStatements.indexOf("create or replace function public.ai_usage_refund"),
+  );
+  // Two ways the SQL writes a reason: cast in the returned row, or assigned to
+  // `v_refuse` and returned later. Both must be seen, otherwise the check would
+  // pass while the most common refusal (a quota reached) went unnoticed.
+  const emitted = new Set([...emitSql.matchAll(/'(daily_messages|daily_quotes|consumption_conflict|consumption_refunded)'/g)].map((match) => match[1]));
+  for (const reason of ["daily_messages", "daily_quotes", "consumption_conflict"]) {
+    assert.ok(emitted.has(reason), `0003 doit pouvoir émettre ${reason}`);
+    assert.ok(usageStoreSource.includes(`"${reason}"`), `usageStore doit mapper ${reason}`);
+  }
+  // The reverse direction is a superset on purpose: `consumption_refunded` is a
+  // legacy value kept mapped for an older deployment, which the corrected SQL
+  // no longer emits. It must stay documented as such rather than silently used.
+  assert.ok(usageStoreSource.includes("consumption_refunded"), "la valeur héritée reste mappée");
+  assert.ok(
+    !emitted.has("consumption_refunded"),
+    "la valeur héritée ne doit pas être émise par le SQL corrigé",
+  );
+  pass("vocabulaire : chaque motif que le SQL peut renvoyer est mappé (et l'hérité reste reconnu, jamais émis)");
+}
+
+{
+  // 7g. Constraints the client relies on: the state machine of the ledger, and
+  // the non-negative counters. Both are read as facts by the code (a refund is
+  // only recorded once; counters never go below zero).
+  assert.match(usageStatements, /check \(state in \('consumed', 'refunded'\)\)/, "états du registre bornés");
+  assert.match(usageStatements, /check \(messages >= 0\)/, "compteur de messages non négatif");
+  assert.match(usageStatements, /check \(quotes >= 0\)/, "compteur d'analyses non négatif");
+  assert.match(usageStatements, /check \(attempts between 1 and 3\)/, "plafond de trois tentatives inscrit dans le schéma");
+  pass("contraintes : machine à états du registre et compteurs non négatifs présents dans 0003");
+}
+
+{
+  // 7h. 0004 replaces exactly one function, by name, and its named conflict
+  // target is the primary key 0003 declares. The client maps the same answers
+  // before and after: nothing it reads is allowed to change.
+  const replaced = [...usageFixStatements.matchAll(/create or replace function public\.([a-z_]+)\(/g)].map(
+    (match) => match[1],
+  );
+  assert.deepEqual(replaced, ["ai_usage_consume"], "0004 ne remplace qu'ai_usage_consume");
+  assert.match(usageFixStatements, /on conflict on constraint ai_usage_daily_pkey do update/, "cible de conflit nommée");
+  assert.match(usageStatements, /constraint ai_usage_daily_pkey primary key \(user_id, usage_day\)/, "la contrainte nommée est bien la PK de 0003");
+
+  const fixParameters = [...usageFix.matchAll(/\b(p_[a-z_]+)\s+[a-z]/g)].map((match) => match[1]);
+  assert.deepEqual(
+    [...new Set(fixParameters)].sort(),
+    ["p_consumption_id", "p_is_quote", "p_limit_messages", "p_limit_quotes", "p_now", "p_user_id"],
+    "0004 conserve exactement la signature de 0003",
+  );
+  assert.match(usageFix, /returns table \(\s*\n?\s*allowed/, "0004 conserve les colonnes retournées");
+  pass("0004 ↔ 0003 : une seule fonction remplacée, même signature, cible de conflit = la PK déclarée");
+}
+
+// ===========================================================================
+// 8. Statuts : ce que Paddle écrit doit être représentable, lisible, et borné
+// ===========================================================================
+{
+  // 0001 declares the CHECK; 0002 re-declares it for the existing table. Every
+  // status the code knows must be accepted by one of them, otherwise a real
+  // Paddle event would be rejected on write and the customer would keep nothing.
+  const one = stripComments(readFileSync("supabase/migrations/0001_subscriptions.sql", "utf8"));
+  const two = stripComments(sql);
+  const accepted = new Set();
+  for (const statement of `${one}\n${two}`.matchAll(/status in \(([^)]*)\)/g)) {
+    for (const literal of statement[1].matchAll(/'([a-z_]+)'/g)) accepted.add(literal[1]);
+  }
+  for (const status of ["trialing", "active", "past_due", "paused", "canceled"]) {
+    assert.ok(accepted.has(status), `le statut ${status} doit être accepté par le CHECK de la table`);
+  }
+  for (const status of [...ENTITLED_STATUSES, ...BLOCKING_STATUSES]) {
+    assert.ok(accepted.has(status), `${status} est connu du code mais refusé par la table`);
+  }
+  // What the webhook may write must be representable too: a status it accepts
+  // but the table refuses would make the upsert fail, and the event would be
+  // retried forever against a constraint it can never satisfy.
+  const webhookStatuses = [
+    ...webhookSource
+      .slice(webhookSource.indexOf("const SUBSCRIPTION_STATUSES"))
+      .match(/^\s{2}"([a-z_]+)",/gm)
+      .map((line) => line.replace(/[\s",]/g, "")),
+  ];
+  assert.deepEqual(
+    webhookStatuses.sort(),
+    ["active", "canceled", "past_due", "paused", "trialing"],
+    "le webhook doit accepter exactement les cinq statuts du schéma",
+  );
+  for (const status of webhookStatuses) {
+    assert.ok(accepted.has(status), `le webhook accepte ${status}, que la table doit accepter aussi`);
+  }
+
+  // The two lists must stay distinct: an entitled status that blocks would
+  // forbid the renewal of a customer we still serve.
+  assert.notDeepEqual([...BLOCKING_STATUSES].sort(), [...ENTITLED_STATUSES].sort());
+
+  // And the index predicate that really refuses a second subscription must
+  // name exactly the blocking statuses.
+  const indexBlock = one.slice(one.indexOf("subscriptions_paddle_customer_id_idx"));
+  const predicate = indexBlock.slice(0, indexBlock.indexOf(";"));
+  const indexStatuses = [...predicate.matchAll(/'([a-z_]+)'/g)].map((match) => match[1]).sort();
+  assert.deepEqual(indexStatuses, [...BLOCKING_STATUSES].sort(), "BLOCKING_STATUSES doit égaler le prédicat de l'index unique");
+  pass("statuts : les cinq statuts acceptés par la table couvrent les listes du code, index partiel aligné");
+}
+
+// ===========================================================================
+// 9. Paiement : ce que le webhook écrit est ce que le contrôle d'accès lit
+// ===========================================================================
+{
+  const readColumns = ACCESS_COLUMNS.split(",").map((column) => column.trim());
+  const readByClient = SUBSCRIPTION_COLUMNS.split(",").map((column) => column.trim());
+  const written = readWebhookRowColumns();
+
+  // Server side: every column read to decide a plan is written by the webhook.
+  const notWritten = readColumns.filter((column) => !written.includes(column) && column !== "id");
+  assert.deepEqual(notWritten, [], `le contrôle d'accès lit des colonnes que le webhook n'écrit jamais : ${notWritten.join(", ")}`);
+
+  // Browser side: the same, plus the columns the UI shows. `id`, `created_at`
+  // and `updated_at` are database defaults, never written by the handler.
+  const databaseOwned = ["id", "created_at", "updated_at"];
+  const notWrittenForClient = readByClient.filter(
+    (column) => !written.includes(column) && !databaseOwned.includes(column),
+  );
+  assert.deepEqual(
+    notWrittenForClient,
+    [],
+    `la vue lit des colonnes que le webhook n'écrit jamais : ${notWrittenForClient.join(", ")}`,
+  );
+
+  // Runtime agreement on values: a row shaped like the webhook's payload, with
+  // the values the webhook writes, must produce the plan the customer bought.
+  const paidRow = {
+    user_id: "11111111-2222-4333-8444-555555555555",
+    plan: "plus",
+    status: "active",
+    current_period_ends_at: new Date(Date.now() + 20 * 86_400_000).toISOString(),
+  };
+  assert.equal(resolveAccessPlan([paidRow], paidRow.user_id), "plus", "une ligne payée donne la formule payée");
+  assert.equal(
+    resolveAccessPlan([{ ...paidRow, current_period_ends_at: new Date(Date.now() - 1_000).toISOString() }], paidRow.user_id),
+    "decouverte",
+    "la période échue retire le droit payant",
+  );
+  assert.equal(resolveAccessPlan([paidRow], "99999999-8888-4777-8666-555555555555"), "decouverte", "la ligne d'autrui ne donne rien");
+  assert.ok(PLAN_LIMITS.plus.messagesPerDay > PLAN_LIMITS.decouverte.messagesPerDay);
+  pass("chaîne payante : les colonnes écrites par le webhook suffisent au contrôle d'accès, valeurs comprises");
 }
 
 console.log(`\n${checks} vérifications d'alignement schéma ↔ code passées.`);

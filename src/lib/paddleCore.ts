@@ -137,7 +137,11 @@ export const PRICING_PLANS: readonly PricingPlan[] = [
     features: [
       "Tout Découverte",
       "Devis et factures de garage illimités",
-      "Analyse de photos et de PDF",
+      // Was "Analyse de photos et de PDF": the API has always refused an
+      // attachment outside a garage-quote analysis, for every plan, so the line
+      // promised something that could not be delivered. It now states what is
+      // actually sold — photos and PDFs are accepted, on those analyses.
+      "Photos et PDF acceptés pour chaque analyse de devis",
       "Historique de vos conversations",
     ],
     cta: "Choisir VEYVRO Plus",

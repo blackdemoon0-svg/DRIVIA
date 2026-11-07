@@ -443,7 +443,7 @@ function subscriptionCreated({ customData, email = USER_EMAIL, priceId = SANDBOX
 }
 
 // ---------------------------------------------------------------------------
-// 6. The four events the activation depends on are the four handled
+// 6. The subscription events handled are exactly the ones activation depends on
 // ---------------------------------------------------------------------------
 
 {
@@ -452,17 +452,51 @@ function subscriptionCreated({ customData, email = USER_EMAIL, priceId = SANDBOX
   assert.ok(block, "la liste des événements traités doit être explicite");
 
   const handled = [...block[1].matchAll(/"([a-z_.]+)"/g)].map((match) => match[1]);
+  // Seven since P12: `subscription.activated` joined the six, because Paddle
+  // Sandbox really emitted it and the endpoint answered 200
+  // `unhandled_event_type` — a delivery Paddle counts as successful while no
+  // subscription is recorded and no right is granted. Six before that (P10/S6:
+  // pause and resume), four before that.
   assert.deepEqual(
     handled.sort(),
-    ["subscription.canceled", "subscription.created", "subscription.past_due", "subscription.updated"],
-    "exactement les quatre événements du cycle de vie d'un abonnement",
+    [
+      "subscription.activated",
+      "subscription.canceled",
+      "subscription.created",
+      "subscription.past_due",
+      "subscription.paused",
+      "subscription.resumed",
+      "subscription.updated",
+    ],
+    "exactement les sept événements du cycle de vie d'un abonnement",
+  );
+  assert.ok(
+    !handled.includes("subscription.trialing") && !handled.includes("subscription.imported"),
+    "trialing et imported restent hors périmètre : aucun événement de ce type n'a été observé, on n'invente pas de compatibilité",
   );
   assert.ok(
     !handled.includes("transaction.completed"),
     "transaction.completed reste acquitté sans écriture : ce n'est pas lui qui active",
   );
+  assert.ok(
+    !handled.includes("adjustment.created"),
+    "les remboursements sont une autre famille, dispatchée à part (ADJUSTMENT_EVENT_TYPES)",
+  );
 
-  pass("événements : created / updated / canceled / past_due traités, transaction.completed sans effet");
+  // The refund/chargeback family is declared separately, and both lists are
+  // dispatched by the handler — a family declared but not routed would be a
+  // silent no-op on real money.
+  const adjustments = /export const ADJUSTMENT_EVENT_TYPES = \[([\s\S]*?)\] as const;/.exec(webhook);
+  assert.ok(adjustments, "la famille des ajustements doit être déclarée");
+  const adjustmentTypes = [...adjustments[1].matchAll(/"([a-z_.]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(adjustmentTypes.sort(), ["adjustment.created", "adjustment.updated"]);
+  assert.match(
+    webhook,
+    /ADJUSTMENT_EVENT_TYPES as readonly string\[\]\)\.includes\(eventType\)/,
+    "le handler aiguille réellement les ajustements vers leur traitement",
+  );
+
+  pass("événements : les sept du cycle de vie traités, remboursements aiguillés à part, transaction.completed sans effet");
 }
 
 // ---------------------------------------------------------------------------

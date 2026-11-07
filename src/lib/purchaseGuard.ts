@@ -21,9 +21,18 @@
  * grants access, and `server/access.ts` remains the only authority. Hiding a
  * button is a service to the customer; it is never a security boundary.
  *
- * The decision is a pure function of three inputs — which plan the button is
- * for, what the database says, and whether a checkout is in flight — so every
- * case can be tested without a browser and without Paddle.
+ * The decision is a pure function of four inputs — which plan the button is
+ * for, what the database says, whether a checkout is in flight, and whether the
+ * account can receive what it pays for — so every case can be tested without a
+ * browser and without Paddle.
+ *
+ * 5. paying from an account whose address is not confirmed, which the webhook
+ *    would refuse to turn into a subscription.
+ *
+ * Subscription management (resume after a pause) happens in Paddle, not here:
+ * the wording says exactly where — the management link Paddle e-mailed, or
+ * Paddle's own dashboard — instead of pointing at a button this application
+ * does not have (P11/S7, R4 option B).
  */
 
 import {
@@ -65,6 +74,20 @@ export type CheckoutActivity =
 
 export const IDLE_ACTIVITY: CheckoutActivity = { kind: "idle" };
 
+/**
+ * What is known about the account itself, independently of any subscription.
+ *
+ * `emailConfirmed` is the one fact the webhook cannot fix for us: it refuses to
+ * bind a subscription to an address that was never confirmed (`email_confirmed_at`
+ * empty in `auth.users`). A payment taken on such an account is stored by Paddle
+ * and refused here, and the customer waits — money gone, no access — until the
+ * retry succeeds after confirmation. So the button is refused up front instead.
+ */
+export type AccountContext = {
+  /** `true` only when Supabase reports a confirmed address. */
+  emailConfirmed: boolean;
+};
+
 export type CtaReason =
   /** This exact plan is already in force. */
   | "current"
@@ -82,6 +105,8 @@ export type CtaReason =
   | "arrears"
   /** The stored subscription is paused and must be resumed first. */
   | "paused"
+  /** The account's e-mail is not confirmed: a payment could not be attributed. */
+  | "unconfirmed"
   /** Ordinary purchase. */
   | "checkout";
 
@@ -94,6 +119,7 @@ const BLOCKING_REASONS: readonly CtaReason[] = [
   "busy",
   "arrears",
   "paused",
+  "unconfirmed",
 ];
 
 export function isBlocked(reason: CtaReason): boolean {
@@ -137,16 +163,18 @@ export function snapshotFromRows(
  * Decide what the button for `plan` must do.
  *
  * Order matters and is the whole point of this function:
- * 1. an unknown state refuses everything, because it cannot prove the absence
+ * 1. an account whose address is not confirmed is refused, because the payment
+ *    could not be turned into a subscription;
+ * 2. an unknown state refuses everything, because it cannot prove the absence
  *    of a plan;
- * 2. a plan already held is refused, and so is a formula the customer already
+ * 3. a plan already held is refused, and so is a formula the customer already
  *    covers;
- * 3. anything that requires a change of formula is refused while the stored
+ * 4. anything that requires a change of formula is refused while the stored
  *    subscription is not in good standing — paying again would not fix arrears,
  *    it would add a second subscription;
- * 4. one checkout at a time: while one is being created or is open, every other
+ * 5. one checkout at a time: while one is being created or is open, every other
  *    paid button is refused too;
- * 5. only then may a click open a checkout.
+ * 6. only then may a click open a checkout.
  *
  * `baseLabel` is the catalogue's own wording (the caller passes `plan.cta`), so
  * this module never has to own marketing copy.
@@ -156,8 +184,24 @@ export function decideCta(
   baseLabel: string,
   snapshot: PlanSnapshot,
   activity: CheckoutActivity,
+  account: AccountContext,
 ): CtaDecision {
-  // 1. Nothing is known yet, or what is known is unusable.
+  // 1. An account that cannot receive what it pays for is refused before
+  // anything else is considered — including an upgrade, which the plan-change
+  // endpoint refuses as well (403 `email_unconfirmed`). Both halves of the
+  // product now say the same thing. This check comes first on purpose: the fact
+  // is known synchronously, it does not depend on the subscription read, and it
+  // is the only reason an otherwise valid purchase would take money for nothing.
+  if (!account.emailConfirmed) {
+    return {
+      disabled: true,
+      label: baseLabel,
+      reason: "unconfirmed",
+      hint: "Confirmez votre adresse e-mail avant de payer : ouvrez le lien reçu par e-mail (regardez aussi les indésirables). Aucun abonnement ne peut être rattaché à un compte non confirmé.",
+    };
+  }
+
+  // 2. Nothing is known yet, or what is known is unusable.
   if (snapshot.kind === "checking") {
     return {
       disabled: true,
@@ -176,7 +220,7 @@ export function decideCta(
     };
   }
 
-  // 2. What the stored subscription already gives.
+  // 3. What the stored subscription already gives.
   if (snapshot.kind === "subscribed") {
     if (snapshot.plan === plan) {
       return {
@@ -187,7 +231,7 @@ export function decideCta(
           snapshot.status === "past_due"
             ? "Paiement en retard : régularisez-le depuis Paddle, votre accès court jusqu'à la fin de la période."
             : snapshot.status === "paused"
-              ? "Abonnement en pause : reprenez-le depuis Paddle."
+              ? "Abonnement en pause : reprenez-le depuis le lien de gestion reçu par e-mail ou depuis votre tableau de bord Paddle. Aucun bouton de reprise n'est disponible dans VEYVRO."
               : "Cette formule est déjà active sur votre compte.",
       };
     }
@@ -202,7 +246,7 @@ export function decideCta(
       };
     }
 
-    // 3. Plus → Pro is allowed, but only from a subscription in good standing.
+    // 4. Plus → Pro is allowed, but only from a subscription in good standing.
     if (snapshot.status === "past_due") {
       return {
         disabled: true,
@@ -216,12 +260,12 @@ export function decideCta(
         disabled: true,
         label: baseLabel,
         reason: "paused",
-        hint: "Votre abonnement est en pause : reprenez-le avant de passer à VEYVRO Pro.",
+        hint: "Votre abonnement est en pause : reprenez-le depuis le lien de gestion reçu par e-mail ou depuis votre tableau de bord Paddle, avant de passer à VEYVRO Pro.",
       };
     }
   }
 
-  // 4. One checkout at a time — including while the window is merely open.
+  // 5. One checkout at a time — including while the window is merely open.
   if (activity.kind !== "idle") {
     const isThisPlan = activity.plan === plan;
     return {
@@ -234,7 +278,7 @@ export function decideCta(
     };
   }
 
-  // 5. Allowed.
+  // 6. Allowed.
   if (snapshot.kind === "subscribed") {
     return {
       disabled: false,

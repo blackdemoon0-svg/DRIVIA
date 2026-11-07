@@ -755,7 +755,10 @@ export default function App() {
         return "Connectez-vous ou créez un compte gratuit pour utiliser VEYVRO. La formule Découverte est gratuite. / Sign in or create a free account to use VEYVRO. The Découverte plan is free.";
       }
       if (code === "plan_required") {
-        return "L'analyse de photos et de PDF fait partie des formules VEYVRO Plus et Pro. / Photo and PDF analysis is part of VEYVRO Plus and Pro.";
+        // The document is part of the garage-quote analysis, and of nothing else
+        // (P10/S6 withdrew the general "photos and PDF" promise the route never
+        // served). The wording no longer suggests otherwise.
+        return "L'analyse de devis avec photo ou PDF fait partie des formules VEYVRO Plus et Pro. / Garage-quote analysis with a photo or PDF is part of VEYVRO Plus and Pro.";
       }
       // Quotas, decided server-side from the plan in the database.
       if (code === "daily_messages") {
@@ -763,6 +766,9 @@ export default function App() {
       }
       if (code === "daily_quotes") {
         return "Vous avez utilisé votre analyse de devis du jour avec la formule Découverte. Elle revient demain à minuit (UTC), ou passez à VEYVRO Plus pour des analyses illimitées. / You have used today's single garage-quote analysis on the Découverte plan. It returns tomorrow at midnight UTC, or upgrade to VEYVRO Plus for unlimited analyses.";
+      }
+      if (code === "ip_rate_limited") {
+        return "Trop de requêtes envoyées depuis votre connexion. Patientez une minute avant de réessayer. / Too many requests from your connection. Please wait a minute before trying again.";
       }
       if (code === "rate_minute" || error.status === 429) {
         return "Trop de requêtes en peu de temps pour votre formule. Patientez un instant avant de réessayer. / Too many requests for your plan in a short time. Please wait a moment before trying again.";
@@ -793,6 +799,21 @@ export default function App() {
       // The IP-level guard, distinct from the per-plan minute window handled above.
       if (code === "rate_limited") {
         return "Trop de requêtes envoyées (limite de débit atteinte). Patientez quelques instants avant de réessayer. / Rate limit reached. Please wait a moment before trying again.";
+      }
+      // Durable allowance (P7/S3): the message identifier sent with the request
+      // was refused, replayed, or could not be checked. Each case has a
+      // different fix, so each gets its own wording instead of a generic 5xx.
+      if (code === "invalid_identifier") {
+        return "Le message n'a pas pu être envoyé correctement. Rechargez la page et renvoyez votre message. / The message could not be sent correctly. Reload the page and send it again.";
+      }
+      if (code === "duplicate") {
+        return "Ce message a déjà été traité. Envoyez un nouveau message pour continuer. / This message was already processed. Send a new message to continue.";
+      }
+      if (code === "conflict") {
+        return "Ce message n'a pas pu être identifié de façon unique. Rechargez la page et réessayez. / This message could not be uniquely identified. Reload the page and try again.";
+      }
+      if (code === "unavailable" && error.status === 503) {
+        return "VEYVRO ne peut pas vérifier votre quota de messages pour le moment. Réessayez dans un instant. / VEYVRO cannot check your message allowance right now. Please retry shortly.";
       }
       if (error.status === 503 || code === "busy") {
         return "Le service VEYVRO traite actuellement de nombreuses demandes. Réessayez dans quelques secondes. / VEYVRO's chat service is handling many requests right now. Please try again shortly.";
@@ -986,6 +1007,10 @@ export default function App() {
           onStartFree={openChat}
           userId={auth.user?.id ?? null}
           accessToken={auth.session?.access_token ?? null}
+          // Read from the session, never inferred: an address Supabase reports
+          // as unconfirmed cannot carry a subscription (the webhook refuses it),
+          // so the paid buttons are refused here as well.
+          emailConfirmed={Boolean(auth.user?.email_confirmed_at)}
           onRequireSignIn={() => setView("connexion")}
         />
       ) : quoteDialogOpen ? (

@@ -29,7 +29,29 @@ type StreamOptions = {
    * never in the URL, never logged.
    */
   accessToken?: string | null;
+  /**
+   * Identifier of this message, so a replay cannot be charged twice.
+   *
+   * Optional: when omitted, one is generated per call. Pass your own value when
+   * the same logical message may be sent more than once (a transport retry, a
+   * double submit) — the server answers 409 instead of consuming a second
+   * message. It carries no identity, no plan and no quota: only "this is the
+   * same request".
+   */
+  clientMessageId?: string;
 };
+
+/**
+ * A fresh RFC 4122 v4 identifier, or `undefined` when the runtime has no
+ * `crypto.randomUUID` (the server then generates one itself).
+ *
+ * Never derived from anything the user wrote: it must not leak content, and it
+ * must be unpredictable enough not to collide with another account's message.
+ */
+function newClientMessageId(): string | undefined {
+  const cryptoApi = globalThis.crypto;
+  return cryptoApi && typeof cryptoApi.randomUUID === "function" ? cryptoApi.randomUUID() : undefined;
+}
 
 type StreamPayload = {
   delta?: unknown;
@@ -123,6 +145,15 @@ export async function streamVeyvroResponse(
     throw new VeyvroApiError(401, "Sign in to VEYVRO to use the chat.", "auth_required");
   }
 
+  // One identifier per send, decided once, right before the request is built:
+  // the bytes on the wire and the identifier cannot disagree, so replaying this
+  // exact request is a 409 — never a second charge.
+  //
+  // Deliberately not generated per retry loop higher up: a *new* attempt is a
+  // new message, and must be charged as one. Only the same payload is the same
+  // message.
+  const clientMessageId = options.clientMessageId ?? newClientMessageId();
+
   let response: Response;
 
   try {
@@ -137,6 +168,7 @@ export async function streamVeyvroResponse(
         messages: history,
         ...(attachments?.length ? { attachments } : {}),
         ...(options.task ? { task: options.task } : {}),
+        ...(clientMessageId ? { clientMessageId } : {}),
       }),
       signal,
     });

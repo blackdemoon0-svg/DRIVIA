@@ -35,11 +35,11 @@
  * send on `PATCH /subscriptions/{id}` — which is precisely why the lock and the
  * single-use nonce exist on this side.
  *
- * Why not `server/quotas.ts`
- * --------------------------
- * It was the obvious module to reuse, and it is the wrong one: its counters are
- * keyed on the chat's plan limits and consuming one there would spend a
- * *message* allowance on a plan change. A customer who re-quotes three times
+ * Why not the chat quota
+ * ----------------------
+ * The chat's counters were the obvious thing to reuse, and they are the wrong
+ * thing: they are keyed on the chat's plan limits, and consuming one there would
+ * spend a *message* allowance on a plan change. A customer who re-quotes three times
  * would lose three messages. The mechanism (a per-key sliding window in memory)
  * is the same; the budget is not. Hence a separate module with its own keys and
  * its own limits, rather than a shared counter that would quietly charge the

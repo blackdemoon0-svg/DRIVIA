@@ -1,6 +1,15 @@
 import VEYVRO_SYSTEM_PROMPT from "../server/veyvroSystemPrompt.js";
 import { authorizeRequest, type AccessDecision } from "../server/access.js";
-import { consumeQuota } from "../server/quotas.js";
+import { resolveConsumptionId } from "../server/consumptionId.js";
+import { consumeDurableUsage, refundDurableUsage, usageFailureStatus } from "../server/usageStore.js";
+import {
+  admitConcurrency,
+  checkAuthFailures,
+  checkIpNet,
+  checkUserBurst,
+  clientKeyFromHeaders,
+  recordAuthFailure,
+} from "../server/rateLimits.js";
 
 /**
  * Rebrand support: VEYVRO_* variables are the canonical names. The handler
@@ -106,160 +115,6 @@ export const config = {
     bodyParser: { sizeLimit: "4mb" },
   },
 };
-
-const REQUEST_RATE_LIMITS = [
-  { windowMs: 60_000, maxRequests: 10 },
-  { windowMs: 60 * 60_000, maxRequests: 60 },
-] as const;
-const RATE_LIMIT_RETENTION_MS = 60 * 60_000;
-const RATE_LIMIT_BUCKET_CLEANUP_INTERVAL_MS = 60_000;
-const MAX_RATE_LIMIT_CLIENTS = 5_000;
-const MAX_CONCURRENT_REQUESTS_PER_CLIENT = 2;
-const MAX_CONCURRENT_REQUESTS_PER_INSTANCE = 12;
-const BUSY_RETRY_AFTER_SECONDS = 5;
-
-type RequestBucket = {
-  requestTimestamps: number[];
-  activeRequests: number;
-};
-
-type RequestAdmissionError = {
-  status: 429 | 503;
-  code: "rate_limited" | "busy";
-  message: string;
-  retryAfterSeconds: number;
-};
-
-type RequestAdmission =
-  | { error: RequestAdmissionError }
-  | { release: () => void };
-
-// Process-local best-effort limits: they reset on cold starts and are not a global quota.
-const requestBuckets = new Map<string, RequestBucket>();
-let activeRequestCount = 0;
-let lastBucketCleanupAt = 0;
-
-function getClientIdentifier(request: ApiRequest) {
-  const forwardedFor = request.headers?.["x-forwarded-for"];
-  const rawForwardedFor = Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor;
-  const forwardedClient = rawForwardedFor?.split(",")[0]?.trim();
-  if (forwardedClient && forwardedClient.length <= 64) return forwardedClient;
-
-  const realIp = request.headers?.["x-real-ip"];
-  const rawRealIp = Array.isArray(realIp) ? realIp[0] : realIp;
-  const realClient = rawRealIp?.trim();
-  return realClient && realClient.length <= 64 ? realClient : "unknown";
-}
-
-function cleanRequestBuckets(now: number) {
-  for (const [clientId, bucket] of requestBuckets) {
-    bucket.requestTimestamps = bucket.requestTimestamps.filter(
-      (timestamp) => now - timestamp < RATE_LIMIT_RETENTION_MS,
-    );
-    if (bucket.requestTimestamps.length === 0 && bucket.activeRequests === 0) {
-      requestBuckets.delete(clientId);
-    }
-  }
-  lastBucketCleanupAt = now;
-}
-
-function admitChatRequest(request: ApiRequest, now = Date.now()): RequestAdmission {
-  if (now - lastBucketCleanupAt >= RATE_LIMIT_BUCKET_CLEANUP_INTERVAL_MS) {
-    cleanRequestBuckets(now);
-  }
-
-  const clientId = getClientIdentifier(request);
-  let bucket = requestBuckets.get(clientId);
-  if (!bucket && requestBuckets.size >= MAX_RATE_LIMIT_CLIENTS) {
-    cleanRequestBuckets(now);
-  }
-  if (!bucket) {
-    while (requestBuckets.size >= MAX_RATE_LIMIT_CLIENTS) {
-      let oldestIdleClient: string | undefined;
-      for (const [existingClientId, entry] of requestBuckets) {
-        if (entry.activeRequests === 0) {
-          oldestIdleClient = existingClientId;
-          break;
-        }
-      }
-      if (!oldestIdleClient) {
-        return {
-          error: {
-            status: 503,
-            code: "busy",
-            message: "VEYVRO is handling many requests right now. Please retry shortly.",
-            retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
-          },
-        };
-      }
-      requestBuckets.delete(oldestIdleClient);
-    }
-    bucket = { requestTimestamps: [], activeRequests: 0 };
-    requestBuckets.set(clientId, bucket);
-  } else {
-    requestBuckets.delete(clientId);
-    requestBuckets.set(clientId, bucket);
-  }
-
-  bucket.requestTimestamps = bucket.requestTimestamps.filter(
-    (timestamp) => now - timestamp < RATE_LIMIT_RETENTION_MS,
-  );
-  for (const limit of REQUEST_RATE_LIMITS) {
-    const recentRequests = bucket.requestTimestamps.filter(
-      (timestamp) => now - timestamp < limit.windowMs,
-    );
-    if (recentRequests.length >= limit.maxRequests) {
-      const requestToExpire = recentRequests[recentRequests.length - limit.maxRequests];
-      const retryAfterSeconds = Math.max(
-        1,
-        Math.ceil((requestToExpire + limit.windowMs - now) / 1_000),
-      );
-      return {
-        error: {
-          status: 429,
-          code: "rate_limited",
-          message: "Too many chat requests. Please wait before trying again.",
-          retryAfterSeconds,
-        },
-      };
-    }
-  }
-
-  if (bucket.activeRequests >= MAX_CONCURRENT_REQUESTS_PER_CLIENT) {
-    return {
-      error: {
-        status: 429,
-        code: "rate_limited",
-        message: "Too many simultaneous requests from this client. Please wait for one to finish.",
-        retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
-      },
-    };
-  }
-  if (activeRequestCount >= MAX_CONCURRENT_REQUESTS_PER_INSTANCE) {
-    return {
-      error: {
-        status: 503,
-        code: "busy",
-        message: "VEYVRO is handling many requests right now. Please retry shortly.",
-        retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS,
-      },
-    };
-  }
-
-  bucket.requestTimestamps.push(now);
-  bucket.activeRequests += 1;
-  activeRequestCount += 1;
-  let released = false;
-
-  return {
-    release: () => {
-      if (released) return;
-      released = true;
-      bucket!.activeRequests = Math.max(0, bucket!.activeRequests - 1);
-      activeRequestCount = Math.max(0, activeRequestCount - 1);
-    },
-  };
-}
 
 function isConversationMessage(value: unknown): value is ConversationMessage {
   if (typeof value !== "object" || value === null) return false;
@@ -593,30 +448,100 @@ function readRequestHeader(request: ApiRequest, name: string): string | null {
 }
 
 /**
- * Chat entry point.
+ * Chat entry point — the order of the four guard rails is the design.
  *
- * Authentication comes first, before any rate-limit bookkeeping: an anonymous
- * caller must not even consume an IP bucket, and the quotas of a plan are only
- * meaningful for an identified account.
+ *   0. method                                       405, before anything
+ *   C. failed authentications, per IP               20/min   (memory)
+ *   ↳ authentication                                Supabase + subscriptions
+ *   B. contract burst, per **account and plan**     10/20/30 per minute
+ *   D. shared-IP net, per IP                        120/min  (memory)
+ *   E. concurrency, per **account**                 2 per account, 12 per instance
+ *   A. daily allowance (inside `handleChatPost`)    15/200/600 per day (SQL)
+ *
+ * Layer C is read *before* authentication and only ever counts requests that
+ * failed to authenticate, so it can never refuse a legitimate signed-in caller
+ * whatever the plan.
+ *
+ * Layer B comes before D and E on purpose: it is the published contract, and it
+ * is the only limit that a customer can name ("Plus gives 20 a minute"). An IP
+ * net that refused first would silently cap a Plus or Pro account at the
+ * address's budget — the bug this order exists to prevent.
+ *
+ * Layer E is keyed on the verified account, never on the address: an address is
+ * not a person, and keying concurrency on it would give a whole office two slots
+ * for all its users.
+ *
+ * `release()` is in a `finally` for every path that reaches the model, including
+ * a stream that the client abandons.
  */
 export default async function handler(request: ApiRequest, response: ApiResponse) {
   if (request.method !== "POST") {
     return response.status(405).json({ error: "Only POST requests are supported." });
   }
 
+  // The address is only trusted on the platform that writes it; elsewhere every
+  // caller shares one bucket (`unknown`), which is a ceiling, not a free pass.
+  const clientKey = clientKeyFromHeaders(request.headers);
+
+  const authFailures = checkAuthFailures(clientKey);
+  if (authFailures.blocked) {
+    response.setHeader("Retry-After", String(authFailures.retryAfterSeconds));
+    return response.status(429).json({
+      code: "rate_limited",
+      error: "Too many failed sign-in attempts from this address. Please wait before trying again.",
+      retryAfterSeconds: authFailures.retryAfterSeconds,
+    });
+  }
+
   const access = await authorizeRequest(readRequestHeader(request, "authorization"));
   if (!access.ok) {
+    // Only a *refused* identity is recorded: an outage of the identity service
+    // is not the caller's doing and must not count against their address.
+    if (access.status === 401) recordAuthFailure(clientKey);
     // Fail closed: 401 for a caller we cannot identify, 503 when the server
     // cannot decide. Never a default plan.
     return response.status(access.status).json({ error: access.error, code: access.code });
   }
 
-  const admission = admitChatRequest(request);
-  if ("error" in admission) {
-    response.setHeader("Retry-After", String(admission.error.retryAfterSeconds));
+  const burst = checkUserBurst(access.userId, access.plan);
+  if (!burst.ok) {
+    response.setHeader("Retry-After", String(burst.retryAfterSeconds));
+    return response.status(429).json({
+      code: "rate_minute",
+      error: "Too many requests for your plan in a short time. Please wait a moment before trying again.",
+      plan: access.plan,
+      limit: burst.limit,
+      used: burst.used,
+      retryAfterSeconds: burst.retryAfterSeconds,
+    });
+  }
+
+  const ipNet = checkIpNet(clientKey);
+  if (!ipNet.ok) {
+    response.setHeader("Retry-After", String(ipNet.retryAfterSeconds));
+    return response.status(429).json({
+      code: "ip_rate_limited",
+      error: "Too many requests from this address. Please wait before trying again.",
+      window: ipNet.window,
+      limit: ipNet.limit,
+      used: ipNet.used,
+      retryAfterSeconds: ipNet.retryAfterSeconds,
+    });
+  }
+
+  const admission = admitConcurrency(access.userId);
+  if (!admission.ok) {
+    response.setHeader("Retry-After", String(admission.retryAfterSeconds));
     return response
-      .status(admission.error.status)
-      .json({ error: admission.error.message, code: admission.error.code });
+      .status(admission.kind === "busy" ? 503 : 429)
+      .json({
+        code: admission.kind,
+        error:
+          admission.kind === "busy"
+            ? "VEYVRO is handling many requests right now. Please retry shortly."
+            : "Too many simultaneous requests from this account. Please wait for one to finish.",
+        retryAfterSeconds: admission.retryAfterSeconds,
+      });
   }
 
   try {
@@ -667,12 +592,14 @@ async function handleChatPost(
   // Plan entitlement, decided server-side from the database — the browser only
   // sent a token.
   //
-  // Découverte has no general photo/PDF capability, but it does include the
-  // daily garage-quote analysis, and that analysis needs its document. So the
-  // attachment is allowed on that one path and refused everywhere else; the
-  // one-per-day ceiling is then applied by the quota below.
+  // The document is part of the garage-quote analysis, and of nothing else: an
+  // attachment without that task is refused above for every plan (S6 withdrew
+  // the catalogue's "photos and PDF" promise rather than shipping a capability
+  // the route does not serve). So the only plan fact that decides here is the
+  // right to run the analysis at all; the daily ceiling is applied below by the
+  // quota, which is what separates Découverte from Plus and Pro.
   const isQuoteAnalysisTask = task === "garage-quote";
-  const mayAttach = access.limits.attachments || (isQuoteAnalysisTask && access.limits.quoteAnalysis);
+  const mayAttach = isQuoteAnalysisTask && access.limits.quoteAnalysis;
   if (attachments.length > 0 && !mayAttach) {
     return response.status(403).json({
       code: "plan_required",
@@ -681,33 +608,11 @@ async function handleChatPost(
     });
   }
 
-  // Quotas, enforced on the plan read in the database.
+  // Provider configuration, decided BEFORE the quota is charged.
   //
-  // Consumed here — after every validation, just before the provider call — so a
-  // malformed request or a refused attachment never eats into the allowance.
-  //
-  // Limitation, stated plainly: these counters live in the memory of one
-  // instance, so they reset on a cold start and do not aggregate across
-  // instances. They stop loops and casual overuse; they are not a billing meter
-  // and not resistant to someone deliberately waiting out a cold start. Making
-  // them durable requires a table, i.e. a migration, which is out of scope here.
-  const quota = consumeQuota({
-    userId: access.userId,
-    plan: access.plan,
-    isQuoteAnalysis: isQuoteAnalysisTask,
-  });
-  if (!quota.ok) {
-    response.setHeader("Retry-After", String(quota.retryAfterSeconds));
-    return response.status(429).json({
-      code: quota.kind,
-      error: quota.error,
-      plan: access.plan,
-      limit: quota.limit,
-      used: quota.used,
-      retryAfterSeconds: quota.retryAfterSeconds,
-    });
-  }
-
+  // The order used to be quota-then-key, which debited one message on every 503
+  // and on every misconfigured provider. A server that cannot call the model must
+  // not spend the caller's allowance: configuration first, quota second.
   const apiKey = readEnvVar("VEYVRO_AI_API_KEY", "VEYDRIVO_AI_API_KEY", "DRIVIA_AI_API_KEY");
   if (!apiKey) {
     return response.status(503).json({
@@ -722,6 +627,98 @@ async function handleChatPost(
       code: "provider_error",
       error: "Unsupported VEYVRO_AI_PROVIDER configuration.",
     });
+  }
+
+  // ── Durable quota ───────────────────────────────────────────────────────────
+  // One identifier per message, one RPC, one SQL transaction: the ledger row and
+  // the counter move together, and a replayed identifier is a no-op instead of a
+  // second charge.
+  //
+  // The plan comes from `access` — the token verified by Supabase and the
+  // subscription row read with the service role key — never from the body, and
+  // never from the browser.
+  //
+  // No fallback to the old in-memory counters, on purpose: when the RPC cannot
+  // answer, the request fails closed with a 503 rather than granting a message
+  // the account may not own. A reset counter is a free message.
+  const rawClientMessageId =
+    typeof requestBody === "object" && requestBody !== null && "clientMessageId" in requestBody
+      ? (requestBody as { clientMessageId?: unknown }).clientMessageId
+      : undefined;
+
+  const resolvedId = resolveConsumptionId(access.userId, rawClientMessageId);
+  if (!resolvedId.ok) {
+    // A present-but-malformed identifier is refused, never replaced: generating a
+    // fresh one would turn a retry into a second consumption.
+    return response.status(400).json({
+      code: "invalid_identifier",
+      error: "The message identifier is malformed. Reload the page and send the message again.",
+    });
+  }
+  const consumptionId = resolvedId.consumptionId;
+
+  /**
+   * Give the message back when the provider never delivered anything.
+   *
+   * Best effort by contract: a refund that cannot be recorded must not change the
+   * answer the user receives, and the SQL is idempotent, so calling it twice is
+   * harmless. `refunded` keeps one request to one refund call.
+   */
+  let refunded = false;
+  const refundConsumption = async (): Promise<void> => {
+    if (refunded) return;
+    refunded = true;
+    try {
+      await refundDurableUsage({ userId: access.userId, consumptionId });
+    } catch {
+      // `refundDurableUsage` never throws; this guard only keeps a future
+      // refactor from breaking the response it was supposed to preserve.
+    }
+  };
+
+  const charge = await consumeDurableUsage({
+    userId: access.userId,
+    plan: access.plan,
+    consumptionId,
+    isQuoteAnalysis: isQuoteAnalysisTask,
+  });
+
+  if (!charge.ok) {
+    switch (charge.kind) {
+      case "daily_messages":
+      case "daily_quotes": {
+        const isMessages = charge.kind === "daily_messages";
+        response.setHeader("Retry-After", String(charge.retryAfterSeconds));
+        return response.status(429).json({
+          code: charge.kind,
+          error: isMessages
+            ? `You have reached your daily allowance of ${charge.limit} messages. It resets at midnight UTC.`
+            : `You have reached your daily allowance of ${charge.limit} garage-quote analysis. It resets at midnight UTC.`,
+          plan: access.plan,
+          limit: charge.limit,
+          used: isMessages ? charge.messages : charge.quotes,
+          retryAfterSeconds: charge.retryAfterSeconds,
+        });
+      }
+      case "duplicate":
+        // Already charged: no provider call, no second deduction.
+        return response.status(409).json({
+          code: "duplicate",
+          error: "This message was already processed. Send a new message to continue.",
+        });
+      case "conflict":
+        return response.status(409).json({
+          code: "conflict",
+          error: "This message identifier was already used by another request.",
+        });
+      default:
+        // `usageFailureStatus` is the single authority: 401, 400 or 503 — never a
+        // default plan, never an in-memory counter.
+        return response.status(usageFailureStatus(charge.kind)).json({
+          code: charge.kind,
+          error: "VEYVRO cannot check your message allowance right now. Please retry shortly.",
+        });
+    }
   }
 
   const defaultBaseUrl =
@@ -763,6 +760,8 @@ async function handleChatPost(
     if (!providerResponse.ok) {
       const errorPayload = await providerResponse.json().catch(() => null);
       const classified = classifyProviderHttpError(providerResponse.status, errorPayload);
+      // Nothing was delivered, so the message is given back.
+      await refundConsumption();
       return response.status(classified.status).json({
         code: classified.code,
         error: classified.error,
@@ -770,6 +769,7 @@ async function handleChatPost(
     }
 
     if (!providerResponse.body) {
+      await refundConsumption();
       return response.status(502).json({
         code: "provider_error",
         error: "The AI provider did not return a response stream.",
@@ -823,6 +823,9 @@ async function handleChatPost(
     }
 
     if (!didStreamText) {
+      // The stream ended without a single token: nothing was delivered, so the
+      // message is refunded before the client is told it failed.
+      await refundConsumption();
       await writeEvent(response, "error", {
         code: "empty_response",
         error: "Le fournisseur IA a renvoyé une réponse vide. / The AI provider returned an empty response.",
@@ -832,6 +835,13 @@ async function handleChatPost(
     }
 
     if (!complete && !finishReason) {
+      // The provider's stream ended without ever saying it was finished. We tell
+      // the user the answer failed, so we do not keep their message either.
+      //
+      // Note the deliberate asymmetry with the `catch` below: a throw *after*
+      // `streamStarted` may be a client that walked away, and refunding there
+      // would hand out a nearly complete answer for free on every disconnect.
+      await refundConsumption();
       await writeEvent(response, "error", {
         code: "incomplete_stream",
         error: "La réponse IA a été interrompue avant la fin. / The AI response was interrupted before completion.",
@@ -868,16 +878,20 @@ async function handleChatPost(
       return;
     }
 
-    if (controller.signal.aborted) {
-      return response.status(504).json({
-        code: "timeout",
-        error: "Le fournisseur IA a mis trop de temps à répondre. Veuillez réessayer. / The AI provider took too long to respond. Please try again.",
+      // Reaching here without `streamStarted` means the provider never delivered
+      // anything: timeout or unreachable, the message is given back.
+      if (controller.signal.aborted) {
+        await refundConsumption();
+        return response.status(504).json({
+          code: "timeout",
+          error: "Le fournisseur IA a mis trop de temps à répondre. Veuillez réessayer. / The AI provider took too long to respond. Please try again.",
+        });
+      }
+      await refundConsumption();
+      return response.status(502).json({
+        code: "provider_error",
+        error: "Le fournisseur IA est temporairement indisponible. / The AI provider is temporarily unavailable.",
       });
-    }
-    return response.status(502).json({
-      code: "provider_error",
-      error: "Le fournisseur IA est temporairement indisponible. / The AI provider is temporarily unavailable.",
-    });
   } finally {
     clearTimeout(timeoutId);
   }

@@ -6,6 +6,9 @@
  * is pure or stubbed, so no network call leaves the process.
  */
 import assert from "node:assert";
+import { readFileSync } from "node:fs";
+import { expectedAmount, getPriceId, isSandboxPriceId, resolvePaddleConfig } from "../src/lib/paddleCore.ts";
+import { describeLimits } from "../src/lib/planLimits.ts";
 import {
   ACCESS_ENV_KEYS,
   PLAN_LIMITS,
@@ -185,28 +188,35 @@ function restore() {
   assert.deepEqual(PLAN_LIMITS.decouverte, {
     messagesPerDay: 15,
     quoteAnalysesPerDay: 1,
-    attachments: false,
     quoteAnalysis: true,
     requestsPerMinute: 10,
   });
   assert.deepEqual(PLAN_LIMITS.plus, {
     messagesPerDay: 200,
     quoteAnalysesPerDay: null,
-    attachments: true,
     quoteAnalysis: true,
     requestsPerMinute: 20,
   });
   assert.deepEqual(PLAN_LIMITS.pro, {
     messagesPerDay: 600,
     quoteAnalysesPerDay: null,
-    attachments: true,
     quoteAnalysis: true,
     requestsPerMinute: 30,
   });
 
+  // No plan carries a "general photo/PDF" flag any more: the route refuses an
+  // attachment outside the quote analysis for everyone, so such a flag would
+  // describe a capability nothing exercises (the S5 finding).
+  for (const plan of ["decouverte", "plus", "pro"]) {
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(PLAN_LIMITS[plan], "attachments"),
+      `${plan} : aucune capacité photo/PDF générale n'est déclarée`,
+    );
+  }
+
   // Un plan inconnu retombe sur le plus restrictif, jamais sur un plan payant.
   assert.deepEqual(limitsFor("inconnu"), PLAN_LIMITS.decouverte);
-  pass("quotas : 15/1/sans pièce jointe, 200/illimité/pièces jointes, 600/illimité/pièces jointes (et 10/20/30 par minute)");
+  pass("quotas : 15/1, 200/illimité, 600/illimité (10/20/30 par minute), et aucune capacité photo/PDF générale déclarée");
 }
 
 {
@@ -221,17 +231,18 @@ function restore() {
     "la promesse Découverte doit rester au singulier",
   );
   assert.equal(PLAN_LIMITS.decouverte.quoteAnalysesPerDay, 1);
-  assert.equal(PLAN_LIMITS.decouverte.attachments, false);
 
-  // « Devis et factures de garage illimités » + « Analyse de photos et de PDF ».
+  // « Devis et factures de garage illimités » + les documents, rattachés à ces
+  // analyses : la promesse dit exactement ce que la route accepte.
   assert.ok(plus.features.some((feature) => /illimités/i.test(feature)));
-  assert.ok(plus.features.some((feature) => /photos et de PDF/i.test(feature)));
+  assert.ok(
+    plus.features.some((feature) => /Photos et PDF acceptés pour chaque analyse de devis/i.test(feature)),
+    "la ligne Plus rattache explicitement les photos et PDF aux analyses de devis",
+  );
   assert.equal(PLAN_LIMITS.plus.quoteAnalysesPerDay, null);
-  assert.equal(PLAN_LIMITS.plus.attachments, true);
 
   // Pro promet au moins autant que Plus.
   assert.ok(pro.features.some((feature) => /Tout VEYVRO Plus/i.test(feature)));
-  assert.equal(PLAN_LIMITS.pro.attachments, true);
   assert.ok(PLAN_LIMITS.pro.messagesPerDay > PLAN_LIMITS.plus.messagesPerDay);
   assert.ok(PLAN_LIMITS.plus.messagesPerDay > PLAN_LIMITS.decouverte.messagesPerDay);
 
@@ -240,7 +251,93 @@ function restore() {
     !decouverte.features.some((feature) => /illimités|photos et de PDF/i.test(feature)),
     "le gratuit ne doit annoncer ni illimité ni analyse de photos",
   );
-  pass("promesses ↔ quotas : chaque ligne du catalogue correspond à une limite réellement appliquée");
+
+  // The withdrawn promise must not come back: no catalogue line may announce a
+  // general photo/PDF analysis. This is the S6 regression guard — a "photos et
+  // PDF" line is only allowed when it names the quote analysis.
+  for (const plan of PRICING_PLANS) {
+    for (const feature of plan.features) {
+      if (!/photos? et (de )?PDF/i.test(feature)) continue;
+      assert.match(
+        feature,
+        /analyse de devis|devis/i,
+        `${plan.id} : « ${feature} » promet des photos/PDF sans les rattacher à l'analyse de devis`,
+      );
+    }
+  }
+
+  // The same rule for the client copy: an error message may not re-introduce the
+  // withdrawn promise. Any "photos et PDF" wording in the interface has to name
+  // the garage-quote analysis it belongs to.
+  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  for (const line of app.split("\n")) {
+    if (!/photos? et (de )?PDF/i.test(line)) continue;
+    assert.match(
+      line,
+      /devis/i,
+      `message client sans mention du devis : ${line.trim().slice(0, 120)}`,
+    );
+  }
+
+  pass("promesses ↔ quotas : le catalogue décrit exactement ce que la route accepte, et ne promet plus de photos/PDF générales");
+}
+
+{
+  // Tarifs : le prix affiché, le prix envoyé à Paddle et la formule vendue
+  // doivent désigner la même chose. Un tarif modifié dans le catalogue sans
+  // prix Paddle correspondant, c'est un bouton qui ne peut pas aboutir — ou
+  // pire, un montant annoncé qui n'est pas celui débité.
+  const tariff = new Map(PRICING_PLANS.map((plan) => [plan.id, plan]));
+
+  assert.deepEqual(
+    [...tariff.keys()].sort(),
+    Object.keys(PLAN_LIMITS).sort(),
+    "chaque formule tarifée doit avoir sa ligne de limites, et réciproquement",
+  );
+  assert.equal(tariff.get("decouverte").monthly, 0, "Découverte reste gratuite");
+  assert.equal(tariff.get("decouverte").yearly, 0);
+  assert.equal(tariff.get("plus").monthly, 7);
+  assert.equal(tariff.get("plus").yearly, 59);
+  assert.equal(tariff.get("pro").monthly, 15);
+  assert.equal(tariff.get("pro").yearly, 129);
+
+  // Chaque formule payante et chaque périodicité a un identifiant de prix, et
+  // l'aller-retour prix → formule est bijectif (le webhook et le changement de
+  // formule partagent cette table).
+  for (const plan of ["plus", "pro"]) {
+    for (const interval of ["month", "year"]) {
+      // `resolvePaddleConfig` with no environment returns the built-in Sandbox
+      // catalogue — exactly what a deployment without price variables sends to
+      // Paddle, and exactly what the webhook must recognise in return.
+      const priceId = getPriceId(resolvePaddleConfig({}), plan, interval);
+      assert.ok(priceId, `${plan}/${interval} doit avoir un identifiant de prix`);
+      assert.equal(isSandboxPriceId(priceId), true, `${plan}/${interval} : l'identifiant par défaut est celui du bac à sable`);
+      assert.equal(expectedAmount(plan, interval), interval === "month" ? tariff.get(plan).monthly : tariff.get(plan).yearly);
+    }
+  }
+
+  // La phrase de quota affichée est générée depuis la table appliquée : elle ne
+  // peut donc pas promettre autre chose que ce que le handler refuse.
+  assert.match(describeLimits("decouverte"), /15 messages par jour/);
+  assert.match(describeLimits("decouverte"), /1 analyse de devis par jour/);
+  // The sentence names where the document is accepted, on every plan: no plan
+  // renders "photos et PDF acceptés" as a standalone capability any more.
+  for (const plan of ["decouverte", "plus", "pro"]) {
+    assert.match(
+      describeLimits(plan),
+      /document joint accepté pour l'analyse de devis/,
+      `${plan} : la phrase de quota rattache le document à l'analyse de devis`,
+    );
+    assert.ok(
+      !/photos et PDF acceptés/i.test(describeLimits(plan)),
+      `${plan} : plus aucune promesse générale de photos/PDF dans la phrase affichée`,
+    );
+  }
+  assert.match(describeLimits("plus"), /200 messages par jour/);
+  assert.match(describeLimits("plus"), /analyses de devis illimitées/);
+  assert.match(describeLimits("pro"), /600 messages par jour/);
+
+  pass("tarifs ↔ quotas : 0/7/59 et 0/15/129, un prix par formule et périodicité, phrases de quota générées");
 }
 
 // ---------------------------------------------------------------------------
