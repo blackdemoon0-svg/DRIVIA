@@ -283,6 +283,40 @@ function restore() {
 }
 
 {
+  // Quatre lignes retirées du catalogue Pro avant lancement :
+  // « Comparatifs détaillés et rapports exportables », « Vérification d'occasion
+  // guidée, étape par étape » et « Réponses prioritaires ». Aucune n'existe
+  // dans le produit — `access.plan` ne change que le quota de messages et la
+  // rafale par minute — et elles sont reportées. Une ligne ne doit pas revenir
+  // avant que la route qui la sert existe.
+  const withdrawn = [/comparatif/i, /exportable/i, /v[ée]rification d'occasion/i, /guid[ée]e/i, /prioritaire/i];
+  for (const plan of PRICING_PLANS) {
+    for (const feature of plan.features) {
+      for (const pattern of withdrawn) {
+        assert.ok(
+          !pattern.test(feature),
+          `${plan.id} : « ${feature} » présente comme disponible une fonctionnalité reportée`,
+        );
+      }
+    }
+  }
+
+  // Contrepartie : Pro garde son prix, son quota et son seul avantage réel.
+  const pro = PRICING_PLANS.find((plan) => plan.id === "pro");
+  assert.deepEqual(
+    pro.features,
+    ["Tout VEYVRO Plus"],
+    "Pro n'annonce plus que ce qu'il tient : tout Plus",
+  );
+  assert.equal(pro.monthly, 15, "Pro reste à 15 $/mois");
+  assert.equal(pro.yearly, 129, "Pro reste à 129 $/an");
+  assert.equal(PLAN_LIMITS.pro.messagesPerDay, 600, "et à 600 messages par jour");
+  assert.equal(PLAN_LIMITS.pro.requestsPerMinute, 30, "avec 30 requêtes par minute");
+
+  pass("catalogue Pro : les quatre promesses reportées ne peuvent plus revenir ; prix, quota et avantage réel inchangés");
+}
+
+{
   // Tarifs : le prix affiché, le prix envoyé à Paddle et la formule vendue
   // doivent désigner la même chose. Un tarif modifié dans le catalogue sans
   // prix Paddle correspondant, c'est un bouton qui ne peut pas aboutir — ou

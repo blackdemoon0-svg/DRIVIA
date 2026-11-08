@@ -156,9 +156,18 @@ export const PRICING_PLANS: readonly PricingPlan[] = [
     yearly: 129,
     features: [
       "Tout VEYVRO Plus",
-      "Comparatifs détaillés et rapports exportables",
-      "Vérification d'occasion guidée, étape par étape",
-      "Réponses prioritaires",
+      // Three lines were withdrawn before launch: "Comparatifs détaillés et
+      // rapports exportables", "Vérification d'occasion guidée, étape par
+      // étape" and "Réponses prioritaires". None of the four existed anywhere
+      // in the product: `access.plan` only changes the daily message allowance
+      // and the per-minute burst, so the card advertised capabilities no route
+      // served. They are postponed, not cancelled: the day one ships, its line
+      // returns here together with a test proving the route serves it.
+      //
+      // What Pro adds today is a larger allowance — 600 messages a day against
+      // Plus's 200, 30 requests a minute against 20. That difference is
+      // rendered from `describeLimits()`, the same table the server enforces,
+      // so the card cannot drift from the quota.
     ],
     cta: "Choisir VEYVRO Pro",
   },
