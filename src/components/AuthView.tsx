@@ -434,9 +434,6 @@ export function AccountView({ user, onGoToPricing, onSignedOut }: AccountViewPro
               Passer à VEYVRO Pro
             </button>
           )}
-          <button type="button" className="pricing-cta secondary" onClick={onGoToPricing}>
-            {summary ? "Voir les formules" : "Découvrir les formules"}
-          </button>
           <button
             type="button"
             className="pricing-verify-button"
