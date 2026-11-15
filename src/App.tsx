@@ -929,14 +929,6 @@ export default function App() {
           >
             Battle
           </button>
-          <button
-            type="button"
-            className={view === "pricing" ? "nav-link active" : "nav-link"}
-            aria-current={view === "pricing" ? "page" : undefined}
-            onClick={() => setView("pricing")}
-          >
-            Tarifs
-          </button>
           <button type="button" className="nav-link" onClick={() => setAboutOpen(true)}>
             About
           </button>
