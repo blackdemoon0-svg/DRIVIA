@@ -32,5 +32,11 @@
       "destination": "/veyvro-mark.svg",
       "permanent": true
     }
+  ],
+  "rewrites": [
+    {
+      "source": "/img-gen/:path*",
+      "destination": "https://image.pollinations.ai/:path*"
+    }
   ]
 }
