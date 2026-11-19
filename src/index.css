@@ -70,7 +70,7 @@ a { color: inherit; }
    SCÈNE IMMERSIVE
    ============================================================ */
 .scene {
-  position: fixed; inset: 0; z-index: 0; overflow: hidden;
+  position: absolute; inset: 0; z-index: 0; overflow: hidden;
   background: var(--bg); pointer-events: none;
 }
 .scene-parallax { position: absolute; inset: -24px; will-change: transform; }
@@ -103,7 +103,7 @@ a { color: inherit; }
 /* Brume volumétrique */
 .scene-mist {
   position: absolute; left: -20%; right: -20%; height: 34%;
-  bottom: calc(var(--cars-h) - 60px);
+  bottom: calc(var(--cars-stage-h) + var(--cars-safe-bottom) - 60px);
   background: radial-gradient(60% 100% at 50% 100%, rgb(calc(150 + 60 * var(--p)) calc(120 + 80 * var(--p)) calc(200 - 100 * var(--p)) / 0.16), transparent 70%);
   filter: blur(28px);
   opacity: 0.8;
@@ -156,20 +156,21 @@ a { color: inherit; }
    ============================================================ */
 .scene-cars {
   position: absolute; left: var(--sidebar-w); right: 0; bottom: 0;
-  height: var(--cars-h);
+  height: var(--cars-band-h);
   display: flex; align-items: flex-end; justify-content: center;
   gap: clamp(8px, 3vw, 56px);
-  padding: 0 clamp(12px, 4vw, 64px);
+  padding: 0 clamp(12px, 4vw, 64px) var(--cars-safe-bottom);
+  overflow: hidden;
   z-index: 2;
 }
 .car {
-  margin: 0; position: relative;
+  margin: 0; position: relative; min-width: 0;
   width: clamp(168px, 22vw, 306px);
   animation: car-float 7s ease-in-out infinite;
   animation-delay: calc(var(--car-index) * 1.4s);
 }
 .car-center { width: clamp(184px, 24vw, 332px); z-index: 3; }
-.car-svg { width: 100%; height: auto; display: block; overflow: visible; }
+.car-svg { width: 100%; height: auto; max-height: var(--cars-stage-h); display: block; overflow: visible; }
 .car-label {
   position: absolute; bottom: -2px; left: 50%; transform: translateX(-50%);
   font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase;
@@ -252,12 +253,23 @@ a { color: inherit; }
 /* ============================================================
    STRUCTURE DE L'APPLICATION
    ============================================================ */
-.app-shell { position: relative; height: 100%; z-index: 1; }
+.app-shell {
+  /* Une réserve commune à la scène et au contenu. Sur une fenêtre basse,
+     les SVG rétrécissent sans rogner les voitures ni leur animation. */
+  --viewport-h: 100vh;
+  --cars-stage-h: clamp(24px, var(--viewport-h) * 0.4 - 80px, var(--cars-h));
+  --cars-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --cars-band-h: calc(var(--cars-stage-h) + 12px + var(--cars-safe-bottom));
+  position: relative; height: var(--viewport-h); z-index: 1;
+}
+@supports (height: 100dvh) {
+  .app-shell { --viewport-h: 100dvh; }
+}
 .app-main {
   position: relative; margin-left: var(--sidebar-w); height: 100%;
   display: flex; flex-direction: column; z-index: 1;
-  /* Réserve la zone des véhicules : le contenu ne chevauche jamais les voitures. */
-  padding-bottom: var(--cars-h);
+  /* La réserve inclut aussi le flottement et la lueur des phares. */
+  padding-bottom: var(--cars-band-h);
 }
 .app-content {
   flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
@@ -463,11 +475,27 @@ a { color: inherit; }
    ACCUEIL
    ============================================================ */
 .home-view {
-  min-height: 100%; display: flex; flex-direction: column; align-items: center;
-  justify-content: center;
-  padding: clamp(14px, 3vh, 32px) clamp(16px, 4vw, 40px) 18px;
-  gap: clamp(14px, 2.6vh, 26px);
+  --home-gutter: max(clamp(16px, 4vw, 40px), env(safe-area-inset-left, 0px), env(safe-area-inset-right, 0px));
+  --home-gap: clamp(14px, 2.6vh, 26px);
+  --home-prompts-gap: 18px;
+  --home-scroll-min: 24px;
+  flex: 1; min-height: 0; display: grid;
+  /* La saisie ne se comprime pas : les cartes et les suggestions défilent
+     dans leurs propres rangées quand la hauteur disponible diminue. */
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(var(--home-scroll-min), max-content) auto
+    minmax(calc(var(--home-scroll-min) + var(--home-prompts-gap)), max-content);
+  align-content: center;
+  align-content: safe center;
+  padding-block: clamp(14px, 3vh, 32px) 18px;
+  overflow: hidden auto;
 }
+.home-intro {
+  display: flex; flex-direction: column; align-items: center; gap: var(--home-gap);
+  padding: 0 var(--home-gutter) 6px;
+  min-height: 0; overflow: hidden auto;
+}
+.home-intro > * { flex-shrink: 0; }
 .home-hero { text-align: center; max-width: 720px; }
 .eyebrow {
   display: inline-flex; align-items: center; gap: 8px;
@@ -511,8 +539,23 @@ a { color: inherit; }
 .action-card-arrow { position: absolute; right: 16px; bottom: 16px; color: var(--text-3); opacity: 0; transition: all 0.25s; }
 .action-card:hover .action-card-arrow { opacity: 1; color: var(--accent-2); transform: translate(2px, -2px); }
 
-.home-composer { width: 100%; max-width: 780px; display: flex; flex-direction: column; gap: 18px; }
-.quick-prompts { display: flex; flex-direction: column; gap: 10px; align-items: center; }
+.home-composer, .quick-prompts {
+  width: min(780px, 100% - 2 * var(--home-gutter)); justify-self: center;
+}
+.home-composer { margin-top: var(--home-gap); position: relative; z-index: 1; }
+.home-composer .composer-input {
+  max-height: clamp(32px, var(--viewport-h) * 0.5 - 128px, 160px);
+}
+/* Le menu s'ouvre vers le haut : ses outils restent accessibles par défilement
+   s'il n'y a pas la place de tous les afficher au-dessus du bouton. */
+.home-composer .tools-menu {
+  max-height: max(68px, var(--viewport-h) * 0.38 - 50px);
+  overflow-y: auto;
+}
+.quick-prompts {
+  display: flex; flex-direction: column; gap: 10px; align-items: center;
+  margin-top: var(--home-prompts-gap); min-height: 0; overflow: hidden auto;
+}
 .quick-prompts-label { font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--text-3); }
 .quick-prompts-list { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
 .quick-prompt {
@@ -880,7 +923,7 @@ a { color: inherit; }
   .app-main { margin-left: 0; }
   .topbar-menu { display: grid; place-items: center; }
   .topbar-brand { display: inline-flex; }
-  .scene-cars { left: 0; padding: 0 8px; gap: 4px; }
+  .scene-cars { left: 0; padding-inline: 8px; gap: 4px; }
   .car { width: clamp(120px, 30vw, 200px); }
   .car-center { width: clamp(130px, 32vw, 220px); }
   .car-label { font-size: 8px; }
@@ -900,11 +943,7 @@ a { color: inherit; }
 
 @media (max-width: 560px) {
   :root { --cars-h: 118px; --topbar-h: 56px; }
-  /* Les cartes empilées peuvent dépasser la hauteur de l'écran. Le centrage
-     vertical (`justify-content: center` hérité) poussait alors le logo et le
-     titre AU-DESSUS de la zone visible, sous la barre supérieure. On aligne
-     en haut pour que rien ne soit jamais coupé ; le défilement reste naturel. */
-  .home-view { padding-top: 16px; gap: 18px; justify-content: flex-start; }
+  .home-view { --home-gap: 18px; padding-top: 16px; align-content: start; }
   .scene-logo-text { font-size: 34px; }
   .scene-logo-mark { width: 32px; height: 32px; }
   .home-description { font-size: 13.5px; }
@@ -915,6 +954,7 @@ a { color: inherit; }
      lignes. Masqué pour rendre toute la largeur au titre (aucune information
      perdue : les cartes sont déjà numérotées 01, 02, 03). */
   .home-actions-count { display: none; }
+  .quick-prompts-list { --quick-columns: 2; }
   .conversation-inner { gap: 16px; }
   .message-content { font-size: 14px; padding: 12px 14px; }
   .page-view { padding-top: 20px; }
@@ -927,6 +967,38 @@ a { color: inherit; }
   .battle-value { font-size: 12.5px; }
   .battle-car-name { font-size: 12.5px; }
   .profile-card, .auth-card { padding: 22px 18px; }
+}
+
+@media (max-width: 350px) {
+  .home-composer .composer-input::placeholder { font-size: 14px; }
+}
+
+/* En hauteur réduite, resserrer les espacements sans changer l'ordre du contenu. */
+@media (max-width: 560px), (max-height: 820px) {
+  .quick-prompts-list {
+    width: 100%; display: grid; grid-template-columns: repeat(var(--quick-columns, 4), minmax(0, 1fr));
+  }
+  .quick-prompt { justify-content: center; }
+  .quick-prompt svg { flex-shrink: 0; }
+}
+@media (max-height: 820px) {
+  .home-view {
+    --home-gap: clamp(6px, 1.8vh, 18px);
+    --home-prompts-gap: clamp(6px, 2vh, 12px);
+    padding-block: var(--home-prompts-gap);
+  }
+  .home-hero .eyebrow { margin-bottom: 6px; }
+  .home-hero .scene-logo { padding-block: 0; }
+  .quick-prompt { padding: 6px 8px; }
+}
+@media (max-height: 680px) and (min-width: 561px) {
+  .home-hero .scene-logo-text { font-size: clamp(32px, 6.8vh, 46px); }
+  .home-hero .scene-logo-mark { width: 36px; height: 36px; }
+}
+@media (max-height: 300px) {
+  .home-view { --home-scroll-min: 16px; }
+  .home-composer .composer-inner { padding-block: 8px 6px; }
+  .home-composer .composer-bar { margin-top: 4px; }
 }
 
 /* --- Garde anti-débordement horizontal --------------------------------
