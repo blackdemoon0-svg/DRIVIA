@@ -13,6 +13,7 @@ import { AuthProvider } from './lib/auth'
 import { SceneProvider } from './lib/scene'
 import './index.css'
 import './styles/smart.css'
+import './styles/avatar.css'
 
 const container = document.getElementById('root')
 if (!container) throw new Error('Élément #root introuvable dans index.html')
