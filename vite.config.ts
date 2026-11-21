@@ -16,4 +16,12 @@ export default defineConfig({
       "@": path.resolve(__dirname, "src"),
     },
   },
+  // Le serveur de développement est consulté à travers le proxy d'aperçu
+  // (domaine *.e2b.app). Vite refuse par défaut les hôtes inconnus avec un 403,
+  // ce qui empêcherait l'aperçu de s'afficher. Réglage de développement
+  // uniquement : le build de production n'est pas concerné.
+  server: {
+    host: "0.0.0.0",
+    allowedHosts: true,
+  },
 });

@@ -1,0 +1,464 @@
+/* ============================================================
+   VEYVRO — Photos de profil
+   Avatar rond partagé (Topbar, Sidebar, Profil) + dialogues
+   Gallery / Camera / aperçu / suppression.
+   Même palette que l'Édition Hiver : violet, magenta, surfaces vitrées.
+   ============================================================ */
+
+.avatar {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  overflow: hidden;
+  border-radius: 50%;
+}
+
+.avatar > img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+/* Une photo réelle remplace complètement le dégradé de secours. */
+.avatar.has-photo {
+  background: rgba(8, 6, 14, 0.7);
+}
+
+.avatar-initial {
+  display: block;
+  line-height: 1;
+}
+
+/* ---------- Page Profil ---------- */
+
+.profile-photo {
+  position: relative;
+  flex-shrink: 0;
+  margin: 4px 2px 4px 0;
+}
+
+.profile-avatar-button {
+  position: relative;
+  display: block;
+  padding: 0;
+  border: none;
+  background: none;
+  border-radius: 50%;
+  line-height: 0;
+}
+
+.profile-avatar-button:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 4px;
+}
+
+.profile-avatar-lg {
+  width: 88px;
+  height: 88px;
+  font-size: 34px;
+}
+
+.profile-avatar-button .profile-avatar {
+  transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
+
+.profile-avatar-button:hover .profile-avatar {
+  transform: scale(1.03);
+  box-shadow: 0 0 32px rgba(168, 85, 247, 0.55);
+}
+
+.profile-avatar-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border-radius: 50%;
+  background: rgba(7, 6, 13, 0.64);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.15;
+  text-align: center;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+}
+
+.profile-avatar-button:hover .profile-avatar-overlay,
+.profile-avatar-button:focus-visible .profile-avatar-overlay {
+  opacity: 1;
+}
+
+/* Sur écran tactile, le survol n'existe pas : le badge appareil photo reste
+   visible, l'infobulle plein écran est inutile. */
+@media (hover: none) {
+  .profile-avatar-overlay { display: none; }
+}
+
+.profile-avatar-badge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 2px solid var(--bg-2);
+  background: linear-gradient(135deg, var(--accent), var(--accent-3));
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+
+.profile-identity-copy {
+  min-width: 0;
+}
+
+.profile-identity-copy p {
+  overflow-wrap: anywhere;
+}
+
+.profile-photo-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  margin-top: 10px;
+}
+
+.profile-photo-empty strong {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.profile-photo-upload {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 0;
+  background: none;
+  border: none;
+  border-bottom: 1px solid transparent;
+  color: var(--accent-2);
+  font-size: 13.5px;
+  font-weight: 600;
+  transition: border-color 0.2s ease, color 0.2s ease;
+}
+
+.profile-photo-upload:hover {
+  color: var(--text);
+  border-bottom-color: currentColor;
+}
+
+.profile-photo-upload:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.profile-photo-hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.profile-photo-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.profile-photo-actions .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 0;
+}
+
+.profile-photo-actions .text-button.is-danger {
+  color: #fda4af;
+}
+
+.profile-photo-actions .text-button.is-danger:hover {
+  color: #fecdd3;
+}
+
+.profile-photo-sep {
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.profile-photo-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 20px;
+}
+
+/* ---------- Dialogue photo ---------- */
+
+.avatar-dialog {
+  max-width: 480px;
+}
+
+.avatar-source-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.avatar-source-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 22px 14px;
+  text-align: center;
+  color: var(--text);
+  background: rgba(8, 6, 14, 0.55);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease;
+}
+
+.avatar-source-card:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: rgba(168, 85, 247, 0.12);
+  transform: translateY(-2px);
+}
+
+.avatar-source-card:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 3px;
+}
+
+.avatar-source-card:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.avatar-source-icon {
+  width: 52px;
+  height: 52px;
+  margin-bottom: 4px;
+  display: grid;
+  place-items: center;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: rgba(168, 85, 247, 0.16);
+  color: var(--accent-2);
+}
+
+.avatar-source-card strong {
+  font-size: 14.5px;
+  font-weight: 600;
+}
+
+.avatar-source-card small {
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+
+.avatar-dialog .auth-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.avatar-dialog .auth-notice svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.avatar-cancel {
+  display: block;
+  margin: 16px auto 0;
+  color: var(--text-2);
+}
+
+.avatar-cancel:hover {
+  color: var(--text);
+}
+
+.avatar-preview {
+  width: min(220px, 62vw);
+  aspect-ratio: 1;
+  margin: 0 auto 14px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: rgba(8, 6, 14, 0.7);
+  box-shadow: 0 0 32px rgba(168, 85, 247, 0.35);
+  font-size: 56px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.avatar-preview img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.avatar-preview.is-broken {
+  border-color: rgba(244, 63, 94, 0.45);
+  box-shadow: none;
+}
+
+.avatar-preview-fallback {
+  background: linear-gradient(135deg, var(--accent), var(--accent-3));
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+.avatar-preview-meta {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--text-3);
+  min-width: 0;
+}
+
+.avatar-preview-name {
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.avatar-preview-actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 6px;
+}
+
+.avatar-preview-actions .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.avatar-remove-preview {
+  width: 96px;
+  height: 96px;
+  margin: 0 auto;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: linear-gradient(135deg, var(--accent), var(--accent-3));
+  color: #fff;
+  font-size: 34px;
+  font-weight: 700;
+  box-shadow: 0 0 24px rgba(168, 85, 247, 0.4);
+}
+
+.avatar-remove-preview img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.avatar-danger-button {
+  background: linear-gradient(135deg, #f43f5e, #b91c1c);
+  box-shadow: 0 0 18px rgba(244, 63, 94, 0.4);
+}
+
+.avatar-danger-button:hover:not(:disabled) {
+  box-shadow: 0 0 26px rgba(244, 63, 94, 0.6);
+}
+
+/* ---------- Responsive ---------- */
+
+@media (max-width: 560px) {
+  .avatar-dialog {
+    padding: 26px 18px;
+  }
+
+  .profile-avatar-lg {
+    width: 76px;
+    height: 76px;
+    font-size: 30px;
+  }
+
+  .profile-avatar-badge {
+    width: 25px;
+    height: 25px;
+  }
+
+  .profile-identity {
+    gap: 14px;
+  }
+
+  .avatar-source-grid {
+    gap: 10px;
+  }
+
+  .avatar-source-card {
+    padding: 18px 10px;
+  }
+
+  .avatar-preview {
+    width: min(190px, 58vw);
+    font-size: 46px;
+  }
+
+  .avatar-dialog .dialog-actions {
+    flex-direction: column-reverse;
+  }
+
+  .avatar-dialog .dialog-actions > button {
+    width: 100%;
+  }
+
+  .avatar-preview-meta {
+    flex-wrap: wrap;
+  }
+
+  .avatar-preview-name {
+    max-width: 100%;
+  }
+}
+
+@media (max-width: 380px) {
+  .avatar-source-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .avatar-source-card {
+    flex-direction: row;
+    text-align: left;
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .avatar-source-icon {
+    width: 44px;
+    height: 44px;
+    margin-bottom: 0;
+  }
+
+  .avatar-source-card small {
+    display: none;
+  }
+}

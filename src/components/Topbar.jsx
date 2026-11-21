@@ -1,11 +1,14 @@
 import { useScene } from '../lib/scene'
 import { useAuth } from '../lib/auth'
+import { useAvatar } from '../lib/useAvatar'
 import { MenuIcon, MoonIcon, SnowIcon, ReplayIcon, InfoIcon, UserIcon, BrandMark } from './Icons'
+import Avatar from './Avatar'
 
 // Barre supérieure : menu mobile, indicateur d'ambiance, rejouer, à propos, compte.
 export default function Topbar({ onMenu, onAbout, onProfile, view }) {
   const { phase, replay, reducedMotion } = useScene()
   const { user, isDemo } = useAuth()
+  const { avatarUrl } = useAvatar()
   const phaseLabel = phase === 'halloween' ? 'Halloween' : phase === 'noel' ? 'Noël' : 'Transition'
 
   return (
@@ -32,7 +35,15 @@ export default function Topbar({ onMenu, onAbout, onProfile, view }) {
           <InfoIcon size={17} />
         </button>
         <button type="button" className="topbar-profile" onClick={onProfile} aria-label="Profil">
-          {user ? <span className="topbar-avatar">{(user.email?.[0] ?? '?').toUpperCase()}</span> : <UserIcon size={18} />}
+          {user ? (
+            <Avatar
+              url={avatarUrl}
+              initial={(user.email?.[0] ?? '?').toUpperCase()}
+              className="topbar-avatar"
+            />
+          ) : (
+            <UserIcon size={18} />
+          )}
         </button>
       </div>
     </header>

@@ -70,6 +70,20 @@ export const ZoomIcon = (p) => (
 )
 export const DownloadIcon = (p) => (<Svg {...p}><path d="M12 3v12M7 11l5 5 5-5M4 20h16" /></Svg>)
 export const RefreshIcon = (p) => (<Svg {...p}><path d="M20.5 12a8.5 8.5 0 1 1-2.9-6.4" /><path d="M21 4v5h-5" /></Svg>)
+export const CameraIcon = (p) => (
+  <Svg {...p}>
+    <path d="M4.5 8.5h2.2l1.5-2.2h7.6l1.5 2.2h2.2a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18v-8a1.5 1.5 0 0 1 1.5-1.5Z" />
+    <circle cx="12" cy="13.6" r="3.4" />
+  </Svg>
+)
+export const GalleryIcon = (p) => (
+  <Svg {...p}>
+    <rect x="3" y="4.5" width="18" height="15" rx="2.6" />
+    <circle cx="8.5" cy="9.8" r="1.6" />
+    <path d="m4.5 17.5 4.3-4.3 3.1 3.1 2.3-2.3 3.6 3.5" />
+  </Svg>
+)
+export const UploadIcon = (p) => (<Svg {...p}><path d="M12 16V4M7.5 8.5 12 4l4.5 4.5" /><path d="M4 17v2a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2" /></Svg>)
 
 export function BrandMark({ size = 28 }) {
   return (

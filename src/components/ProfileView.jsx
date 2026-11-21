@@ -1,5 +1,19 @@
+import { useState } from 'react'
 import { useAuth, useAuthActions } from '../lib/auth'
-import { UserIcon, MailIcon, ShieldIcon, LogoutIcon, CheckIcon, ConversationsIcon } from './Icons'
+import { useAvatar } from '../lib/useAvatar'
+import {
+  UserIcon,
+  MailIcon,
+  ShieldIcon,
+  LogoutIcon,
+  CheckIcon,
+  ConversationsIcon,
+  CameraIcon,
+  UploadIcon,
+  TrashIcon,
+} from './Icons'
+import Avatar from './Avatar'
+import ProfilePhotoDialog from './ProfilePhotoDialog'
 
 // Profil utilisateur — identité et compte.
 // VEYVRO est entièrement gratuit : aucun tarif, aucun abonnement, aucun bouton de
@@ -8,6 +22,21 @@ import { UserIcon, MailIcon, ShieldIcon, LogoutIcon, CheckIcon, ConversationsIco
 export default function ProfileView({ onSignIn, conversationCount }) {
   const { user, status } = useAuth()
   const { busy, signOut } = useAuthActions()
+  const { hasAvatar, avatarUrl } = useAvatar()
+  const [photoDialog, setPhotoDialog] = useState(null)
+  const [notice, setNotice] = useState(null)
+
+  const openPhotoDialog = (mode) => {
+    setNotice(null)
+    setPhotoDialog(mode)
+  }
+
+  const closePhotoDialog = () => setPhotoDialog(null)
+
+  const handlePhotoDone = (message) => {
+    setPhotoDialog(null)
+    setNotice(message)
+  }
 
   if (status === 'loading') {
     return <div className="page-view"><div className="empty-state"><p>Vérification de votre session…</p></div></div>
@@ -43,12 +72,66 @@ export default function ProfileView({ onSignIn, conversationCount }) {
 
       <div className="profile-card">
         <div className="profile-identity">
-          <span className="profile-avatar">{initial}</span>
-          <div>
+          <div className="profile-photo">
+            <button
+              type="button"
+              className="profile-avatar-button"
+              onClick={() => openPhotoDialog('pick')}
+              aria-label={hasAvatar ? 'Changer la photo de profil' : 'Ajouter une photo de profil'}
+            >
+              <Avatar
+                url={avatarUrl}
+                initial={initial}
+                className="profile-avatar profile-avatar-lg"
+                alt="Votre photo de profil"
+              />
+              <span className="profile-avatar-overlay" aria-hidden="true">
+                <CameraIcon size={19} />
+                <span>{hasAvatar ? 'Changer' : 'Ajouter'}</span>
+              </span>
+              <span className="profile-avatar-badge" aria-hidden="true">
+                <CameraIcon size={14} />
+              </span>
+            </button>
+          </div>
+
+          <div className="profile-identity-copy">
             <h2>{user.email?.split('@')[0]}</h2>
             <p>{user.email}</p>
+
+            {hasAvatar ? (
+              <div className="profile-photo-actions">
+                <button type="button" className="text-button" onClick={() => openPhotoDialog('pick')}>
+                  <CameraIcon size={14} /> Changer la photo
+                </button>
+                <span className="profile-photo-sep" aria-hidden="true">·</span>
+                <button
+                  type="button"
+                  className="text-button is-danger"
+                  onClick={() => openPhotoDialog('remove')}
+                >
+                  <TrashIcon size={14} /> Supprimer
+                </button>
+              </div>
+            ) : (
+              <div className="profile-photo-empty">
+                <strong>Add a profile pic</strong>
+                <button type="button" className="profile-photo-upload" onClick={() => openPhotoDialog('pick')}>
+                  <UploadIcon size={15} /> Upload your photo
+                </button>
+                <span className="profile-photo-hint">JPG, PNG ou WEBP · 5 Mo max</span>
+              </div>
+            )}
           </div>
         </div>
+
+        {notice && (
+          <div className="auth-notice is-success profile-photo-notice" role="status">
+            <CheckIcon size={14} />
+            <span>{notice}</span>
+          </div>
+        )}
+
         <dl className="profile-rows">
           <div className="profile-row">
             <dt><MailIcon size={16} /> Adresse e-mail</dt>
@@ -73,6 +156,17 @@ export default function ProfileView({ onSignIn, conversationCount }) {
           <LogoutIcon size={16} /> {busy ? 'Déconnexion…' : 'Se déconnecter'}
         </button>
       </div>
+
+      {photoDialog && (
+        <ProfilePhotoDialog
+          key={photoDialog}
+          mode={photoDialog}
+          currentUrl={avatarUrl}
+          initial={initial}
+          onClose={closePhotoDialog}
+          onDone={handlePhotoDone}
+        />
+      )}
     </div>
   )
 }

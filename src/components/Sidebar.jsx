@@ -1,5 +1,7 @@
 import { BrandMark, ChatIcon, ConversationsIcon, SettingsIcon, HelpIcon, UserIcon, BattleIcon, PlusIcon, CloseIcon, SparklesIcon } from './Icons'
 import { useAuth } from '../lib/auth'
+import { useAvatar } from '../lib/useAvatar'
+import Avatar from './Avatar'
 
 // Barre latérale sombre et élégante. Navigation demandée : Chat, Mes conversations,
 // Paramètres, Aide et Support, Profil. Aucun élément d'abonnement / offre commerciale.
@@ -13,6 +15,7 @@ const NAV = [
 
 export default function Sidebar({ view, onNavigate, onNewChat, open, onClose }) {
   const { user } = useAuth()
+  const { avatarUrl } = useAvatar()
   const initial = (user?.email?.[0] ?? '?').toUpperCase()
 
   return (
@@ -62,7 +65,11 @@ export default function Sidebar({ view, onNavigate, onNewChat, open, onClose }) 
             onClick={() => onNavigate('profile')}
             aria-current={view === 'profile' ? 'page' : undefined}
           >
-            <span className="sidebar-avatar">{user ? initial : <UserIcon size={17} />}</span>
+            {user ? (
+              <Avatar url={avatarUrl} initial={initial} className="sidebar-avatar" />
+            ) : (
+              <span className="sidebar-avatar"><UserIcon size={17} /></span>
+            )}
             <span className="sidebar-profile-meta">
               <span className="sidebar-profile-name">{user ? user.email?.split('@')[0] : 'Invité'}</span>
               <span className="sidebar-profile-sub">{user ? 'Profil utilisateur' : 'Se connecter'}</span>
