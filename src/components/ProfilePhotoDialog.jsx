@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useAvatar } from '../lib/useAvatar'
 import { formatAvatarSize, validateAvatarFile } from '../lib/avatar'
 import {
@@ -93,7 +94,7 @@ export default function ProfilePhotoDialog({ mode = 'pick', currentUrl, initial 
     if (result?.ok) onDone('Photo de profil supprimée.')
   }
 
-  return (
+  const dialog = (
     <div className="dialog-backdrop" onMouseDown={() => !busy && onClose()}>
       <section
         className="dialog avatar-dialog"
@@ -276,4 +277,9 @@ export default function ProfilePhotoDialog({ mode = 'pick', currentUrl, initial 
       </section>
     </div>
   )
+
+  // Portail vers <body> : le dialogue doit passer au-dessus de la Sidebar et de
+  // la Topbar, comme les autres dialogues de l'application.
+  if (typeof document === 'undefined') return dialog
+  return createPortal(dialog, document.body)
 }

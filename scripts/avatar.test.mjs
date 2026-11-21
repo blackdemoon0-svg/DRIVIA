@@ -180,6 +180,7 @@ assert.match(dialog, /accept="image\/jpeg,image\/png,image\/webp"/);
 assert.match(dialog, /capture="user"/);
 assert.match(dialog, /URL\.createObjectURL/, "aperçu local avant validation");
 assert.match(dialog, /URL\.revokeObjectURL/, "l'aperçu est libéré");
+assert.match(dialog, /createPortal\(dialog, document\.body\)/, "le dialogue passe au-dessus de la Sidebar");
 assert.match(hook, /client\.storage\.from\(AVATAR_BUCKET\)/);
 assert.match(hook, /\.upload\(/);
 assert.match(hook, /upsert: true/);

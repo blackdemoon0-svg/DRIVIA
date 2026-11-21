@@ -40,7 +40,10 @@ function subscribe(listener) {
 function readDemoAvatar(userId) {
   if (!userId) return null
   try {
-    return localStorage.getItem(DEMO_PREFIX + userId) || null
+    const value = localStorage.getItem(DEMO_PREFIX + userId)
+    // Seule une image embarquée est rendue : jamais une valeur arbitraire
+    // injectée dans l'attribut src.
+    return value && value.startsWith('data:image/') ? value : null
   } catch {
     return null
   }
