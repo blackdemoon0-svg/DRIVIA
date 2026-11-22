@@ -171,3 +171,111 @@ export function chatErrorMessage(error) {
     return 'Le service IA est momentanément indisponible. Réessayez dans un instant.'
   return error.message || 'Une erreur est survenue. Réessayez dans un instant.'
 }
+
+// ---------------------------------------------------------------------------
+// Voix Live (GPT-Live + WebRTC)
+// ---------------------------------------------------------------------------
+// La clé OpenAI ne quitte jamais le serveur : le navigateur envoie une offre SDP,
+// le serveur l'échange contre une réponse SDP et ne renvoie que celle-ci.
+// Ces fonctions sont ADDITIVES : streamChat, parseSseBlock et le contrat SSE du
+// chat texte ne sont pas modifiés.
+
+/** Erreur vocale, alignée sur VeyvroApiError pour un traitement uniforme. */
+export class VoiceApiError extends Error {
+  constructor(status, message, code, meta = {}) {
+    super(message)
+    this.name = 'VoiceApiError'
+    this.status = status
+    this.code = code ?? null
+    this.retryAfterSeconds = meta.retryAfterSeconds ?? null
+    this.limitMinutes = meta.limitMinutes ?? null
+    this.remainingSeconds = meta.remainingSeconds ?? null
+  }
+}
+
+async function voiceRequest(path, { method = 'GET', accessToken, body, signal } = {}) {
+  const headers = { 'Content-Type': 'application/json' }
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`
+  let response
+  try {
+    response = await fetch(path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
+    })
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err
+    throw new VoiceApiError(0, 'Le service vocal est injoignable. / The voice service could not be reached.', 'network')
+  }
+
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new VoiceApiError(
+      response.status,
+      payload?.error ?? 'Le service vocal a renvoyé une erreur.',
+      payload?.code ?? 'provider_error',
+      {
+        retryAfterSeconds: Number(response.headers.get('retry-after') ?? payload?.retryAfterSeconds) || null,
+        limitMinutes: payload?.limit ?? null,
+        remainingSeconds: payload?.remainingSeconds ?? null,
+      }
+    )
+  }
+  return payload
+}
+
+/** Catalogue des voix + voix enregistrée sur le compte (catalogue public). */
+export async function fetchVoiceProfiles(accessToken, options = {}) {
+  return voiceRequest('/api/voice-profiles', { accessToken, signal: options.signal })
+}
+
+/** Enregistre la voix choisie sur le compte. */
+export async function saveVoicePreference(accessToken, voiceId, options = {}) {
+  return voiceRequest('/api/voice-profiles', {
+    method: 'PUT',
+    accessToken,
+    body: { voice: voiceId },
+    signal: options.signal,
+  })
+}
+
+/**
+ * Ouvre une session Live : renvoie { sessionId, sdp, voice, quota }.
+ * `history` permet de reprendre le contexte de la conversation texte.
+ */
+export async function startVoiceSession({ sdp, voice, history, accessToken, signal } = {}) {
+  if (!accessToken) throw new VoiceApiError(401, 'Connectez-vous à VEYVRO pour utiliser la voix.', 'auth_required')
+  return voiceRequest('/api/voice-session', {
+    method: 'POST',
+    accessToken,
+    body: { sdp, voice, history: Array.isArray(history) ? history : undefined },
+    signal,
+  })
+}
+
+/** Ferme une session Live et règle sa durée côté serveur. */
+export async function endVoiceSession({ sessionId, accessToken, signal } = {}) {
+  if (!accessToken) return null
+  return voiceRequest('/api/voice-end', {
+    method: 'POST',
+    accessToken,
+    body: { sessionId },
+    signal,
+  })
+}
+
+/** Message utilisateur pour une erreur vocale. */
+export function voiceErrorMessage(error) {
+  const code = error?.code ?? null
+  if (code === 'auth_required' || error?.status === 401) return 'Connectez-vous à VEYVRO pour utiliser la voix.'
+  if (code === 'voice_not_in_plan')
+    return "La conversation vocale fait partie des formules VEYVRO Plus et Pro."
+  if (code === 'voice_minutes_exhausted')
+    return `Vous avez atteint votre quota vocal du jour${error?.limitMinutes ? ` (${error.limitMinutes} min)` : ''}. Il revient à minuit UTC.`
+  if (code === 'voice_unavailable')
+    return "La conversation vocale n'est pas disponible pour ce compte pour le moment."
+  if (code === 'identity_unavailable') return 'Le service de compte est momentanément indisponible. Réessayez.'
+  if (code === 'invalid_offer') return 'La connexion audio n’a pas pu être préparée. Réessayez.'
+  return error?.message || 'La conversation vocale est momentanément indisponible.'
+}

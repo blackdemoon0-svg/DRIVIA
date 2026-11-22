@@ -15,6 +15,7 @@ export default function ChatComposer({
   textareaRef,
   compact = false,
   disabled = false,
+  voiceSlot = null,
 }) {
   const [toolsOpen, setToolsOpen] = useState(false)
   const toolsRef = useRef(null)
@@ -116,6 +117,7 @@ export default function ChatComposer({
                 </div>
               )}
             </div>
+            {voiceSlot}
           </div>
           <div className="composer-right">
             <span className="composer-hint">Entrée pour envoyer</span>

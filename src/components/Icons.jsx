@@ -84,6 +84,8 @@ export const GalleryIcon = (p) => (
   </Svg>
 )
 export const UploadIcon = (p) => (<Svg {...p}><path d="M12 16V4M7.5 8.5 12 4l4.5 4.5" /><path d="M4 17v2a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2" /></Svg>)
+export const MicIcon = (p) => (<Svg {...p}><rect x="9" y="3" width="6" height="10" rx="3" /><path d="M5.5 11a6.5 6.5 0 0 0 13 0" /><path d="M12 17.5V21M9 21h6" /></Svg>)
+export const MicOffIcon = (p) => (<Svg {...p}><path d="M9 5.5A3 3 0 0 1 15 6v4.5" /><path d="M9 9.5V11a3 3 0 0 0 4.6 2.5" /><path d="M5.5 11a6.5 6.5 0 0 0 9.6 5.7" /><path d="M18.5 11v.5" /><path d="M12 17.5V21M9 21h6" /><path d="M4 4l16 16" /></Svg>)
 
 export function BrandMark({ size = 28 }) {
   return (

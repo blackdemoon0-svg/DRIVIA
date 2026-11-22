@@ -41,6 +41,8 @@ type AccountCounters = {
   day: string;
   messages: number;
   quotes: number;
+  /** Voice seconds consumed today (UTC): a session is billed by duration. */
+  voiceSeconds: number;
   /** Timestamps of the requests in the current minute window. */
   requestTimestamps: number[];
   lastSeenAt: number;
@@ -91,6 +93,7 @@ function entryFor(userId: string, nowMs: number): AccountCounters {
       day,
       messages: 0,
       quotes: 0,
+      voiceSeconds: 0,
       requestTimestamps: [],
       lastSeenAt: nowMs,
     };
@@ -103,6 +106,7 @@ function entryFor(userId: string, nowMs: number): AccountCounters {
     existing.day = day;
     existing.messages = 0;
     existing.quotes = 0;
+    existing.voiceSeconds = 0;
   }
   existing.lastSeenAt = nowMs;
   return existing;
@@ -206,11 +210,16 @@ export function consumeQuota(options: ConsumeOptions): QuotaVerdict {
 export function readQuotaUsage(
   userId: string,
   nowMs: number = Date.now(),
-): { messages: number; quotes: number; day: string } {
+): { messages: number; quotes: number; voiceSeconds: number; day: string } {
   const entry = counters.get(quotaKey(userId));
   const day = utcDayKey(nowMs);
-  if (!entry || entry.day !== day) return { messages: 0, quotes: 0, day };
-  return { messages: entry.messages, quotes: entry.quotes, day };
+  if (!entry || entry.day !== day) return { messages: 0, quotes: 0, voiceSeconds: 0, day };
+  return {
+    messages: entry.messages,
+    quotes: entry.quotes,
+    voiceSeconds: entry.voiceSeconds,
+    day,
+  };
 }
 
 /**
@@ -221,4 +230,134 @@ export function readQuotaUsage(
  */
 export function resetQuotas(): void {
   counters.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Voice Live allowance
+// ---------------------------------------------------------------------------
+//
+// The voice allowance lives in the SAME counter object as messages and quotes:
+// one account has one entry, reset at the same UTC midnight. It is a new field
+// on the existing store, not a second quota system.
+//
+// Difference with messages: a voice session is not a discrete request, it has a
+// duration. So the allowance is reserved when the session starts and released
+// when it ends, instead of being incremented once and for all.
+//
+// Why a reservation: without it, a user could open several sessions in
+// parallel, each one passing the check, and exceed the daily allowance by a
+// multiple. With it, the seconds are reserved up front and adjusted down to the
+// real duration at close time.
+
+/** How long one reserved session may run before the server stops counting. */
+export const VOICE_RESERVATION_SECONDS = 60;
+
+export type VoiceQuotaVerdict =
+  | {
+      ok: true;
+      limits: PlanLimits;
+      /** Seconds reserved for this session, released when it closes. */
+      reservedSeconds: number;
+      /** Remaining seconds for the day after the reservation. */
+      remainingSeconds: number;
+    }
+  | {
+      ok: false;
+      kind: "voice_not_in_plan" | "voice_minutes_exhausted";
+      retryAfterSeconds: number;
+      limit: number;
+      used: number;
+      error: string;
+    };
+
+/**
+ * Reserve voice time for one session.
+ *
+ * Refuses before any provider call when the plan has no voice allowance
+ * (`voiceMinutesPerDay === 0`) or when the day's allowance is spent. The
+ * `/api/voice-session` route calls this *before* creating a Live session, so a
+ * refused request never costs a cent at OpenAI.
+ */
+export function reserveVoiceQuota(options: {
+  userId: string;
+  plan: PlanId;
+  /** Seconds to reserve. Defaults to the standard reservation. */
+  seconds?: number;
+  nowMs?: number;
+}): VoiceQuotaVerdict {
+  const nowMs = options.nowMs ?? Date.now();
+  const limits = limitsFor(options.plan);
+  const reserveSeconds = Math.max(1, Math.floor(options.seconds ?? VOICE_RESERVATION_SECONDS));
+
+  if (limits.voiceMinutesPerDay <= 0) {
+    return {
+      ok: false,
+      kind: "voice_not_in_plan",
+      retryAfterSeconds: 0,
+      limit: 0,
+      used: 0,
+      error:
+        "La conversation vocale fait partie des formules VEYVRO Plus et Pro. / Voice conversation is part of the VEYVRO Plus and Pro plans.",
+    };
+  }
+
+  if (counters.size > MAX_TRACKED_ACCOUNTS) prune(nowMs);
+  const entry = entryFor(options.userId, nowMs);
+  const allowanceSeconds = limits.voiceMinutesPerDay * 60;
+  const usedSeconds = entry.voiceSeconds;
+
+  if (usedSeconds + reserveSeconds > allowanceSeconds) {
+    return {
+      ok: false,
+      kind: "voice_minutes_exhausted",
+      retryAfterSeconds: Math.ceil(msUntilNextUtcDay(nowMs) / 1_000),
+      limit: limits.voiceMinutesPerDay,
+      used: Math.floor(usedSeconds / 60),
+      error: `Vous avez atteint votre quota vocal de ${limits.voiceMinutesPerDay} minutes pour aujourd'hui. Il revient à minuit UTC. / You have reached your daily voice allowance of ${limits.voiceMinutesPerDay} minutes. It resets at midnight UTC.`,
+    };
+  }
+
+  entry.voiceSeconds += reserveSeconds;
+
+  return {
+    ok: true,
+    limits,
+    reservedSeconds: reserveSeconds,
+    remainingSeconds: allowanceSeconds - entry.voiceSeconds,
+  };
+}
+
+/**
+ * Settle a finished session: give back the reservation, keep the real duration.
+ *
+ * Called by `/api/voice-end`. A session that lasted 90 s with a 60 s
+ * reservation must consume 90 s, not 60: the release is `reserved - real`, and
+ * it is allowed to be negative (the extra time is charged).
+ *
+ * Idempotent per session, because the client may call it twice (tab closed, then
+ * a late beacon): see `settledVoiceSessions`.
+ */
+export function settleVoiceQuota(options: {
+  userId: string;
+  reservedSeconds: number;
+  actualSeconds: number;
+  nowMs?: number;
+}): { usedSeconds: number; chargedSeconds: number } {
+  const nowMs = options.nowMs ?? Date.now();
+  if (counters.size > MAX_TRACKED_ACCOUNTS) prune(nowMs);
+  const entry = entryFor(options.userId, nowMs);
+
+  const actual = Math.max(0, Math.floor(options.actualSeconds));
+  const reserved = Math.max(0, Math.floor(options.reservedSeconds));
+  // Replace the reservation with the truth (never below zero).
+  entry.voiceSeconds = Math.max(0, entry.voiceSeconds - reserved + actual);
+
+  return { usedSeconds: entry.voiceSeconds, chargedSeconds: actual };
+}
+
+/** Voice seconds used today, without consuming anything. */
+export function readVoiceUsage(userId: string, nowMs: number = Date.now()): number {
+  const entry = counters.get(quotaKey(userId));
+  if (!entry || entry.day !== utcDayKey(nowMs)) return 0;
+  return entry.voiceSeconds;
 }

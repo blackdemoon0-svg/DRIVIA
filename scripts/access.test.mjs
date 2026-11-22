@@ -188,6 +188,8 @@ function restore() {
     attachments: false,
     quoteAnalysis: true,
     requestsPerMinute: 10,
+    // Voix : absente de la formule gratuite (refus avant tout appel fournisseur).
+    voiceMinutesPerDay: 0,
   });
   assert.deepEqual(PLAN_LIMITS.plus, {
     messagesPerDay: 200,
@@ -195,6 +197,7 @@ function restore() {
     attachments: true,
     quoteAnalysis: true,
     requestsPerMinute: 20,
+    voiceMinutesPerDay: 10,
   });
   assert.deepEqual(PLAN_LIMITS.pro, {
     messagesPerDay: 600,
@@ -202,6 +205,7 @@ function restore() {
     attachments: true,
     quoteAnalysis: true,
     requestsPerMinute: 30,
+    voiceMinutesPerDay: 30,
   });
 
   // Un plan inconnu retombe sur le plus restrictif, jamais sur un plan payant.
