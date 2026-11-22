@@ -1,6 +1,21 @@
 import VEYVRO_SYSTEM_PROMPT from "../server/veyvroSystemPrompt.js";
 import { authorizeRequest, type AccessDecision } from "../server/access.js";
 import { consumeQuota } from "../server/quotas.js";
+import { describeModel } from "../server/ai/modelCatalog.js";
+import { applyModelPin, planRoute, type RoutePlan, type RoutingPolicy } from "../server/ai/router.js";
+import {
+  ProviderClient,
+  ProviderError,
+  type ApiErrorCode,
+  type ProviderContentPart,
+  type ProviderMessage,
+} from "../server/ai/provider.js";
+import { orchestrate } from "../server/ai/orchestrator.js";
+import {
+  DEFAULT_DAILY_BUDGET_USD,
+  canAffordExpensiveMode,
+  recordSpend,
+} from "../server/ai/budget.js";
 
 /**
  * Rebrand support: VEYVRO_* variables are the canonical names. The handler
@@ -35,15 +50,6 @@ type DocumentAttachment =
       text: string;
     };
 
-type ProviderContentPart =
-  | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string; detail: "high" } };
-
-type ProviderMessage = {
-  role: "system" | "user" | "assistant";
-  content: string | ProviderContentPart[];
-};
-
 type ApiRequest = {
   method?: string;
   body?: unknown;
@@ -59,27 +65,6 @@ type ApiResponse = {
   once?: (event: "drain", listener: () => void) => void;
   end: () => void;
 };
-
-type ProviderStreamChunk = {
-  error?: unknown;
-  choices?: Array<{
-    delta?: { content?: unknown };
-    finish_reason?: string | null;
-  }>;
-};
-
-type ApiErrorCode =
-  | "missing_api_key"
-  | "invalid_api_key"
-  | "access_denied"
-  | "model_unavailable"
-  | "insufficient_quota"
-  | "rate_limited"
-  | "busy"
-  | "timeout"
-  | "empty_response"
-  | "incomplete_stream"
-  | "provider_error";
 
 const MAX_HISTORY_MESSAGES = 24;
 const MAX_HISTORY_CHARACTERS = 24_000;
@@ -453,137 +438,6 @@ async function writeEvent(response: ApiResponse, event: string, payload: unknown
   }
 }
 
-function usesReasoningParameterProfile(provider: string, model: string): boolean {
-  if (provider === "gemini") return false;
-  const normalized = model.trim().toLowerCase();
-  return /^(gpt-5|gpt-6|o1|o3|o4)($|[-.])/.test(normalized);
-}
-
-function classifyProviderHttpError(
-  status: number,
-  payload: unknown,
-): { status: number; code: ApiErrorCode; error: string } {
-  const rawError =
-    typeof payload === "object" && payload !== null && "error" in payload
-      ? (payload as { error?: unknown }).error
-      : null;
-  const errorObj =
-    typeof rawError === "object" && rawError !== null
-      ? (rawError as Record<string, unknown>)
-      : null;
-  const upstreamCode = typeof errorObj?.code === "string" ? errorObj.code.toLowerCase() : "";
-  const upstreamType = typeof errorObj?.type === "string" ? errorObj.type.toLowerCase() : "";
-  const upstreamMessage = typeof errorObj?.message === "string" ? errorObj.message.toLowerCase() : "";
-
-  if (
-    status === 402 ||
-    upstreamCode === "insufficient_quota" ||
-    upstreamType === "insufficient_quota" ||
-    upstreamCode === "billing_hard_limit_reached" ||
-    (status === 429 && (upstreamMessage.includes("quota") || upstreamMessage.includes("billing")))
-  ) {
-    return {
-      status: 429,
-      code: "insufficient_quota",
-      error:
-        "Quota API insuffisant ou facturation non activée sur le compte du fournisseur IA. / Insufficient API quota or inactive billing on the AI provider account.",
-    };
-  }
-
-  if (status === 429 || upstreamCode === "rate_limit_exceeded" || upstreamType === "rate_limit_error") {
-    return {
-      status: 429,
-      code: "rate_limited",
-      error:
-        "Limite de débit atteinte auprès du fournisseur IA. Réessayez dans quelques instants. / The AI provider is rate limited. Try again shortly.",
-    };
-  }
-
-  if (status === 401 || upstreamCode === "invalid_api_key") {
-    return {
-      status: 502,
-      code: "invalid_api_key",
-      error:
-        "Clé API invalide ou rejetée par le fournisseur IA. Vérifiez VEYVRO_AI_API_KEY sur le serveur. / The AI provider rejected its API key. Check VEYVRO_AI_API_KEY on the server.",
-    };
-  }
-
-  if (
-    status === 404 ||
-    upstreamCode === "model_not_found" ||
-    (status === 400 && upstreamMessage.includes("model") && upstreamMessage.includes("not exist"))
-  ) {
-    return {
-      status: 502,
-      code: "model_unavailable",
-      error:
-        "Le modèle IA configuré est indisponible ou introuvable. Vérifiez VEYVRO_AI_MODEL et les accès du projet. / The configured AI model is unavailable or not found. Check VEYVRO_AI_MODEL.",
-    };
-  }
-
-  if (
-    status === 403 ||
-    upstreamCode === "insufficient_permissions" ||
-    upstreamCode === "access_terminated" ||
-    upstreamType === "permission_error"
-  ) {
-    if (upstreamMessage.includes("model")) {
-      return {
-        status: 502,
-        code: "model_unavailable",
-        error:
-          "Ce compte ou projet n'a pas accès au modèle IA configuré. Vérifiez VEYVRO_AI_MODEL et les droits du projet. / This account or project does not have access to the configured AI model.",
-      };
-    }
-    return {
-      status: 502,
-      code: "access_denied",
-      error:
-        "Accès refusé par le fournisseur IA. Vérifiez les permissions de la clé API et du projet. / Access denied by the AI provider. Check API key and project permissions.",
-    };
-  }
-
-  return {
-    status: 502,
-    code: "provider_error",
-    error:
-      "Le fournisseur IA n'a pas pu traiter la requête. Vérifiez la configuration du fournisseur et du modèle. / The AI provider could not complete the request. Check the provider and model configuration.",
-  };
-}
-
-async function consumeProviderFrame(
-  frame: string,
-  response: ApiResponse,
-): Promise<{ complete: boolean; hasText: boolean; finishReason: string | null }> {
-  const dataLines = frame
-    .split("\n")
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice(5).trimStart());
-
-  if (dataLines.length === 0) return { complete: false, hasText: false, finishReason: null };
-  const data = dataLines.join("\n");
-  if (data === "[DONE]") return { complete: true, hasText: false, finishReason: null };
-
-  let chunk: ProviderStreamChunk;
-  try {
-    chunk = JSON.parse(data) as ProviderStreamChunk;
-  } catch {
-    throw new Error("The AI provider returned an invalid stream.");
-  }
-
-  if (chunk.error) throw new Error("The AI provider returned a stream error.");
-
-  const choice = chunk.choices?.[0];
-  const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : null;
-  const delta = choice?.delta?.content;
-  if (typeof delta === "string" && delta.length > 0) {
-    await writeEvent(response, "delta", { delta });
-    return { complete: false, hasText: true, finishReason };
-  }
-
-  return { complete: false, hasText: false, finishReason };
-}
-
 /** Read a header regardless of the case the platform used. */
 function readRequestHeader(request: ApiRequest, name: string): string | null {
   const headers = request.headers ?? {};
@@ -716,150 +570,168 @@ async function handleChatPost(
     });
   }
 
-  const provider = (readEnvVar("VEYVRO_AI_PROVIDER", "VEYDRIVO_AI_PROVIDER", "DRIVIA_AI_PROVIDER") || "openai").toLowerCase();
-  if (provider !== "openai" && provider !== "gemini" && provider !== "openai-compatible") {
+  const rawProvider = (readEnvVar("VEYVRO_AI_PROVIDER", "VEYDRIVO_AI_PROVIDER", "DRIVIA_AI_PROVIDER") || "openai").toLowerCase();
+  if (rawProvider !== "openai" && rawProvider !== "gemini" && rawProvider !== "openai-compatible") {
     return response.status(500).json({
       code: "provider_error",
       error: "Unsupported VEYVRO_AI_PROVIDER configuration.",
     });
   }
+  const provider = rawProvider as ProviderKind;
 
   const defaultBaseUrl =
     provider === "gemini"
       ? "https://generativelanguage.googleapis.com/v1beta/openai"
       : "https://api.openai.com/v1";
-  const baseUrl = (readEnvVar("VEYVRO_AI_BASE_URL", "VEYDRIVO_AI_BASE_URL", "DRIVIA_AI_BASE_URL") || defaultBaseUrl).replace(/\/+$/, "");
-  const defaultModel = provider === "gemini" ? "gemini-3.8-flash" : "gpt-4.1-mini";
-  const model = (readEnvVar("VEYVRO_AI_MODEL", "VEYDRIVO_AI_MODEL", "DRIVIA_AI_MODEL") || defaultModel).trim();
-  const isReasoningModel = usesReasoningParameterProfile(provider, model);
-  const maxCompletionTokens = isReasoningModel
-    ? attachments.length > 0
-      ? 3200
-      : 2400
-    : attachments.length > 0
-      ? 1800
-      : 1400;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 45_000);
-  let streamStarted = false;
+  const baseUrl = (
+    readEnvVar("VEYVRO_AI_BASE_URL", "VEYDRIVO_AI_BASE_URL", "DRIVIA_AI_BASE_URL") || defaultBaseUrl
+  ).replace(/\/+$/, "");
+
+  // ── Routing ──────────────────────────────────────────────────────────────
+  // Which model answers is decided here, on the server, from the request and
+  // the plan read in the database. The browser can express a *preference* for
+  // a cheaper or a deeper answer (`depth`), never a model id: the plan's price
+  // ceiling and the operator's policy bound whatever it asks for.
+  const routingPolicy = readRoutingPolicy();
+  const hint = readRoutingHint(requestBody);
+  const pinnedModel = readEnvVar("VEYVRO_AI_MODEL", "VEYDRIVO_AI_MODEL", "DRIVIA_AI_MODEL")?.trim();
+
+  let plan: RoutePlan = planRoute({
+    message: messages[messages.length - 1].content,
+    historyLength: Math.max(0, messages.length - 1),
+    hasAttachments: attachments.length > 0,
+    isQuoteAnalysis: isQuoteAnalysisTask,
+    tier: access.plan,
+    hint,
+    policy: routingPolicy,
+  });
+
+  // An explicit model pin still wins — that is how an existing deployment keeps
+  // its configuration — but effort, output ceiling and verification stay
+  // routed, because they never change which model is called.
+  if (pinnedModel) plan = applyModelPin(plan, pinnedModel);
+
+  // Automatic multi-model routing is an OpenAI-account feature. Any other
+  // endpoint does not serve OpenAI model ids, so it keeps the previous
+  // single-model behaviour: the configured model, or the historical default.
+  if (provider !== "openai") {
+    const fallbackModel = provider === "gemini" ? "gemini-3.8-flash" : "gpt-4.1-mini";
+    const singleModel = describeModel(pinnedModel || fallbackModel);
+    plan = {
+      ...plan,
+      mode: "balanced",
+      primary: singleModel,
+      collaborators: [],
+      verifiers: [],
+      verify: false,
+      synthesise: false,
+      effort: "medium",
+      reasons: [...plan.reasons, "fournisseur non-OpenAI : modèle unique configuré"],
+    };
+  }
+
+  // ── Spend guard ──────────────────────────────────────────────────────────
+  // A costly plan is only worth running if this instance can still afford it.
+  // Refusing is never an option: the route degrades to a single model instead.
+  const dailyBudgetUsd = readDailyBudgetUsd();
+  if (
+    (plan.collaborators.length > 0 || plan.verifiers.length > 0) &&
+    !canAffordExpensiveMode(plan.estimatedCostUsd, { dailyBudgetUsd })
+  ) {
+    plan = {
+      ...plan,
+      mode: plan.mode === "collaborative" ? "coding" : plan.mode,
+      primary: plan.collaborators[1] ?? plan.primary,
+      collaborators: [],
+      verifiers: [],
+      verify: false,
+      synthesise: false,
+      downgraded: true,
+      reasons: [...plan.reasons, "budget journalier de l'instance atteint : mode simple"],
+    };
+  }
+
+  const client = new ProviderClient({
+    baseUrl,
+    apiKey,
+    provider,
+  });
+
+  const visionRequired = attachments.some((attachment) => attachment.type === "image");
+  const providerMessages = getProviderMessages(messages, attachments, task);
+
+  // The whole request must end before the platform function timeout; every
+  // stage budget is derived from this deadline instead of a fixed 45 s guess.
+  const deadline = Date.now() + readRequestDeadlineMs();
+  let responseStarted = false;
+
+  const publish = {
+    delta: async (delta: string) => {
+      if (!responseStarted) {
+        startEventStream(response);
+        responseStarted = true;
+      }
+      await writeEvent(response, "delta", { delta });
+    },
+    // Progress of the internal passes. Existing clients ignore unknown events,
+    // so this adds observability without touching the contract.
+    stage: async (stage: string, detail: Record<string, unknown>) => {
+      if (!responseStarted) {
+        startEventStream(response);
+        responseStarted = true;
+      }
+      await writeEvent(response, "stage", { stage, ...detail });
+    },
+  };
 
   try {
-    const providerResponse = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        messages: getProviderMessages(messages, attachments, task),
-        stream: true,
-        ...(provider === "gemini" ? {} : { max_completion_tokens: maxCompletionTokens }),
-        ...(isReasoningModel ? {} : { temperature: attachments.length > 0 ? 0.2 : 0.7 }),
-      }),
-      signal: controller.signal,
+    const result = await orchestrate({
+      client,
+      plan,
+      messages: providerMessages,
+      publish,
+      deadline,
+      visionRequired,
+      temperature: attachments.length > 0 ? 0.2 : 0.7,
     });
 
-    if (!providerResponse.ok) {
-      const errorPayload = await providerResponse.json().catch(() => null);
-      const classified = classifyProviderHttpError(providerResponse.status, errorPayload);
-      return response.status(classified.status).json({
-        code: classified.code,
-        error: classified.error,
-      });
+    recordSpend(result.costUsd);
+
+    // Routing is server-side metadata: useful in logs, harmless in the stream.
+    logRouting(result);
+
+    if (!responseStarted) {
+      // No fragment was published, yet the model produced text (possible when a
+      // stream is buffered entirely). Publish it now, unchanged.
+      await publish.delta(result.text);
     }
 
-    if (!providerResponse.body) {
-      return response.status(502).json({
-        code: "provider_error",
-        error: "The AI provider did not return a response stream.",
-      });
-    }
-
-    response.status(200);
-    response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    response.setHeader("Cache-Control", "no-cache, no-transform");
-    response.setHeader("X-Accel-Buffering", "no");
-    response.flushHeaders?.();
-    streamStarted = true;
-
-    const reader = providerResponse.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let complete = false;
-    let didStreamText = false;
-    let finishReason: string | null = null;
-
-    try {
-      while (!complete) {
-        const { done, value } = await reader.read();
-        buffer += decoder.decode(value, { stream: !done });
-        buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-
-        let separatorIndex = buffer.indexOf("\n\n");
-        while (separatorIndex !== -1) {
-          const frame = buffer.slice(0, separatorIndex);
-          buffer = buffer.slice(separatorIndex + 2);
-          const result = await consumeProviderFrame(frame, response);
-          complete = result.complete;
-          didStreamText ||= result.hasText;
-          if (result.finishReason) finishReason = result.finishReason;
-          if (complete) break;
-          separatorIndex = buffer.indexOf("\n\n");
-        }
-
-        if (done) {
-          if (!complete && buffer.trim()) {
-            const result = await consumeProviderFrame(buffer, response);
-            complete = result.complete;
-            didStreamText ||= result.hasText;
-            if (result.finishReason) finishReason = result.finishReason;
-          }
-          break;
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-
-    if (!didStreamText) {
-      await writeEvent(response, "error", {
-        code: "empty_response",
-        error: "Le fournisseur IA a renvoyé une réponse vide. / The AI provider returned an empty response.",
-      });
-      response.end();
-      return;
-    }
-
-    if (!complete && !finishReason) {
-      await writeEvent(response, "error", {
-        code: "incomplete_stream",
-        error: "La réponse IA a été interrompue avant la fin. / The AI response was interrupted before completion.",
-      });
-      response.end();
-      return;
-    }
-
-    if (finishReason === "length") {
+    if (result.finishReason === "length") {
       await writeEvent(response, "delta", {
         delta:
           "\n\n[Note : réponse tronquée car la limite de longueur maximale a été atteinte. / Response truncated due to maximum output length.]",
       });
-      await writeEvent(response, "done", { truncated: true, finishReason: "length" });
+      await writeEvent(response, "done", {
+        truncated: true,
+        finishReason: "length",
+        ...publicRoutingMeta(plan, result.modelsInvolved),
+      });
       response.end();
       return;
     }
 
-    await writeEvent(response, "done", {});
+    await writeEvent(response, "done", publicRoutingMeta(plan, result.modelsInvolved));
     response.end();
-  } catch {
-    if (streamStarted) {
+  } catch (error) {
+    const classified = classifyOrchestrationError(error);
+
+    if (responseStarted) {
       try {
+        // Some text already reached the user: the stream cannot be restarted,
+        // so the interruption is reported instead of a duplicate answer.
         await writeEvent(response, "error", {
-          code: controller.signal.aborted ? "timeout" : "incomplete_stream",
-          error: controller.signal.aborted
-            ? "Le fournisseur IA a mis trop de temps à répondre. Veuillez réessayer. / VEYVRO AI took too long to respond. Please try again."
-            : "La réponse IA a été interrompue. Veuillez réessayer. / VEYVRO AI stream was interrupted. Please try again.",
+          code: classified.code,
+          error: classified.error,
         });
         response.end();
       } catch {
@@ -868,17 +740,146 @@ async function handleChatPost(
       return;
     }
 
-    if (controller.signal.aborted) {
-      return response.status(504).json({
-        code: "timeout",
-        error: "Le fournisseur IA a mis trop de temps à répondre. Veuillez réessayer. / The AI provider took too long to respond. Please try again.",
-      });
-    }
-    return response.status(502).json({
-      code: "provider_error",
-      error: "Le fournisseur IA est temporairement indisponible. / The AI provider is temporarily unavailable.",
+    return response.status(classified.status).json({
+      code: classified.code,
+      error: classified.error,
     });
-  } finally {
-    clearTimeout(timeoutId);
+  }
+}
+
+type ProviderKind = "openai" | "gemini" | "openai-compatible";
+
+/**
+ * Absolute budget for one `/api/chat` invocation, below Vercel's 60 s limit.
+ *
+ * Every stage budget is derived from it, so a slower or faster platform limit
+ * can be matched without touching the orchestration code. The override is
+ * clamped: a misconfigured value must not let a request run past the function
+ * timeout, nor cut a normal answer short.
+ */
+const DEFAULT_REQUEST_DEADLINE_MS = 54_000;
+const MIN_REQUEST_DEADLINE_MS = 5_000;
+const MAX_REQUEST_DEADLINE_MS = 54_000;
+
+function readRequestDeadlineMs(): number {
+  const raw = readEnvVar(
+    "VEYVRO_AI_REQUEST_DEADLINE_MS",
+    "VEYDRIVO_AI_REQUEST_DEADLINE_MS",
+    "DRIVIA_AI_REQUEST_DEADLINE_MS",
+  );
+  if (!raw) return DEFAULT_REQUEST_DEADLINE_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_REQUEST_DEADLINE_MS;
+  return Math.min(MAX_REQUEST_DEADLINE_MS, Math.max(MIN_REQUEST_DEADLINE_MS, parsed));
+}
+
+/** Open the SSE response. Called on the first published event, not before. */
+function startEventStream(response: ApiResponse) {
+  response.status(200);
+  response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  response.setHeader("Cache-Control", "no-cache, no-transform");
+  response.setHeader("X-Accel-Buffering", "no");
+  response.flushHeaders?.();
+}
+
+/**
+ * Operator knobs, read per request so a redeploy is not needed for a JSON body
+ * tweak — but never read from the request body.
+ */
+function readRoutingPolicy(): RoutingPolicy {
+  const raw = (readEnvVar("VEYVRO_AI_ROUTING", "VEYDRIVO_AI_ROUTING", "DRIVIA_AI_ROUTING") || "auto")
+    .trim()
+    .toLowerCase();
+  if (raw === "single" || raw === "collaborative") return raw;
+  return "auto";
+}
+
+function readDailyBudgetUsd(): number {
+  const raw = readEnvVar(
+    "VEYVRO_AI_DAILY_BUDGET_USD",
+    "VEYDRIVO_AI_DAILY_BUDGET_USD",
+    "DRIVIA_AI_DAILY_BUDGET_USD",
+  );
+  if (!raw) return DEFAULT_DAILY_BUDGET_USD;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_DAILY_BUDGET_USD;
+}
+
+/**
+ * Optional cost hint from the browser: `"fast"` asks for the cheapest route,
+ * `"deep"` for the most thorough one. Both are clamped by the plan's budget and
+ * by the routing policy, so a client cannot buy a more expensive answer than its
+ * plan allows.
+ */
+function readRoutingHint(body: unknown): "fast" | "balanced" | "deep" | undefined {
+  if (typeof body !== "object" || body === null || !("depth" in body)) return undefined;
+  const raw = (body as { depth?: unknown }).depth;
+  if (raw === "fast" || raw === "balanced" || raw === "deep") return raw;
+  return undefined;
+}
+
+/** Turn any orchestration failure into the response the interface expects. */
+function classifyOrchestrationError(error: unknown): {
+  status: number;
+  code: ApiErrorCode;
+  error: string;
+} {
+  if (error instanceof ProviderError) {
+    return {
+      status: error.classified.status,
+      code: error.classified.code,
+      error: error.classified.error,
+    };
+  }
+  return {
+    status: 502,
+    code: "provider_error",
+    error:
+      "Le fournisseur IA est temporairement indisponible. / The AI provider is temporarily unavailable.",
+  };
+}
+
+/**
+ * Public metadata attached to the `done` event.
+ *
+ * It names the model class and whether the answer was checked — the kind of
+ * information a user may reasonably want — and nothing that costs money or
+ * reveals the deployment's configuration.
+ */
+function publicRoutingMeta(plan: RoutePlan, modelsInvolved: string[]) {
+  return {
+    routing: {
+      mode: plan.mode,
+      verified: plan.verify,
+      // Count only: which model answered is a routing decision, not public data.
+      models: modelsInvolved.length,
+    },
+  };
+}
+
+/**
+ * Server-side trace of one turn: route, models, tokens and estimated cost.
+ *
+ * No key, no prompt, no user content — only what is needed to answer "why did
+ * this turn cost that much?" in the Vercel logs.
+ */
+function logRouting(result: Awaited<ReturnType<typeof orchestrate>>) {
+  try {
+    console.log(
+      JSON.stringify({
+        event: "veyvro_chat",
+        mode: result.mode,
+        models: result.modelsUsed,
+        failed: result.failedModels,
+        verified: result.verified,
+        degraded: result.degraded,
+        promptTokens: result.usage.promptTokens,
+        completionTokens: result.usage.completionTokens,
+        costUsd: result.costUsd,
+        durationMs: result.durationMs,
+      }),
+    );
+  } catch {
+    // Logging must never break a response.
   }
 }
