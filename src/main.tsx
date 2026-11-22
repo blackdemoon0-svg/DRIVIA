@@ -4,6 +4,7 @@
 // reste vert, sans renommer les fichiers ni affaiblir `strict`.
 import React from 'react'
 import { createRoot } from 'react-dom/client'
+import { Analytics } from '@vercel/analytics/react'
 
 // @ts-expect-error — composants JSX non typés (App.jsx, lib/auth.jsx, lib/scene.jsx)
 import App from './App'
@@ -25,5 +26,6 @@ createRoot(container).render(
         <App />
       </SceneProvider>
     </AuthProvider>
+    <Analytics />
   </React.StrictMode>
 )
