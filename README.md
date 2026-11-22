@@ -20,9 +20,41 @@ This is a generative chat, not a response library: every user turn sends the rec
 - `VEYVRO_AI_PROVIDER` (optional: `openai`, `gemini`, or `openai-compatible`; defaults to `openai`)
 - `VEYVRO_AI_API_KEY` (required, server-side only)
 - `VEYVRO_AI_BASE_URL` (optional; defaults to the selected provider's compatible endpoint)
-- `VEYVRO_AI_MODEL` (optional; defaults to `gpt-4.1-mini` for OpenAI or `gemini-3.8-flash` for Gemini)
+- `VEYVRO_AI_MODEL` (optional; **pins** one model and disables automatic model choice. Unset is the recommended setting — see “Multi-model routing” below)
+- `VEYVRO_AI_ROUTING` (optional: `auto` (default), `single`, `collaborative`)
+- `VEYVRO_AI_DAILY_BUDGET_USD` (optional; soft per-instance daily ceiling for the expensive modes, default `20`)
+- `VEYVRO_AI_REQUEST_DEADLINE_MS` (optional; default `54000`, clamped to 5–54 s)
 
 For another provider, choose `VEYVRO_AI_PROVIDER=openai-compatible` and set its base URL, API key, and model. The Gemini option uses `https://generativelanguage.googleapis.com/v1beta/openai` and accepts an override for the model or URL. The browser always calls the same-origin `/api/chat` endpoint; the provider is only contacted by the server.
+
+### Multi-model routing
+
+VEYVRO no longer sends every question to one model. `server/ai/router.ts` reads the request and the plan read in the database, then picks a route; `server/ai/orchestrator.ts` executes it. All model identifiers, prices and parameter profiles live in `server/ai/modelCatalog.ts` and were checked against the official documentation on 2026-11-22 (see the header of that file for the exact URLs).
+
+| Question type | Route | Model |
+| --- | --- | --- |
+| Greeting, single factual question | `fast` | `gpt-6-luna` |
+| Standard comparison / buying advice | `balanced` | `gpt-6.1-terra` |
+| Code, CAN/OBD, calculation, garage-quote document | `coding` | `gpt-6.2-sol` |
+| Safety symptom, multi-part diagnosis | `reasoning` (+ verification) | `gpt-6.2-astra`, checked by `gpt-6.1-terra` |
+| Genuinely hard request on Plus/Pro | `collaborative` | `gpt-6.2-astra` + `gpt-6.2-sol` draft in parallel, `gpt-6.2-sol` (coordinator) merges, `gpt-6.1-terra` verifies |
+
+Rules that keep this honest:
+
+- the costlier routes are **earned by signals**, never by what the browser asks: a `depth` hint can only *lower* cost, and a refusal marker cannot be forged by the client;
+- Découverte never triggers a collaboration — `REQUEST_BUDGET_USD` caps every request per plan and the plan is visibly downgraded (`downgraded: true`) when the ceiling bites;
+- a model that answers "not found / no access" is denylisted for 15 minutes in that instance, so the failure is paid once and the next request routes around it;
+- auth and quota failures are never retried on another model — no other model would fare better;
+- text already shown to the user is never replayed: a mid-stream failure is reported, not duplicated;
+- the SSE contract is unchanged (`event: delta` with `{delta}`, then `event: done`); internal progress travels on a separate `event: stage` channel that existing clients ignore. `done` now also carries `routing: {mode, verified, models}`.
+
+Check which models *your* key may actually use (one free request, key never printed):
+
+```sh
+VEYVRO_AI_API_KEY=... npm run ai:models
+```
+
+An explicit `VEYVRO_AI_MODEL` still wins over automatic choice, so an existing deployment keeps its behaviour until that variable is removed.
 
 For local development, copy `.env.example` to `.env.local`, set `VEYVRO_AI_API_KEY` there, and run the API route through `vercel dev`. `.env.local` is ignored by Git. For a deployed Vercel project, add the key in the project's server environment variable settings and redeploy. Never put the real key in React code, a `VITE_` variable, HTML, or a committed file.
 
