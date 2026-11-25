@@ -196,5 +196,16 @@ export const LIVE_DELEGATION_MODEL = "gpt-6-luna";
 /** Reasoning effort handed to the delegating model, kept aligned with the router. */
 export const LIVE_DELEGATION_EFFORT: ReasoningEffort = "low";
 
+/**
+ * Model used to transcribe the user's speech into the session.
+ *
+ * This is not decoration: `conversation.item.input_audio_transcription.completed`
+ * is what lets the server know what the user said. Without it, the conversation
+ * memory that survives a voice change could only contain the assistant's turns.
+ *
+ * `whisper-1` is the transcription model documented for Live audio input.
+ */
+export const LIVE_TRANSCRIPTION_MODEL = "whisper-1";
+
 /** Hard platform limit documented for a Live session. */
 export const LIVE_MAX_SESSION_MINUTES = 60;

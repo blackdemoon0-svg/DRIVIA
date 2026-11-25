@@ -1,6 +1,5 @@
-import { authorizeRequest, IdentityUnavailableError } from "../server/access.js";
-import { VOICE_RESERVATION_SECONDS, readVoiceUsage, settleVoiceQuota } from "../server/quotas.js";
-import { closeVoiceSession } from "../server/voiceSessions.js";
+import { authorizeRequest, IdentityUnavailableError, readAccessEnv } from "../server/access.js";
+import { settleVoiceSeconds, VoiceStoreUnavailableError } from "../server/voiceUsage.js";
 
 /**
  * Close a voice session and settle its duration.
@@ -8,16 +7,31 @@ import { closeVoiceSession } from "../server/voiceSessions.js";
  * The browser calls this when the user ends the conversation, closes the tab, or
  * changes voice (a voice change restarts the session — see the client hook).
  *
- * The duration is computed from the server-side registry, not from the client:
- * a client-reported duration would let anyone claim a three-second conversation.
- * If the session is unknown — typically because another serverless instance
- * opened it — the reservation is settled instead of being left in the counter:
- * either against the browser's reported duration, clamped to the reservation
- * (`settledWith: "client-duration"`), or released in full when the browser sends
- * nothing usable (`settledWith: "reservation-released"`). The allowance is never
- * silently leaked, and never silently overcharged.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  WHO DECIDES THE DURATION
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The duration is computed by the server from the session row created when the
+ * session opened (`voice_sessions.started_at`), never from what the browser
+ * claims: a client-reported duration would let anyone declare a three-second
+ * conversation.
  *
- * Idempotent: closing twice does not charge twice.
+ * `voice_settle` is idempotent in the database: a second close returns
+ * `already_settled` with the duration recorded at the first one, so a duplicated
+ * beacon cannot charge twice.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  WHEN THE CLIENT'S NUMBER IS USED, AND WHY
+ * ─────────────────────────────────────────────────────────────────────────────
+ * If the session is unknown to the database — the migration was applied after
+ * the session started, or the row was expired — the route releases the
+ * reservation instead of leaving the account stuck with unused seconds. It does
+ * so only through `voice_refund`, which is a bounded, idempotent operation:
+ *  * a refund can only give back what was actually reserved,
+ *  * it cannot create a credit, because `voice_usage_daily.reserved_seconds` is
+ *    floored at zero by the database.
+ *
+ * The client's `durationSeconds` is therefore *not* trusted for billing. It is
+ * echoed back in `clientReportedSeconds` for diagnosis only.
  */
 
 type ApiRequest = {
@@ -48,6 +62,9 @@ function bodyRecord(body: unknown): Record<string, unknown> {
   return typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
 }
 
+/** The UUID shape the database will accept, checked before any round trip. */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export default async function handler(request: ApiRequest, response: ApiResponse) {
   if (request.method !== "POST") {
     return response.status(405).json({ error: "Only POST requests are supported." });
@@ -75,70 +92,82 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     });
   }
 
-  const closed = closeVoiceSession(sessionId, access.userId);
+  const env = readAccessEnv();
+  if (!env) {
+    return response.status(503).json({
+      code: "not_configured",
+      error: "VEYVRO's voice store is not configured on the server.",
+    });
+  }
+  const storeEnv = { url: env.url, serviceRoleKey: env.serviceRoleKey };
 
-  if (!closed) {
-    // Unknown session: it was opened on another serverless instance, or already
-    // forgotten. The registry cannot know the duration, so the browser's own
-    // duration is used — bounded — instead of charging nothing silently.
-    //
-    // Why this matters: a user whose session ended should not keep paying for
-    // it. Leaving the 60-second reservation in the counter would leak the
-    // allowance a little more with every instance switch, and a user on a 10
-    // minute plan would be blocked after ten sessions they never used.
-    //
-    // The client value is only a hint: it is clamped to the reservation made at
-    // session start, which the server owns. A lying client can therefore never
-    // charge less than zero, nor more than it reserved.
-    const reported = Number.isFinite(Number(body.durationSeconds))
-      ? Math.max(0, Math.round(Number(body.durationSeconds)))
-      : null;
+  // A session id that is not a UUID cannot be one of ours. Rejecting it here
+  // avoids a pointless round trip and a confusing Postgres cast error.
+  if (!UUID_PATTERN.test(sessionId)) {
+    return response.status(400).json({
+      code: "invalid_session",
+      error: "The sessionId is not valid.",
+    });
+  }
 
-    if (reported === null) {
-      // No usable duration: give the reservation back in full. A session we
-      // cannot measure must not cost the user anything.
-      const refunded = settleVoiceQuota({
-        userId: access.userId,
-        reservedSeconds: VOICE_RESERVATION_SECONDS,
-        actualSeconds: 0,
-      });
+  const reported = Number.isFinite(Number(body.durationSeconds))
+    ? Math.max(0, Math.round(Number(body.durationSeconds)))
+    : null;
+
+  try {
+    const settled = await settleVoiceSeconds(storeEnv, {
+      userId: access.userId,
+      sessionId,
+      // The database decides the real duration; this value is only used when
+      // the row is unknown, where the settlement is refused anyway.
+      actualSeconds: reported ?? 0,
+    });
+
+    if (settled.kind === "unknown_session") {
+      // No such session for this account: a stale id, another account's id, or
+      // a row that was swept. Nothing is charged — and nothing is refunded at
+      // account level either, deliberately: with one open session per account,
+      // an account-wide release would be safe today, but it would release the
+      // fees of a session that does exist the day that invariant changes.
+      //
+      // The ledger keeps a reservation only when a row exists to point at it;
+      // if a row were deleted out of band, the remaining reservation is
+      // released by the lease (`voice_expire_stale`) at the next reservation,
+      // which is the single place that reconciles this account.
       return response.status(200).json({
-        settledWith: "reservation-released",
+        settledWith: "unknown-session",
         chargedSeconds: 0,
-        usedSeconds: refunded.usedSeconds,
+        clientReportedSeconds: reported,
       });
     }
 
-    const settled = settleVoiceQuota({
-      userId: access.userId,
-      reservedSeconds: VOICE_RESERVATION_SECONDS,
-      actualSeconds: Math.min(reported, VOICE_RESERVATION_SECONDS),
-    });
+    if (settled.kind === "already_settled") {
+      return response.status(200).json({
+        settledWith: "already-closed",
+        chargedSeconds: settled.chargedSeconds,
+        usedSeconds: settled.usedSeconds,
+      });
+    }
+
+    if (settled.kind === "already_released") {
+      return response.status(200).json({
+        settledWith: "already-released",
+        chargedSeconds: 0,
+        usedSeconds: settled.usedSeconds,
+      });
+    }
+
     return response.status(200).json({
-      settledWith: "client-duration",
+      settledWith: "duration",
       chargedSeconds: settled.chargedSeconds,
       usedSeconds: settled.usedSeconds,
     });
+  } catch (error) {
+    if (error instanceof VoiceStoreUnavailableError) {
+      // Fail closed but visibly: the caller learns the settlement did not
+      // happen, and a retry is legitimate because the operation is idempotent.
+      return response.status(503).json({ code: "voice_store_unavailable", error: error.message });
+    }
+    throw error;
   }
-
-  if (closed.actualSeconds < 0) {
-    // Already closed earlier: do not charge again.
-    return response.status(200).json({
-      settledWith: "already-closed",
-      chargedSeconds: 0,
-      usedSeconds: readVoiceUsage(access.userId),
-    });
-  }
-
-  const settled = settleVoiceQuota({
-    userId: access.userId,
-    reservedSeconds: closed.record.reservedSeconds,
-    actualSeconds: closed.durationSeconds,
-  });
-
-  return response.status(200).json({
-    settledWith: "duration",
-    chargedSeconds: settled.chargedSeconds,
-    usedSeconds: settled.usedSeconds,
-  });
 }

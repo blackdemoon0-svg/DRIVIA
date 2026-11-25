@@ -19,6 +19,17 @@ import { startVoiceSession, endVoiceSession, voiceErrorMessage } from './chatApi
 const ICE_GATHERING_TIMEOUT_MS = 5000
 const DATA_CHANNEL_LABEL = 'oai-events'
 
+// Mémoire de la conversation vocale, conservée entre deux sessions.
+//
+// Une voix est figée dans une session GPT-Live : changer de voix impose de
+// fermer la session et d'en ouvrir une neuve (voir `restartWithVoice`). Sans
+// mémoire, VEYVRO repartait de zéro et oubliait tout ce qui venait d'être dit.
+//
+// La mémoire vit ici, dans le hook, et non dans `chat.messages` : le vocal et
+// l'écrit restent deux fils distincts, mais le vocal se souvient de lui-même.
+const MAX_VOICE_MEMORY_MESSAGES = 12
+const MAX_VOICE_MEMORY_CHARACTERS = 4000
+
 function microphoneSupported() {
   return (
     typeof navigator !== 'undefined' &&
@@ -42,6 +53,69 @@ export function microphoneErrorMessage(error) {
   return 'Impossible de démarrer le microphone.'
 }
 
+/**
+ * Rôle d'un événement du data channel, ou `null` s'il n'en porte pas.
+ *
+ * Les deux événements qui comptent sont les transcriptions finalisées : celle
+ * de l'utilisateur (sa parole, transcrite) et celle de l'assistant. Les
+ * fragments de streaming sont ignorés — voir `MAX_VOICE_MEMORY_MESSAGES`.
+ */
+function transcriptRole(payload) {
+  if (typeof payload?.role === 'string') {
+    if (payload.role === 'user' || payload.role === 'assistant') return payload.role
+  }
+  if (payload?.type === 'conversation.item.input_audio_transcription.completed') return 'user'
+  if (payload?.type === 'response.audio_transcript.done') return 'assistant'
+  if (payload?.type === 'response.text.done') return 'assistant'
+  return null
+}
+
+/**
+ * Ajoute un tour à la mémoire vocale, en tenant les deux bornes.
+ *
+ * `MAX_VOICE_MEMORY_MESSAGES` limite la profondeur du fil ;
+ * `MAX_VOICE_MEMORY_CHARACTERS` limite ce que la session suivante recevra. Un
+ * long monologue ne doit pas faire exploser la requête de session.
+ */
+function pushMemory(memory, role, content) {
+  const next = [...memory, { role, content }]
+  let kept = next.slice(-MAX_VOICE_MEMORY_MESSAGES)
+  let total = kept.reduce((sum, message) => sum + message.content.length, 0)
+  while (kept.length > 1 && total > MAX_VOICE_MEMORY_CHARACTERS) {
+    total -= kept[0].content.length
+    kept = kept.slice(1)
+  }
+  return kept
+}
+
+/**
+ * Fusionne deux fils sans doublon consécutif.
+ *
+ * Le parent peut fournir la conversation texte (`history`), la session en cours
+ * fournit son propre fil vocal (`voiceHistoryRef`). Les deux sont utiles : le
+ * vocal doit reprendre le contexte écrit ET ce qui vient d'être dit à voix
+ * haute.
+ */
+export function mergeVoiceHistory(chatHistory, voiceMemory) {
+  const merged = []
+  const consider = (role, content) => {
+    if (role !== 'user' && role !== 'assistant') return
+    if (typeof content !== 'string') return
+    const text = content.trim()
+    if (!text) return
+    const last = merged[merged.length - 1]
+    if (last && last.role === role && last.content === text) return
+    merged.push({ role, content: text })
+  }
+  if (Array.isArray(chatHistory)) {
+    for (const message of chatHistory) consider(message?.role, message?.content)
+  }
+  if (Array.isArray(voiceMemory)) {
+    for (const message of voiceMemory) consider(message?.role, message?.content)
+  }
+  return merged
+}
+
 export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }) {
   const [status, setStatus] = useState('idle') // idle | connecting | live | error
   const [micEnabled, setMicEnabled] = useState(false)
@@ -61,6 +135,10 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
   // Une session est ouverte : l'état React peut retarder d'un rendu, ce drapeau
   // non. Il empêche deux sessions simultanées, donc deux facturations.
   const activeRef = useRef(false)
+  // Fil de la conversation vocale, y compris à travers les changements de voix.
+  // Une ref et non un état : la valeur doit être lue au moment exact où la
+  // nouvelle session est créée, sans attendre un rendu.
+  const voiceHistoryRef = useRef([])
 
   /** Secondes écoulées depuis l'ouverture de la session, ou null. */
   const elapsedSeconds = () => {
@@ -68,6 +146,11 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
     if (!startedAt) return null
     return Math.max(0, Math.round((Date.now() - startedAt) / 1000))
   }
+
+  /** Ajoute un tour à la mémoire vocale, sans provoquer de rendu inutile. */
+  const appendVoiceMemory = useCallback((role, content) => {
+    voiceHistoryRef.current = pushMemory(voiceHistoryRef.current, role, content)
+  }, [])
 
   const cleanupPeer = useCallback(async () => {
     const sessionId = sessionIdRef.current
@@ -109,6 +192,10 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
     await cleanupPeer()
     setMicEnabled(false)
     setStatus('idle')
+    // Fin voulue par l'utilisateur : la mémoire vocale est effacée. Elle ne
+    // survit qu'aux changements de voix, pas à une conversation terminée.
+    voiceHistoryRef.current = []
+    setTranscript([])
   }, [cleanupPeer])
 
   /** Coupe ou rétablit le micro sans fermer la session (la session reste facturée). */
@@ -147,7 +234,7 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
    * ait re-rendu avec la nouvelle préférence. Un événement de clic n'est pas un
    * identifiant de voix : tout ce qui n'est pas une chaîne est ignoré.
    */
-  const start = useCallback(
+  const startSession = useCallback(
     async (voiceOverride) => {
       const sessionVoice = typeof voiceOverride === 'string' && voiceOverride ? voiceOverride : voice
       if (!sessionVoice) return
@@ -206,6 +293,20 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
           if (payload.type.endsWith('.delta') && typeof delta === 'string' && delta) {
             setTranscript((prev) => [...prev.slice(-40), { role: 'assistant', text: delta }])
           }
+
+          // Mémoire de session : on ne garde que du texte final, jamais des
+          // fragments. Un `delta` recopié tel quel produirait un historique
+          // haché, où chaque mot serait un message.
+          const role = transcriptRole(payload)
+          const text =
+            payload.type === 'conversation.item.input_audio_transcription.completed' ||
+            payload.type === 'response.audio_transcript.done' ||
+            payload.type === 'response.text.done'
+              ? payload.transcript ?? payload.text ?? null
+              : null
+          if (role && typeof text === 'string' && text.trim()) {
+            appendVoiceMemory(role, text.trim())
+          }
         })
 
         stream.getTracks().forEach((track) => pc.addTrack(track, stream))
@@ -214,10 +315,13 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
         await pc.setLocalDescription(offer)
         await waitForIceGathering(pc)
 
+        // Le contexte transmis est la fusion du fil écrit (fourni par le
+        // parent) et du fil vocal de cette conversation. C'est ce qui permet à
+        // VEYVRO de garder le fil après un changement de voix.
         const answer = await startVoiceSession({
           sdp: pc.localDescription?.sdp ?? offer.sdp,
           voice: sessionVoice,
-          history,
+          history: mergeVoiceHistory(history, voiceHistoryRef.current),
           accessToken,
         })
 
@@ -249,6 +353,16 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
     [accessToken, cleanupPeer, history, onVoiceSubstituted, voice]
   )
 
+  // `startSession` change d'identité à chaque nouvelle voix ou nouveau fil.
+  // `restartWithVoice` doit pourtant appeler la PLUS RÉCENTE version : sans
+  // cette ref, il appellerait celle capturée au rendu du clic, et la nouvelle
+  // session repartirait avec l'ancienne voix. Le bug est silencieux et
+  // n'apparaît qu'après un second changement de voix.
+  const startRef = useRef(startSession)
+  useEffect(() => {
+    startRef.current = startSession
+  }, [startSession])
+
   /**
    * Redémarrage propre après changement de voix.
    *
@@ -267,9 +381,9 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
         setStatus('idle')
         return
       }
-      await start(nextVoice)
+      await startRef.current(nextVoice)
     },
-    [accessToken, cleanupPeer, start, status, voice]
+    [accessToken, cleanupPeer, status, voice]
   )
 
   // Fermeture de page : on ne peut pas attendre une réponse HTTP, mais on peut
@@ -308,7 +422,7 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
     quota,
     transcript,
     audioRef,
-    start,
+    start: startSession,
     stop,
     toggleMic,
     restartWithVoice,

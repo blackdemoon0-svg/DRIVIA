@@ -24,6 +24,7 @@ import {
   LIVE_DELEGATION_EFFORT,
   LIVE_DELEGATION_MODEL,
   LIVE_MODEL,
+  LIVE_TRANSCRIPTION_MODEL,
   type LiveVoice,
 } from "../server/ai/voiceCatalog.js";
 import type { ProviderMessage } from "../server/ai/provider.js";
@@ -95,7 +96,21 @@ DELEGATED BACKEND CHANNEL
 export type LiveSessionConfig = {
   model: string;
   instructions: string;
-  audio: { output: { voice: string } };
+  audio: {
+    output: { voice: string };
+    /**
+     * Transcription de la parole de l'utilisateur.
+     *
+     * Sans elle, le serveur n'a AUCUN moyen de connaître ce que l'utilisateur a
+     * dit : le data channel ne transporte alors que la parole de l'assistant.
+     * L'historique transmis à la session suivante (après un changement de voix)
+     * ne contiendrait donc que les réponses de VEYVRO, et le fil serait perdu —
+     * exactement le défaut à corriger.
+     *
+     * `whisper-1` est le modèle de transcription documenté pour l'entrée audio.
+     */
+    input: { transcription: { model: string } };
+  };
   delegation: {
     type: "responses";
     responses: {
@@ -120,6 +135,9 @@ export type LiveSessionConfig = {
  *     not kept for forking.
  *   • no `audio.format` — WebRTC negotiates the format during connection; the
  *     documentation says to leave it out of WebRTC requests.
+ *   • `audio.input.transcription` — requested explicitly. The server cannot
+ *     know what the user said otherwise, and the conversation memory that
+ *     survives a voice change is built from those transcriptions.
  */
 export function buildLiveSessionConfig(voice: LiveVoice): LiveSessionConfig {
   const instructions = `${VEYVRO_SYSTEM_PROMPT}\n\n${CONVERSATION_INSTRUCTIONS}`;
@@ -130,7 +148,10 @@ export function buildLiveSessionConfig(voice: LiveVoice): LiveSessionConfig {
   return {
     model: LIVE_MODEL,
     instructions,
-    audio: { output: { voice: voice.id } },
+    audio: {
+      output: { voice: voice.id },
+      input: { transcription: { model: LIVE_TRANSCRIPTION_MODEL } },
+    },
     delegation: {
       type: "responses",
       responses: {

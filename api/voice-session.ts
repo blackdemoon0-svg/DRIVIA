@@ -1,9 +1,14 @@
 import crypto from "node:crypto";
 import { authorizeRequest, IdentityUnavailableError, readAccessEnv } from "../server/access.js";
-import { reserveVoiceQuota, settleVoiceQuota } from "../server/quotas.js";
+import {
+  reserveVoiceSeconds,
+  refundVoiceReservation,
+  VoiceStoreUnavailableError,
+  type VoiceStoreEnv,
+} from "../server/voiceUsage.js";
+import { VOICE_RESERVATION_SECONDS, VOICE_RESERVATION_TTL_SECONDS } from "../server/quotas.js";
 import { buildLiveSessionConfig, buildSessionInput } from "./_liveConfig.js";
 import { selectVoice, type LiveVoice } from "../server/ai/voiceCatalog.js";
-import { openVoiceSession } from "../server/voiceSessions.js";
 
 /**
  * Start a GPT-Live WebRTC session.
@@ -26,10 +31,16 @@ import { openVoiceSession } from "../server/voiceSessions.js";
  *      fact is reported so the client can correct its stored preference;
  *   3. plan rights — `voiceMinutesPerDay === 0` refuses before any provider
  *      call, so a Découverte request costs nothing;
- *   4. quota reservation — seconds are reserved up front to stop several
- *      parallel sessions from each passing the same check;
+ *   4. quota reservation — seconds are reserved up front, IN POSTGRES, so the
+ *      reservation is atomic and shared by every instance (migration
+ *      0004_voice_usage.sql). The database also refuses a second open session
+ *      for the same account, which is what makes two tabs harmless;
  *   5. provider call — and, if it fails, the reservation is immediately given
  *      back: a failed session must not eat the user's allowance.
+ *
+ * The reservation now returns the session id, so this route no longer keeps a
+ * registry of its own: the row in `voice_sessions` IS the record, and it
+ * survives a cold start.
  */
 
 type ApiRequest = {
@@ -71,6 +82,19 @@ function readRequestHeader(request: ApiRequest, name: string): string | null {
 
 function bodyRecord(body: unknown): Record<string, unknown> {
   return typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+}
+
+/**
+ * The store needs the project URL and the service role key.
+ *
+ * `readAccessEnv()` already validates all three Supabase variables; these two
+ * are the subset the RPC calls use. Returns `null` when incomplete, so the
+ * caller can answer 503 rather than half-working.
+ */
+function voiceStoreEnv(): VoiceStoreEnv | null {
+  const env = readAccessEnv();
+  if (!env) return null;
+  return { url: env.url, serviceRoleKey: env.serviceRoleKey };
 }
 
 /**
@@ -308,38 +332,68 @@ export default async function handler(request: ApiRequest, response: ApiResponse
   // so it can repair the account preference.
   const { voice, rejectedRequest } = selectVoice(body.voice);
 
-  const reservation = reserveVoiceQuota({
-    userId: access.userId,
-    plan: access.plan,
-  });
+  const storeEnv = voiceStoreEnv();
+  if (!storeEnv) {
+    return response.status(503).json({
+      code: "not_configured",
+      error: "VEYVRO's voice store is not configured on the server.",
+    });
+  }
+
+  const apiKey = readEnvVar("VEYVRO_AI_API_KEY", "VEYDRIVO_AI_API_KEY", "DRIVIA_AI_API_KEY");
+  if (!apiKey) {
+    // Checked BEFORE reserving: a missing key is a deployment fault, and it
+    // must not leave a reservation to refund.
+    return response.status(503).json({
+      code: "missing_api_key",
+      error: "VEYVRO's AI provider is not configured. Set VEYVRO_AI_API_KEY on the server.",
+    });
+  }
+
+  // Reserved atomically in Postgres. A Découverte account is refused here, by
+  // `voice_not_in_plan`, before any provider call.
+  let reservation: Awaited<ReturnType<typeof reserveVoiceSeconds>>;
+  try {
+    reservation = await reserveVoiceSeconds(storeEnv, {
+      userId: access.userId,
+      allowanceSeconds: access.limits.voiceMinutesPerDay * 60,
+      reserveSeconds: VOICE_RESERVATION_SECONDS,
+      voiceId: voice.id,
+      ttlSeconds: VOICE_RESERVATION_TTL_SECONDS,
+    });
+  } catch (error) {
+    if (error instanceof VoiceStoreUnavailableError) {
+      return response.status(503).json({ code: "voice_store_unavailable", error: error.message });
+    }
+    throw error;
+  }
+
   if (!reservation.ok) {
     if (reservation.retryAfterSeconds > 0) {
       response.setHeader("Retry-After", String(reservation.retryAfterSeconds));
     }
-    return response.status(reservation.kind === "voice_not_in_plan" ? 403 : 429).json({
+    // `voice_session_open` is a 409: the account already has a live session.
+    // Answering 429 would make the interface suggest waiting for a quota reset
+    // when the real cause is a tab that is still open.
+    const status =
+      reservation.kind === "voice_not_in_plan"
+        ? 403
+        : reservation.kind === "voice_session_open"
+          ? 409
+          : 429;
+    const error =
+      reservation.kind === "voice_not_in_plan"
+        ? "La conversation vocale fait partie des formules VEYVRO Plus et Pro. / Voice conversation is part of the VEYVRO Plus and Pro plans."
+        : reservation.kind === "voice_session_open"
+          ? "Une conversation vocale est déjà en cours sur ce compte. Terminez-la avant d'en ouvrir une autre. / A voice conversation is already running on this account."
+          : `Vous avez atteint votre quota vocal de ${Math.floor(reservation.limitSeconds / 60)} minutes pour aujourd'hui. Il revient à minuit UTC. / You have reached your daily voice allowance of ${Math.floor(reservation.limitSeconds / 60)} minutes. It resets at midnight UTC.`;
+    return response.status(status).json({
       code: reservation.kind,
-      error: reservation.error,
+      error,
       plan: access.plan,
-      limit: reservation.limit,
-      used: reservation.used,
+      limit: Math.floor(reservation.limitSeconds / 60),
+      used: Math.floor(reservation.usedSeconds / 60),
       retryAfterSeconds: reservation.retryAfterSeconds,
-    });
-  }
-
-  const accessEnv = readAccessEnv();
-  const apiKey = readEnvVar("VEYVRO_AI_API_KEY", "VEYDRIVO_AI_API_KEY", "DRIVIA_AI_API_KEY");
-  if (!apiKey || !accessEnv) {
-    // Give the reservation back: nothing was created upstream.
-    settleVoiceQuota({
-      userId: access.userId,
-      reservedSeconds: reservation.reservedSeconds,
-      actualSeconds: 0,
-    });
-    return response.status(503).json({
-      code: apiKey ? "not_configured" : "missing_api_key",
-      error: apiKey
-        ? "VEYVRO's voice provider is not configured on the server."
-        : "VEYVRO's AI provider is not configured. Set VEYVRO_AI_API_KEY on the server.",
     });
   }
 
@@ -358,26 +412,20 @@ export default async function handler(request: ApiRequest, response: ApiResponse
 
   if (!created.ok) {
     // A session that never started must not cost the user any of their minutes.
-    settleVoiceQuota({
+    // The refund is idempotent in the database, so a retried request cannot
+    // give the reservation back twice.
+    await refundVoiceReservation(storeEnv, {
       userId: access.userId,
-      reservedSeconds: reservation.reservedSeconds,
-      actualSeconds: 0,
-    });
+      sessionId: reservation.sessionId,
+    }).catch(() => null);
     if (created.status === 429) {
       response.setHeader("Retry-After", "5");
     }
     return response.status(created.status).json({ code: created.code, error: created.error });
   }
 
-  const { id } = openVoiceSession({
-    userId: access.userId,
-    voiceId: voice.id,
-    reservedSeconds: reservation.reservedSeconds,
-    providerSessionId: created.providerSessionId,
-  });
-
   return response.status(201).json({
-    sessionId: id,
+    sessionId: reservation.sessionId,
     sdp: created.sdp,
     voice: {
       id: voice.id,
@@ -385,8 +433,9 @@ export default async function handler(request: ApiRequest, response: ApiResponse
       replacedInvalidRequest: rejectedRequest,
     },
     quota: {
-      limitMinutes: reservation.limits.voiceMinutesPerDay,
+      limitMinutes: Math.floor(access.limits.voiceMinutesPerDay),
       remainingSeconds: reservation.remainingSeconds,
+      usedSeconds: reservation.usedSeconds,
     },
   });
 }

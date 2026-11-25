@@ -11,7 +11,7 @@ compte** et **enregistré sur le compte**.
 | Transport | WebRTC, échange SDP côté serveur |
 | Voix par défaut | `brise` |
 | Voix proposées | 28 voix documentées + `marin` (défaut OpenAI) |
-| Quota vocal | `voiceMinutesPerDay` : Découverte 0, Plus 10, Pro 30 |
+| Quota vocal | `voiceMinutesPerDay` : Découverte 0, Plus 10, Pro 30, **persistant en base** |
 | Préférence | `raw_user_meta_data.veyvro_voice` (aucune table, aucune migration) |
 
 ## Fichiers
@@ -21,7 +21,10 @@ compte** et **enregistré sur le compte**.
 | Fichier | Rôle |
 | --- | --- |
 | `server/ai/voiceCatalog.ts` | Le catalogue des voix, source unique ; résolution et validation d'un identifiant ; modèle et cible de délégation |
-| `server/voiceSessions.ts` | Registre serveur des sessions ouvertes : propriétaire, début, durée réelle, fermeture idempotente |
+| `server/voiceUsage.ts` | Appels aux fonctions SQL `voice_*` : réservation, règlement, remboursement. Aucun état local |
+| ~~`server/voiceSessions.ts`~~ | **Supprimé** : le registre en mémoire est remplacé par la table `voice_sessions` |
+| `supabase/migrations/0004_voice_usage.sql` | Tables `voice_usage_daily` et `voice_sessions`, cinq fonctions, RLS. **Non exécutée** |
+| `scripts/sql/voice-usage.sql.test.mjs` | Exécute la migration dans un PostgreSQL 16 réel (PGlite) et prouve les garanties |
 | `api/_liveConfig.ts` | Construction de la configuration de session (modèle, voix, consignes, délégation). Préfixe `_` : ce n'est pas une route |
 | `api/voice-session.ts` | `POST` une offre SDP → authentification → validation de la voix → quota → session Live → réponse SDP |
 | `api/voice-end.ts` | Ferme une session et règle la durée réelle côté serveur |
@@ -30,7 +33,8 @@ compte** et **enregistré sur le compte**.
 | `src/lib/useVoiceLive.js` | Session WebRTC : micro, data channel `oai-events`, fin, changement de voix |
 | `src/components/VoicePicker.jsx` | Sélecteur de voix (aperçus uniquement s'ils sont réels) |
 | `src/components/VoiceLiveButton.jsx` | Bouton micro, état de session, quota restant |
-| `scripts/voice.test.mjs` | 94 contrôles : catalogue, validation, quota, sessions simultanées, fermetures anormales, erreurs, formules, périmètre, additivité |
+| `scripts/voice.test.mjs` | 102 contrôles : catalogue, validation, quota, sessions simultanées, fermetures anormales, contexte, erreurs, formules, périmètre, additivité |
+| `scripts/voice-store.stub.mjs` | Double fidèle des fonctions SQL pour les tests de route (sans réseau) |
 
 **Modifiés — de façon strictement additive**
 
@@ -45,7 +49,7 @@ compte** et **enregistré sur le compte**.
 | `src/components/Icons.jsx` | `MicIcon`, `MicOffIcon` |
 | `src/index.css` | Styles du bouton et du sélecteur |
 | `scripts/access.test.mjs` | Les trois `deepEqual` de `PLAN_LIMITS` incluent le nouveau champ ; la fixture « abonnement Pro » est ancrée sur l'horloge réelle (voir plus bas) |
-| `package.json` | `test:voice` ajouté à la suite `test` |
+| `package.json` | `test:voice` et `test:voice-sql` ajoutés à la suite `test` ; `@electric-sql/pglite` en dépendance de développement |
 
 ## Contrats d'API
 
@@ -60,11 +64,11 @@ compte** et **enregistré sur le compte**.
   "sessionId": "…",                 // identifiant serveur, pas celui d'OpenAI
   "sdp": "v=0…",                    // réponse SDP à appliquer
   "voice": { "id": "brise", "label": "Brise", "replacedInvalidRequest": false },
-  "quota": { "limitMinutes": 10, "remainingSeconds": 540 }
+  "quota": { "limitMinutes": 10, "remainingSeconds": 540, "usedSeconds": 60 }
 }
 ```
 
-Erreurs : `invalid_offer` 400 · `voice_not_in_plan` 403 · `voice_minutes_exhausted` / `rate_limited` 429 (+`Retry-After`) · `invalid_api_key` / `voice_unavailable` / `provider_error` 502 · `timeout` 504 · `identity_unavailable` / `missing_api_key` / `not_configured` 503.
+Erreurs : `invalid_offer` 400 · `voice_not_in_plan` 403 · **`voice_session_open` 409** · `voice_minutes_exhausted` / `rate_limited` 429 (+`Retry-After`) · `invalid_api_key` / `voice_unavailable` / `provider_error` 502 · `timeout` 504 · `identity_unavailable` / `missing_api_key` / `not_configured` / **`voice_store_unavailable`** 503.
 
 Un identifiant de voix inconnu **n'est jamais transmis** : il est remplacé par
 `brise` et `replacedInvalidRequest: true` permet au client de corriger la
@@ -75,32 +79,82 @@ préférence enregistrée.
 ```jsonc
 { "sessionId": "…" }
 // 200
-{ "settledWith": "duration" | "already-closed" | "unavailable",
+{ "settledWith": "duration" | "already-closed" | "already-released" | "unknown-session",
   "chargedSeconds": 42, "usedSeconds": 42 }
 ```
 
-La durée vient du registre serveur, jamais du client. Fermer deux fois ne
-facture pas deux fois.
+La durée vient de la base (`voice_sessions.started_at`), **jamais du client**.
+Fermer deux fois ne facture pas deux fois. Une session inconnue ne facture rien
+et renvoie `clientReportedSeconds` pour le diagnostic seulement.
 
 ### `GET | PUT /api/voice-profiles`
 
 `GET` renvoie le catalogue même à un visiteur non connecté (`selected: null`) ;
 pour un compte, `selected` est la voix enregistrée si elle existe encore dans le
 catalogue, sinon `brise`. `PUT { voice }` valide puis écrit
-`data.veyvro_voice` via l'API admin Supabase — le même mécanisme que
-`avatar_url`.
+`data.veyvro_voice` via `PUT /auth/v1/user` avec le jeton de l'utilisateur, qui
+**fusionne** les métadonnées — c'est ce qui préserve `avatar_url` et
+`avatar_path`.
 
-## Quota vocal
+## Quota vocal — persistant et partagé
 
-Pas de second système : `voiceSeconds` est un champ de l'entrée de compteur
-existante (`messages`, `quotes`), remise à zéro avec elles à minuit UTC.
+Le compteur vocal **n'est plus en mémoire**. Il vivait dans un `Map` par
+instance : un redémarrage à froid le remettait à zéro, et deux instances Vercel
+ne partageaient rien — un compte Pro pouvait donc consommer 30 minutes **par
+instance**. Il vit désormais dans Postgres (`0004_voice_usage.sql`), partagé par
+toutes les instances.
 
-1. La session **réserve** 60 s avant l'appel fournisseur (deux sessions
-   parallèles ne peuvent pas passer la même vérification).
-2. Un échec fournisseur **rend** immédiatement la réservation : une session qui
-   n'a pas démarré ne coûte rien.
-3. La fermeture **règle** la durée réelle (`réservé − réel`, négatif autorisé :
-   une session de 90 s consomme 90 s).
+Formules : Découverte **0**, Plus **10**, Pro **30** minutes par jour UTC.
+
+### Les cinq opérations
+
+1. **Réserver** (`voice_reserve`) — 60 s, avant l'appel fournisseur. L'incrément
+   et la condition d'autorisation sont dans le **même `UPDATE ... WHERE`** : deux
+   réservations concurrentes ne peuvent pas passer toutes les deux, quelle que
+   soit l'instance.
+2. **Refuser une seconde session** — un index unique partiel impose **une seule
+   session ouverte par compte**. Deux onglets sont refusés en `409
+   voice_session_open`, pas facturés deux fois.
+3. **Régulariser** (`voice_settle`) — à la fermeture, la réservation est
+   remplacée par la durée réelle, lue depuis `voice_sessions.started_at`. Une
+   session de 90 s coûte 90 s. Idempotent : un beacon tardif ne refacture rien.
+4. **Rembourser** (`voice_refund`) — si le fournisseur échoue, la réservation est
+   rendue en entier. Idempotent par état.
+5. **Libérer un bail expiré** (`voice_expire_stale`) — une session ouverte depuis
+   plus d'une heure sans fermeture est expirée et sa réservation rendue. Un
+   onglet tué ne bloque pas le compte jusqu'à minuit.
+
+### Ce que le client ne peut pas faire
+
+**La durée n'est jamais celle annoncée par le navigateur.** Elle est lue dans la
+base. La valeur envoyée par le client n'est renvoyée que pour le diagnostic
+(`clientReportedSeconds`), et une session inconnue ne facture **rien** — la
+version précédente la facturait, plafonnée à 60 s, ce qui restait un chiffre
+fourni par le client.
+
+Si Supabase est injoignable, la route répond `503 voice_store_unavailable` :
+elle **échoue fermé**, elle ne retombe pas sur un compteur en mémoire.
+
+## Contexte vocal — conservé lors d'un changement de voix
+
+Une voix est figée dans une session GPT-Live : changer de voix ferme la session
+et en ouvre une nouvelle. Sans mémoire, VEYVRO repartait de zéro.
+
+- La session demande maintenant la **transcription de l'entrée audio**
+  (`audio.input.transcription`, modèle `whisper-1`). Sans elle, le seul texte
+  disponible serait celui de l'assistant : l'historique ne contiendrait que ses
+  propres réponses.
+- `useVoiceLive` tient une **mémoire vocale** (`voiceHistoryRef`), alimentée par
+  les transcriptions finalisées — jamais par les fragments de streaming, qui
+  produiraient un historique haché.
+- À chaque ouverture, `mergeVoiceHistory` fusionne le fil **écrit** (fourni par
+  `App`) et le fil **vocal**, sans doublon consécutif. Bornes : 12 messages et
+  4 000 caractères.
+- La mémoire survit aux **changements de voix**, et est effacée par `stop()` :
+  une conversation terminée ne pollue pas la suivante.
+- `restartWithVoice` appelle la version **la plus récente** de `start` via une
+  ref. Sans cela, le second changement de voix serait reparti avec la voix
+  capturée au premier clic — un bug silencieux.
 
 ## Corrections apportées après la revue du 2026-11-22
 
@@ -147,16 +201,24 @@ environnement, pas dans le code :
   pire que de n'en avoir aucun. Le sélecteur l'annonce explicitement à
   l'utilisateur. La génération est prévue par `scripts/voice-samples.mjs`, qui
   nécessite une clé réelle.
-- **Comportement multi-instance.** Le registre des sessions et les compteurs
-  sont en mémoire, comme les quotas existants. Une session ouverte sur une
-  instance et fermée sur une autre renvoie `settledWith: "unavailable"` au lieu
-  de facturer un chiffre inventé.
+- **Comportement multi-instance réel.** Il est désormais **prouvé par le SQL**,
+  pas par un déploiement : `scripts/sql/voice-usage.sql.test.mjs` exécute la
+  migration dans un PostgreSQL 16 réel (PGlite) et lance deux réservations et
+  quatre fermetures **simultanées**. Ce n'est pas deux instances Vercel : c'est
+  deux sessions Postgres concurrentes sur les mêmes lignes. C'est le niveau de
+  preuve disponible ici, et il est honnête de le dire ainsi.
+- **La migration n'est pas appliquée.** `0004_voice_usage.sql` est proposée,
+  testée sur PostgreSQL 16, **jamais exécutée sur Supabase**. Tant qu'elle ne
+  l'est pas, les routes renvoient `503 voice_store_unavailable` (le message
+  nomme la migration).
 
 ## Notes d'exploitation
 
 - Aucune variable d'environnement nouvelle : `VEYVRO_AI_API_KEY`,
   `VEYVRO_AI_BASE_URL`, et les trois clés Supabase existantes.
-- Aucune migration SQL.
+- **Une migration SQL devient nécessaire** : `0004_voice_usage.sql`. Non
+  exécutée. Sans elle, la voix répond `503 voice_store_unavailable`, elle ne
+  retombe pas silencieusement sur l'ancien comportement.
 - La voix est figée pour la durée d'une session GPT-Live : changer de voix
   ferme la session et en ouvre une nouvelle avec le même contexte. C'est la
   seule façon honnête de le faire, et c'est ce que fait l'interface.
