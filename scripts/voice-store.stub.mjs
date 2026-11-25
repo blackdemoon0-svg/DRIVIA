@@ -47,6 +47,9 @@ function secondsUntilUtcMidnight(nowMs) {
 /** Margin granted around an active session's reservation, as the SQL does. */
 const LEASE_MARGIN_SECONDS = 300;
 
+/** Marge avant minuit, comme le SQL : une session ne traverse jamais le jour. */
+const MIN_RESERVABLE_SECONDS = 60;
+
 export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
   /** `${userId}|${day}` → { consumed, reserved } */
   const usage = new Map();
@@ -226,18 +229,60 @@ export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
       return { ok: true, kind: "activated" };
     },
 
+    // Le battement de cœur est l'AUTORITÉ de fin de session : il répond
+    // `should_stop` et clôt lui-même au plafond, comme le fait le SQL.
     voice_touch(args) {
       const nowMs = now();
+      const maxSession = ceiling(args, "voice_touch");
       const session = sessions.get(args.p_session_id);
       if (!session || session.userId !== args.p_user_id) {
-        return { ok: false, kind: "unknown_session" };
+        return { ok: false, kind: "unknown_session", should_stop: true, remaining_seconds: 0 };
       }
       if (session.state !== "active") {
-        return { ok: false, kind: "not_active", state: session.state };
+        return {
+          ok: false,
+          kind: "not_active",
+          state: session.state,
+          should_stop: true,
+          remaining_seconds: 0,
+        };
       }
+
+      const bound = Math.min(session.reservedSeconds, maxSession);
+      const measured = Math.max(0, Math.floor((nowMs - session.startedAt) / 1_000));
+      const remaining = Math.max(0, bound - measured);
+
+      if (remaining <= 0) {
+        const row = usageRow(session.userId, session.usageDay);
+        row.reserved = Math.max(0, row.reserved - session.reservedSeconds);
+        row.consumed += bound;
+        session.state = "settled";
+        session.closedAt = nowMs;
+        session.chargedSeconds = bound;
+        return {
+          ok: true,
+          kind: "ceiling_reached",
+          state: "settled",
+          remaining_seconds: 0,
+          should_stop: true,
+          expired: true,
+          measured_seconds: measured,
+          charged_seconds: bound,
+        };
+      }
+
       session.leaseExpiresAt =
         nowMs + Math.max(120, Number(args.p_lease_seconds ?? 0)) * 1_000;
-      return { ok: true, kind: "touched" };
+      return {
+        ok: true,
+        kind: "touched",
+        state: "active",
+        remaining_seconds: remaining,
+        reserved_seconds: bound,
+        should_stop: false,
+        expiring_soon: remaining <= 30,
+        expired: false,
+      };
     },
 
     voice_close_overdue(args) {
@@ -303,21 +348,68 @@ export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
       };
     },
 
+    // CORRECTION DE SÉCURITÉ : une session ACTIVE ne se rembourse JAMAIS.
+    // Un remboursement libérait la réservation d'une conversation déjà
+    // activée — du temps consommé, jamais facturé.
     voice_refund(args) {
       const nowMs = now();
       const session = sessions.get(args.p_session_id);
       if (!session || session.userId !== args.p_user_id) {
-        return { ok: false, kind: "unknown_session" };
+        return { ok: false, kind: "unknown_session", released: false };
       }
-      if (session.state !== "pending" && session.state !== "active") {
-        return { ok: true, kind: "already_released", charged_seconds: 0 };
+      if (session.state === "active") {
+        return {
+          ok: false,
+          kind: "active_not_refundable",
+          state: session.state,
+          released: false,
+          charged_seconds: 0,
+        };
+      }
+      if (session.state !== "pending") {
+        return {
+          ok: true,
+          kind: "already_released",
+          state: session.state,
+          released: false,
+          charged_seconds: session.chargedSeconds ?? 0,
+        };
       }
       const row = usageRow(session.userId, session.usageDay);
       row.reserved = Math.max(0, row.reserved - session.reservedSeconds);
       session.state = "refunded";
       session.closedAt = nowMs;
       session.chargedSeconds = 0;
-      return { ok: true, kind: "refunded", charged_seconds: 0 };
+      return {
+        ok: true,
+        kind: "refunded",
+        state: "refunded",
+        released: true,
+        released_seconds: session.reservedSeconds,
+        charged_seconds: 0,
+      };
+    },
+
+    // Relecture d'état : ne modifie rien.
+    voice_session_state(args) {
+      const session = sessions.get(args.p_session_id);
+      if (!session || session.userId !== args.p_user_id) {
+        return { ok: false, kind: "unknown_session" };
+      }
+      return {
+        ok: true,
+        session_id: session.id,
+        state: session.state,
+        reserved_seconds: session.reservedSeconds,
+        charged_seconds: session.chargedSeconds,
+        started_at: session.startedAt ? new Date(session.startedAt).toISOString() : null,
+        action:
+          session.state === "pending"
+            ? "refundable"
+            : session.state === "active"
+              ? "settle"
+              : "closed",
+      };
     },
 
     voice_usage_read(args) {

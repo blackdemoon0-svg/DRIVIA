@@ -241,3 +241,21 @@ export const LIVE_MAX_SESSION_SECONDS = LIVE_MAX_SESSION_MINUTES * 60;
  * appeared.
  */
 export const SESSION_LEASE_MARGIN_SECONDS = 300;
+
+/**
+ * Lease granted to an ACTIVE session, in seconds: its reservation plus the margin.
+ *
+ * DERIVED, and never a ceiling. It is what the heartbeat sends as the lease, so
+ * an active conversation is never released by lease expiry before
+ * `voice_close_overdue` can bill it.
+ */
+export const LIVE_SESSION_LEASE_SECONDS = LIVE_MAX_SESSION_SECONDS + SESSION_LEASE_MARGIN_SECONDS;
+
+/**
+ * Seconds between two heartbeats, from the browser.
+ *
+ * Short enough that a spent reservation ends the conversation within a few
+ * seconds instead of at the next call to the provider. This is the client-side
+ * cadence only; the authority remains `voice_touch` in PostgreSQL.
+ */
+export const VOICE_HEARTBEAT_SECONDS = 15;

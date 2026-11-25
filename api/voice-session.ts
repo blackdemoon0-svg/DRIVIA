@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import { authorizeRequest, IdentityUnavailableError, readAccessEnv } from "../server/access.js";
 import {
   activateVoiceSession,
+  readVoiceSessionState,
+  settleVoiceSeconds,
   refundVoiceReservation,
   reserveVoiceSeconds,
   VoiceStoreUnavailableError,
@@ -147,6 +149,64 @@ type LiveSessionPayload = {
  * Extracted so the tests can exercise the call without a route, and so the
  * provider error mapping stays in one place.
  */
+/**
+ * Make sure the session is activated, and report what is ACTUALLY true.
+ *
+ * Three outcomes, and the distinction is the whole point:
+ *
+ *   • `active`  — the database says the row is active (`started_at` set), so the
+ *                 clock runs and the reservation must not be released;
+ *   • `pending` — the database, read AFTER the doubt, still says the activation
+ *                 never landed. The reservation is genuinely unused;
+ *   • `unknown` — the read itself failed. Nothing is known, so nothing is
+ *                 decided; the caller must not refund.
+ *
+ * `voice_activate` is idempotent: calling it again returns `already_active`
+ * without moving `started_at`, so a retry after a lost response cannot shorten
+ * the billed duration.
+ */
+async function ensureActivated(
+  storeEnv: VoiceStoreEnv,
+  options: {
+    userId: string;
+    sessionId: string;
+    maxSessionSeconds: number;
+    providerSessionId: string | null;
+  },
+): Promise<{ outcome: "active" | "pending" | "unknown"; state: string }> {
+  try {
+    const activation = await activateVoiceSession(storeEnv, {
+      userId: options.userId,
+      sessionId: options.sessionId,
+      maxSessionSeconds: options.maxSessionSeconds,
+      providerSessionId: options.providerSessionId,
+    });
+    if (activation.kind === "activated" || activation.kind === "already_active") {
+      return { outcome: "active", state: "active" };
+    }
+    // `not_pending` / `unknown_session`: the row is in a state we did not
+    // expect. Do not assume anything — read it.
+  } catch (error) {
+    if (!(error instanceof VoiceStoreUnavailableError)) throw error;
+    // The response was lost. The activation may well have landed.
+  }
+
+  // DOUBT: re-read the row before any compensating action.
+  try {
+    const state = await readVoiceSessionState(storeEnv, {
+      userId: options.userId,
+      sessionId: options.sessionId,
+    });
+    if (!state.found) return { outcome: "unknown", state: "unknown_session" };
+    if (state.action === "settle") return { outcome: "active", state: state.state };
+    if (state.action === "refundable") return { outcome: "pending", state: state.state };
+    return { outcome: "pending", state: state.state };
+  } catch (error) {
+    if (!(error instanceof VoiceStoreUnavailableError)) throw error;
+    return { outcome: "unknown", state: "unknown" };
+  }
+}
+
 export async function createLiveSession(options: {
   apiKey: string;
   baseUrl: string;
@@ -437,24 +497,39 @@ export default async function handler(request: ApiRequest, response: ApiResponse
   // The provider answered: the conversation is about to start. Only now does
   // the billable clock start (`started_at`), so the SDP exchange — up to 20 s of
   // preparation — is not charged to the user.
-  let activated = true;
-  try {
-    const activation = await activateVoiceSession(storeEnv, {
-      userId: access.userId,
-      sessionId: reservation.sessionId,
-      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
-      providerSessionId: created.providerSessionId,
+  //
+  // ───────────────────────────────────────────────────────────────────────────
+  //  A LOST RESPONSE IS NOT A FAILED ACTIVATION
+  // ───────────────────────────────────────────────────────────────────────────
+  // `activateVoiceSession` can succeed in PostgreSQL and still throw here,
+  // because the HTTP response was lost. Treating that throw as "activation
+  // failed" and refunding released an ACTIVATED session — real time consumed,
+  // never billed. Compensation must therefore start from a fact, not a guess:
+  // after any doubt, re-read the row.
+  const activation = await ensureActivated(storeEnv, {
+    userId: access.userId,
+    sessionId: reservation.sessionId,
+    maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+    providerSessionId: created.providerSessionId,
+  });
+
+  if (activation.outcome === "unknown") {
+    // The ledger is unreachable, so we cannot even tell whether the clock
+    // started. Refunding here would be a guess with the user's minutes at
+    // stake, so nothing is released: the pending lease (`voice_expire_stale`)
+    // gives the reservation back on its own within VOICE_RESERVATION_TTL_SECONDS
+    // if the activation never landed. The browser gets no SDP and the provider
+    // session expires unused.
+    return response.status(503).json({
+      code: "voice_store_unavailable",
+      error: "La conversation n'a pas pu être ouverte. Réessayez. / The voice session could not be opened. Please try again.",
     });
-    activated = activation.kind === "activated" || activation.kind === "already_active";
-  } catch (error) {
-    if (!(error instanceof VoiceStoreUnavailableError)) throw error;
-    activated = false;
   }
 
-  if (!activated) {
-    // The conversation exists upstream but the ledger could not open its
-    // clock. Refuse it: better no session than an unbilled one. The
-    // reservation is released and the browser had no SDP to apply.
+  if (activation.outcome !== "active") {
+    // Confirmed: the row never became active. The reservation is genuinely
+    // unused, so releasing it is right — and `voice_refund` will refuse anyway
+    // if our read turns out to have raced an activation.
     await refundVoiceReservation(storeEnv, {
       userId: access.userId,
       sessionId: reservation.sessionId,
@@ -465,7 +540,25 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     });
   }
 
-  return response.status(201).json({
+  // ───────────────────────────────────────────────────────────────────────────
+  //  IF THE BROWSER NEVER RECEIVES THE SDP, THE CLOCK IS STILL RUNNING
+  // ───────────────────────────────────────────────────────────────────────────
+  // The activation is recorded, so from PostgreSQL's point of view a billable
+  // conversation exists. If the navigation fails here — the upload of the answer
+  // is interrupted, the tab is suspended — nobody will call `/api/voice-end`,
+  // and the session would stay `active` until its reservation elapses and
+  // `voice_close_overdue` bills it in full.
+  //
+  // We cannot close the provider session from here: GPT-Live closes through the
+  // `session.close` EVENT on the client's data channel, and `v1/live/sessions`
+  // exposes no server-side close endpoint (the documented `hangup` belongs to
+  // the Realtime API at `/v1/realtime/calls`, which this project does not use).
+  // The provider session therefore expires on its own, unbilled by us.
+  //
+  // What we CAN do is settle immediately, so the user is charged the few
+  // seconds actually measured rather than the whole reservation. This path is
+  // deliberately narrow: it runs only when producing the 201 itself throws.
+  const payload = {
     sessionId: reservation.sessionId,
     sdp: created.sdp,
     voice: {
@@ -482,5 +575,23 @@ export default async function handler(request: ApiRequest, response: ApiResponse
       // conversation at this point instead of discovering the limit mid-sentence.
       maxSessionSeconds: reservation.maxSessionSeconds,
     },
-  });
+  };
+
+  try {
+    return response.status(201).json(payload);
+  } catch (error) {
+    // The answer could not be handed to the browser: nobody will ever close
+    // this session from the client. Settle now, so the charge is the measured
+    // duration (a few seconds) rather than the whole reservation later.
+    await settleVoiceSeconds(storeEnv, {
+      userId: access.userId,
+      sessionId: reservation.sessionId,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+    }).catch(() => null);
+    void error;
+    return response.status(503).json({
+      code: "voice_delivery_failed",
+      error: "La conversation n'a pas pu être transmise au navigateur. Aucune minute n'a été décomptée au-delà du temps écoulé. / The voice session could not be delivered to the browser.",
+    });
+  }
 }

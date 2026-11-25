@@ -673,6 +673,232 @@ pass("migration v3 : s'applique sans erreur sur PostgreSQL 16");
 }
 
 // ===========================================================================
+// 10 bis. SÉCURITÉ (revue du 2026-11-22) : une session activée ne se rembourse pas
+// ===========================================================================
+{
+  const user = await newUser();
+  const reserved = await reserve(user, { allowance: 1800 });
+  await activate(user, reserved.session_id);
+
+  // Le remboursement doit être REFUSÉ par la base, pas seulement par la route.
+  const refunded = await refund(user, reserved.session_id);
+  assert.equal(refunded.ok, false, "le remboursement d'une session active est refusé");
+  assert.equal(refunded.kind, "active_not_refundable");
+  assert.equal(refunded.released, false, "aucune seconde n'est rendue");
+
+  const [row] = await q(
+    `select state, reserved_seconds from public.voice_sessions where id = $1`,
+    [reserved.session_id],
+  );
+  assert.equal(row.state, "active", "la session reste active");
+  const [usage] = await q(
+    `select reserved_seconds from public.voice_usage_daily where user_id = $1`,
+    [user],
+  );
+  assert.equal(usage.reserved_seconds, 1800, "la réservation reste retenue en entier");
+  pass("sécurité : voice_refund refuse une session active (active_not_refundable), réservation intacte");
+
+  // La seule sortie est le règlement, au temps mesuré.
+  await q(
+    `update public.voice_sessions set started_at = now() - interval '30 seconds' where id = $1`,
+    [reserved.session_id],
+  );
+  const settled = await settle(user, reserved.session_id);
+  assert.equal(settled.charged_seconds, 30, "30 s réellement consommées sont facturées");
+  pass("sécurité : une session activée ne peut que se régler");
+
+  // Un remboursement APRÈS règlement ne rend rien non plus.
+  const afterClose = await refund(user, reserved.session_id);
+  assert.equal(afterClose.released, false);
+  assert.equal(afterClose.kind, "already_released");
+  const [after] = await q(
+    `select consumed_seconds from public.voice_usage_daily where user_id = $1`,
+    [user],
+  );
+  assert.equal(after.consumed_seconds, 30, "la facture reste due");
+  pass("sécurité : après règlement, aucun remboursement rétroactif");
+
+  // pending reste remboursable : pas de surcorrection.
+  const other = await newUser();
+  const pending = await reserve(other, { allowance: 600 });
+  const released = await refund(other, pending.session_id);
+  assert.equal(released.kind, "refunded");
+  assert.equal(released.released, true);
+  assert.equal(released.released_seconds, 600);
+  pass("sécurité : une réservation pending reste remboursable");
+}
+
+// ===========================================================================
+// 10 ter. `voice_session_state` : la relecture qui tranche le doute
+// ===========================================================================
+{
+  const user = await newUser();
+  const reserved = await reserve(user, { allowance: 600 });
+
+  const [pendingState] = await q(`select public.voice_session_state($1, $2) as r`, [
+    user,
+    reserved.session_id,
+  ]);
+  assert.equal(pendingState.r.action, "refundable");
+  assert.equal(pendingState.r.state, "pending");
+
+  await activate(user, reserved.session_id);
+  const [activeState] = await q(`select public.voice_session_state($1, $2) as r`, [
+    user,
+    reserved.session_id,
+  ]);
+  assert.equal(activeState.r.action, "settle", "active → à régler, jamais à rembourser");
+  assert.ok(activeState.r.started_at !== null, "la relecture expose started_at");
+
+  await settle(user, reserved.session_id);
+  const [closedState] = await q(`select public.voice_session_state($1, $2) as r`, [
+    user,
+    reserved.session_id,
+  ]);
+  assert.equal(closedState.r.action, "closed");
+
+  const [unknown] = await q(`select public.voice_session_state($1, $2) as r`, [
+    user,
+    "00000000-0000-4000-8000-ffffffffffff",
+  ]);
+  assert.equal(unknown.r.kind, "unknown_session");
+  pass("relecture : voice_session_state distingue refundable / settle / closed sans rien modifier");
+
+  // La lecture ne modifie rien : deux appels de suite donnent le même résultat.
+  const [a] = await q(`select public.voice_session_state($1, $2) as r`, [user, reserved.session_id]);
+  const [b] = await q(`select public.voice_session_state($1, $2) as r`, [user, reserved.session_id]);
+  assert.deepEqual(a, b, "la relecture est sans effet de bord");
+  pass("relecture : voice_session_state est en lecture seule");
+}
+
+// ===========================================================================
+// 10 quater. refund et settle CONCURRENTS dans le vrai moteur
+// ===========================================================================
+{
+  const user = await newUser();
+  const reserved = await reserve(user, { allowance: 1800 });
+  await activate(user, reserved.session_id);
+  await q(
+    `update public.voice_sessions set started_at = now() - interval '30 seconds' where id = $1`,
+    [reserved.session_id],
+  );
+
+  const results = await Promise.allSettled([
+    q(`select public.voice_refund($1, $2) as r`, [user, reserved.session_id]),
+    q(`select public.voice_settle($1, $2, $3) as r`, [user, reserved.session_id, MAX_SESSION]),
+    q(`select public.voice_refund($1, $2) as r`, [user, reserved.session_id]),
+    q(`select public.voice_settle($1, $2, $3) as r`, [user, reserved.session_id, MAX_SESSION]),
+  ]);
+  assert.ok(
+    results.every((r) => r.status === "fulfilled"),
+    "aucun appel concurrent ne doit lever d'erreur brute",
+  );
+
+  const payloads = results.map((r) => r.value[0].r);
+  const refunds = payloads.filter((p) => "released" in p);
+  assert.ok(
+    refunds.every((p) => p.released !== true || p.kind === "refunded"),
+    "un remboursement ne peut réussir que sur une session pending",
+  );
+  assert.equal(
+    refunds.filter((p) => p.kind === "active_not_refundable").length >= 1,
+    true,
+    "au moins un remboursement s'est heurté au refus sur session active",
+  );
+
+  const [state] = await q(
+    `select state, charged_seconds from public.voice_sessions where id = $1`,
+    [reserved.session_id],
+  );
+  const [usage] = await q(
+    `select consumed_seconds, reserved_seconds from public.voice_usage_daily where user_id = $1`,
+    [user],
+  );
+  assert.equal(state.state, "settled", "quel que soit l'ordre, la session finit réglée");
+  assert.equal(state.charged_seconds, 30, "facturée une seule fois, 30 s");
+  assert.equal(usage.consumed_seconds, 30, "le compteur ne contient qu'une facture");
+  assert.equal(usage.reserved_seconds, 0, "la réservation est libérée exactement une fois");
+  pass("concurrence : refund+settle simultanés — jamais remboursée, jamais facturée deux fois");
+}
+
+// ===========================================================================
+// 10 quinquies. Le plafond ARRÊTE la conversation, côté base
+// ===========================================================================
+{
+  const user = await newUser();
+  // Compte à 90 s de crédit : la réservation vaut 90 s, pas 1800.
+  await consume(user, 1710, 1800);
+  const last = await reserve(user, { allowance: 1800 });
+  assert.equal(last.reserved_seconds, 90, "90 s restantes = plafond réel de la session");
+  await activate(user, last.session_id);
+
+  // À 40 s : la base dit de continuer, et donne le temps restant.
+  await q(
+    `update public.voice_sessions set started_at = now() - interval '40 seconds' where id = $1`,
+    [last.session_id],
+  );
+  const [mid] = await q(`select public.voice_touch($1, $2, $3, $4) as r`, [
+    user,
+    last.session_id,
+    3900,
+    MAX_SESSION,
+  ]);
+  assert.equal(mid.r.should_stop, false, "à 40 s, la conversation continue");
+  assert.ok(
+    Math.abs(mid.r.remaining_seconds - 50) <= 1,
+    `il reste ~50 s (obtenu ${mid.r.remaining_seconds})`,
+  );
+  assert.equal(mid.r.state, "active");
+
+  // À 120 s (au-delà des 90) : la base arrête ET facture elle-même.
+  await q(
+    `update public.voice_sessions set started_at = now() - interval '120 seconds' where id = $1`,
+    [last.session_id],
+  );
+  const [late] = await q(`select public.voice_touch($1, $2, $3, $4) as r`, [
+    user,
+    last.session_id,
+    3900,
+    MAX_SESSION,
+  ]);
+  assert.equal(late.r.should_stop, true, "au-delà du plafond, la base ordonne l'arrêt");
+  assert.equal(late.r.expired, true, "et elle a clos la session pendant l'appel");
+  assert.equal(late.r.charged_seconds, 90, "facturée à son plafond de 90 s");
+
+  const [closed] = await q(
+    `select state, charged_seconds from public.voice_sessions where id = $1`,
+    [last.session_id],
+  );
+  assert.equal(closed.state, "settled");
+  const [usage] = await q(
+    `select consumed_seconds from public.voice_usage_daily where user_id = $1`,
+    [user],
+  );
+  assert.equal(usage.consumed_seconds, 1800, "quota atteint, jamais dépassé");
+
+  // Un client qui ignorerait la consigne ne consomme plus rien.
+  await q(
+    `update public.voice_sessions set started_at = now() - interval '600 seconds' where id = $1`,
+    [last.session_id],
+  );
+  const [zombie] = await q(`select public.voice_touch($1, $2, $3, $4) as r`, [
+    user,
+    last.session_id,
+    300,
+    MAX_SESSION,
+  ]);
+  assert.equal(zombie.r.should_stop, true);
+  assert.equal(zombie.r.kind, "not_active");
+  assert.equal(zombie.r.remaining_seconds, 0);
+  const [still] = await q(
+    `select consumed_seconds from public.voice_usage_daily where user_id = $1`,
+    [user],
+  );
+  assert.equal(still.consumed_seconds, 1800, "10 minutes de plus ne coûtent rien de plus");
+  pass("plafond : voice_touch arrête et facture lui-même ; un client qui l'ignore ne consomme plus");
+}
+
+// ===========================================================================
 // 11. Aucun impact sur l'existant
 // ===========================================================================
 {

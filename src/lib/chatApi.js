@@ -272,6 +272,23 @@ export async function endVoiceSession({ sessionId, durationSeconds, accessToken,
   })
 }
 
+/**
+ * Battement de cœur d'une session vocale.
+ *
+ * Le serveur seul sait combien de temps il reste : il répond `stop: true` quand
+ * la réservation est épuisée (PostgreSQL a alors déjà close et facturé la
+ * session). `settled` indique qu'il ne faut PAS rappeler /api/voice-end.
+ */
+export async function heartbeatVoiceSession({ sessionId, accessToken, signal } = {}) {
+  if (!accessToken) return null
+  return voiceRequest('/api/voice-heartbeat', {
+    method: 'POST',
+    accessToken,
+    body: { sessionId },
+    signal,
+  })
+}
+
 /** Message utilisateur pour une erreur vocale. */
 export function voiceErrorMessage(error) {
   const code = error?.code ?? null

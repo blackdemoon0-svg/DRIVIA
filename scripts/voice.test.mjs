@@ -48,6 +48,7 @@ import { mergeVoiceHistory } from "../src/lib/useVoiceLive.js";
 import { createVoiceStoreStub } from "./voice-store.stub.mjs";
 import voiceSessionHandler from "../api/voice-session.ts";
 import voiceEndHandler from "../api/voice-end.ts";
+import voiceHeartbeatHandler from "../api/voice-heartbeat.ts";
 import voiceProfilesHandler from "../api/voice-profiles.ts";
 import { PLAN_LIMITS, limitsFor } from "../src/lib/planLimits.ts";
 
@@ -513,10 +514,51 @@ const days = (n) => new Date(Date.now() + n * 86_400_000).toISOString();
   const nextDayStore = createVoiceStoreStub({ now: () => NOON + 86_400_000 });
   const nextDayUsage = await voiceUsage.readVoiceAllowance(
     { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
-    { userId: USER, fetchImpl: nextDayStore.fetch },
+    { userId: USER, allowanceSeconds: 1_800, fetchImpl: nextDayStore.fetch },
   );
   assert.equal(nextDayUsage.consumedSeconds, 0, "le compteur vocal se réinitialise à minuit UTC");
+  assert.equal(
+    nextDayUsage.remainingSeconds,
+    1_800,
+    "et le crédit restant est de nouveau entier — c'est ce que la fonction doit dire",
+  );
   pass("quota : le compteur vocal revient à zéro au jour UTC suivant");
+
+  // ── `remainingSeconds` est le RESTANT, pas le consommé ────────────────────
+  // Défaut corrigé : `Math.max(0, consumed + reserved)` renvoyait l'usage sous
+  // l'étiquette « restant ». Sur un compte intact, il annonçait 0 seconde
+  // disponible ; à mi-quota, il annonçait exactement l'inverse de la vérité.
+  {
+    const fresh = createVoiceStoreStub({ now: () => NOON });
+    const untouched = await voiceUsage.readVoiceAllowance(
+      { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
+      { userId: USER, allowanceSeconds: 1_800, fetchImpl: fresh.fetch },
+    );
+    assert.equal(untouched.consumedSeconds, 0);
+    assert.equal(untouched.remainingSeconds, 1_800, "compte intact : 30 minutes disponibles");
+
+    await voiceUsage.reserveVoiceSeconds(
+      { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
+      {
+        userId: USER,
+        allowanceSeconds: 1_800,
+        voiceId: "brise",
+        maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+        fetchImpl: fresh.fetch,
+      },
+    );
+    const held = await voiceUsage.readVoiceAllowance(
+      { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
+      { userId: USER, allowanceSeconds: 1_800, fetchImpl: fresh.fetch },
+    );
+    assert.equal(held.reservedSeconds, 1_800, "la réservation est retenue");
+    assert.equal(
+      held.remainingSeconds,
+      0,
+      "une réservation consomme le crédit : rien n'est disponible pendant qu'elle court",
+    );
+    pass("quota : remainingSeconds = crédit total - consommé - réservé (jamais l'usage)");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,6 +1111,20 @@ function proPlan() {
 // ---------------------------------------------------------------------------
 // 7. /api/voice-end — règlement, propriété, idempotence
 // ---------------------------------------------------------------------------
+/** Appelle /api/voice-heartbeat comme le ferait le navigateur. */
+async function callHeartbeat({ token = TOKEN, sessionId } = {}) {
+  const { res, out } = makeResponse();
+  await voiceHeartbeatHandler(
+    {
+      method: "POST",
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      body: { sessionId },
+    },
+    res,
+  );
+  return out;
+}
+
 async function callEnd({ token = TOKEN, body, sessionId } = {}) {
   const { res, out } = makeResponse();
   await voiceEndHandler(
@@ -1490,7 +1546,12 @@ async function callProfiles({ method = "GET", token = null, body } = {}) {
 
   // Les routes API suivent la convention du projet (fichiers .ts, handler par défaut).
   const apiFiles = readdirSync(new URL("../api/", import.meta.url)).filter((name) => /^voice-.*\.ts$/.test(name));
-  assert.deepEqual(apiFiles.sort(), ["voice-end.ts", "voice-profiles.ts", "voice-session.ts"]);
+  assert.deepEqual(apiFiles.sort(), [
+    "voice-end.ts",
+    "voice-heartbeat.ts",
+    "voice-profiles.ts",
+    "voice-session.ts",
+  ]);
   for (const file of apiFiles) {
     const source = readFileSync(new URL(`../api/${file}`, import.meta.url), "utf8");
     assert.match(source, /export default async function handler/, `${file} exporte un handler par défaut`);
@@ -1755,6 +1816,412 @@ async function callProfiles({ method = "GET", token = null, body } = {}) {
 // Nettoyage
 // ---------------------------------------------------------------------------
 globalThis.fetch = originalFetch;
+// ---------------------------------------------------------------------------
+// 11. Revue de sécurité du 2026-11-22 — le remboursement d'une session activée
+// ---------------------------------------------------------------------------
+//
+// Défaut trouvé en revue, au commit 7fbeb50 :
+//
+//   `voice_activate` pouvait réussir en base ET sa réponse se perdre. La route
+//   concluait « activation échouée » et remboursait. `voice_refund` acceptait
+//   `pending` ET `active` : la réservation d'une conversation déjà activée —
+//   du temps réellement consommé — était rendue en entier, sans facturation.
+//
+// Les tests ci-dessous reproduisent ce scénario exact, puis vérifient que le
+// plafond arrête réellement la conversation, et qu'aucune course entre
+// remboursement et règlement ne peut ni rembourser une session activée ni
+// facturer deux fois.
+{
+  applyEnv();
+
+  /**
+   * Un `fetch` qui perd la réponse APRÈS avoir laissé la base écrire.
+   *
+   * `underlying` est le `fetch` déjà installé par `installStub` : on ne
+   * remplace QUE l'appel visé, pour ne pas court-circuiter l'identité ni la
+   * lecture de l'abonnement.
+   */
+  function lostResponseOn(rpcName, store, underlying) {
+    return async (input, init = {}) => {
+      const url = String(input);
+      if (url.includes(`/rest/v1/rpc/${rpcName}`)) {
+        const args = init.body ? JSON.parse(String(init.body)) : {};
+        // La base reçoit et applique l'écriture…
+        store.rpc[rpcName](args);
+        // …mais la réponse ne revient jamais : timeout réseau côté serveur.
+        throw new TypeError("network timeout after the row was written");
+      }
+      return underlying(input, init);
+    };
+  }
+
+  // ── 11.a Le scénario complet : activation validée, réponse perdue ────────
+  {
+    resetQuotas();
+    let clock = Date.now();
+    const store = createVoiceStoreStub({ now: () => clock });
+    installStub({ rows: proPlan(), store });
+
+    // La route utilise `globalThis.fetch`. On l'enveloppe pour perdre la réponse
+    // de `voice_activate` UNIQUEMENT, et laisser passer le reste.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = lostResponseOn("voice_activate", store, realFetch);
+
+    const out = await callSession({ body: { sdp: OFFER_SDP, voice: "brise" } });
+
+    // La base a bien activé : c'est ce que le scénario exige de prouver.
+    const session = store.session(out.body?.sessionId ?? store.openSessions(USER)[0]?.id);
+    globalThis.fetch = realFetch;
+
+    assert.ok(session, "la session existe en base malgré la perte de réponse");
+    assert.equal(session.state, "active", "elle a bien été ACTIVÉE : started_at est posé");
+    assert.ok(session.startedAt !== null, "le chrono de facturation tourne");
+
+    // Et elle n'a pas été remboursée : la réponse 201 est même parvenue.
+    assert.equal(out.status, 201, "la session est ouverte malgré la perte de réponse à l'activation");
+    assert.equal(store.reserved(USER), 30 * 60, "la réservation reste retenue, rien n'a été rendu");
+    pass("activation perdue : la base confirme l'activation, la réservation n'est PAS remboursée");
+  }
+
+  // ── 11.b Tentative de remboursement direct sur une session active ────────
+  {
+    resetQuotas();
+    let clock = Date.now();
+    const store = createVoiceStoreStub({ now: () => clock });
+    const env = { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" };
+
+    const reserved = await voiceUsage.reserveVoiceSeconds(env, {
+      userId: USER,
+      allowanceSeconds: 1_800,
+      voiceId: "brise",
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    await voiceUsage.activateVoiceSession(env, {
+      userId: USER,
+      sessionId: reserved.sessionId,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+
+    const refused = await voiceUsage.refundVoiceReservation(env, {
+      userId: USER,
+      sessionId: reserved.sessionId,
+      fetchImpl: store.fetch,
+    });
+    assert.equal(refused.kind, "active_not_refundable", "le remboursement est REFUSÉ");
+    assert.equal(refused.released, false, "et rien n'a été rendu");
+    assert.equal(store.reserved(USER), 1_800, "la réservation est intacte");
+    assert.equal(store.session(reserved.sessionId).state, "active", "la session reste active");
+    pass("remboursement : une session active est refusée (active_not_refundable), réservation intacte");
+
+    // La seule sortie d'une session active est le RÈGLEMENT.
+    clock += 12_000;
+    const settled = await voiceUsage.settleVoiceSeconds(env, {
+      userId: USER,
+      sessionId: reserved.sessionId,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    assert.equal(settled.chargedSeconds, 12, "12 s réellement consommées sont facturées");
+    assert.equal(store.consumed(USER), 12);
+    assert.equal(store.reserved(USER), 0);
+    pass("remboursement : la session active ne peut que se régler, 12 s facturées");
+
+    // Remboursement APRÈS règlement : plus rien à rendre, et pas de crédit créé.
+    const afterClose = await voiceUsage.refundVoiceReservation(env, {
+      userId: USER,
+      sessionId: reserved.sessionId,
+      fetchImpl: store.fetch,
+    });
+    assert.equal(afterClose.released, false, "une session réglée ne rend rien");
+    assert.equal(store.consumed(USER), 12, "la facture reste due");
+    pass("remboursement : après règlement, aucun remboursement rétroactif possible");
+  }
+
+  // ── 11.c pending se rembourse normalement (pas de surcorrection) ────────
+  {
+    resetQuotas();
+    const store = createVoiceStoreStub({ now: () => Date.now() });
+    const env = { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" };
+
+    const reserved = await voiceUsage.reserveVoiceSeconds(env, {
+      userId: USER,
+      allowanceSeconds: 1_800,
+      voiceId: "brise",
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    const refunded = await voiceUsage.refundVoiceReservation(env, {
+      userId: USER,
+      sessionId: reserved.sessionId,
+      fetchImpl: store.fetch,
+    });
+    assert.equal(refunded.kind, "refunded");
+    assert.equal(refunded.released, true, "une réservation jamais activée est bien rendue");
+    assert.equal(store.reserved(USER), 0);
+    assert.equal(store.consumed(USER), 0);
+    pass("remboursement : une réservation pending reste remboursable (comportement conservé)");
+  }
+
+  // ── 11.d Relecture d'état : la base dit quoi faire ──────────────────────
+  {
+    resetQuotas();
+    const store = createVoiceStoreStub({ now: () => Date.now() });
+    const env = { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" };
+
+    const reserved = await voiceUsage.reserveVoiceSeconds(env, {
+      userId: USER,
+      allowanceSeconds: 1_800,
+      voiceId: "brise",
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+
+    const pendingState = await voiceUsage.readVoiceSessionState(env, {
+      userId: USER,
+      sessionId: reserved.sessionId,
+      fetchImpl: store.fetch,
+    });
+    assert.equal(pendingState.found, true);
+    assert.equal(pendingState.action, "refundable", "pending → remboursable");
+
+    await voiceUsage.activateVoiceSession(env, {
+      userId: USER,
+      sessionId: reserved.sessionId,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    const activeState = await voiceUsage.readVoiceSessionState(env, {
+      userId: USER,
+      sessionId: reserved.sessionId,
+      fetchImpl: store.fetch,
+    });
+    assert.equal(activeState.action, "settle", "active → à régler, jamais à rembourser");
+
+    const unknown = await voiceUsage.readVoiceSessionState(env, {
+      userId: USER,
+      sessionId: "00000000-0000-4000-8000-ffffffffffff",
+      fetchImpl: store.fetch,
+    });
+    assert.equal(unknown.found, false);
+    pass("relecture : l'état réel décide de l'action (refundable / settle / closed)");
+  }
+
+  // ── 11.e refund et settle CONCURRENTS : ni remboursée ni facturée deux fois
+  {
+    resetQuotas();
+    let clock = Date.now();
+    const store = createVoiceStoreStub({ now: () => clock });
+    const env = { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" };
+
+    const reserved = await voiceUsage.reserveVoiceSeconds(env, {
+      userId: USER,
+      allowanceSeconds: 1_800,
+      voiceId: "brise",
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    await voiceUsage.activateVoiceSession(env, {
+      userId: USER,
+      sessionId: reserved.sessionId,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    clock += 30_000; // 30 s réellement consommées
+
+    // Remboursement et règlement lancés ensemble.
+    const [refundResult, settleResult] = await Promise.allSettled([
+      voiceUsage.refundVoiceReservation(env, {
+        userId: USER,
+        sessionId: reserved.sessionId,
+        fetchImpl: store.fetch,
+      }),
+      voiceUsage.settleVoiceSeconds(env, {
+        userId: USER,
+        sessionId: reserved.sessionId,
+        maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+        fetchImpl: store.fetch,
+      }),
+    ]);
+
+    assert.equal(refundResult.status, "fulfilled");
+    assert.equal(refundResult.value.released, false, "le remboursement n'a rien rendu");
+    assert.equal(settleResult.status, "fulfilled");
+    assert.equal(settleResult.value.kind, "settled");
+    assert.equal(settleResult.value.chargedSeconds, 30, "30 s facturées, une seule fois");
+    assert.equal(store.consumed(USER), 30, "le compteur ne contient qu'une facture");
+    assert.equal(store.reserved(USER), 0, "la réservation est libérée une fois");
+
+    // Deux règlements concurrents de plus : aucun ne refacture.
+    const more = await Promise.allSettled([
+      voiceUsage.settleVoiceSeconds(env, {
+        userId: USER,
+        sessionId: reserved.sessionId,
+        maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+        fetchImpl: store.fetch,
+      }),
+      voiceUsage.settleVoiceSeconds(env, {
+        userId: USER,
+        sessionId: reserved.sessionId,
+        maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+        fetchImpl: store.fetch,
+      }),
+    ]);
+    assert.ok(more.every((m) => m.status === "fulfilled"));
+    assert.ok(
+      more.every((m) => m.value.kind === "already_settled"),
+      "les règlements suivants sont idempotents",
+    );
+    assert.equal(store.consumed(USER), 30, "le compteur reste à 30 s, pas 90");
+    pass("concurrence : refund+settle simultanés → jamais remboursée, facturée une seule fois");
+  }
+
+  // ── 11.f Le plafond ARRÊTE la conversation (pas seulement le compteur) ──
+  {
+    resetQuotas();
+    let clock = Date.now();
+    const store = createVoiceStoreStub({ now: () => clock });
+    installStub({ rows: proPlan(), store });
+    const env = { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" };
+
+    // Un compte à 90 s de crédit : la session est donc plafonnée à 90 s, pas à 30 min.
+    const tight = "55555555-1111-4111-8111-111111111111";
+    const first = await voiceUsage.reserveVoiceSeconds(env, {
+      userId: tight,
+      allowanceSeconds: 1_800,
+      voiceId: "brise",
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    await voiceUsage.activateVoiceSession(env, {
+      userId: tight,
+      sessionId: first.sessionId,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    // On simule une consommation antérieure de 1710 s : il reste 90 s.
+    clock += 1_710_000;
+    await voiceUsage.settleVoiceSeconds(env, {
+      userId: tight,
+      sessionId: first.sessionId,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+
+    const last = await voiceUsage.reserveVoiceSeconds(env, {
+      userId: tight,
+      allowanceSeconds: 1_800,
+      voiceId: "brise",
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    assert.equal(last.reservedSeconds, 90, "90 s restantes réservées : c'est le plafond réel");
+    await voiceUsage.activateVoiceSession(env, {
+      userId: tight,
+      sessionId: last.sessionId,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+
+    // À mi-parcours : le serveur dit qu'il reste du temps et de continuer.
+    clock += 40_000;
+    const midBeat = await voiceUsage.touchVoiceSession(env, {
+      userId: tight,
+      sessionId: last.sessionId,
+      leaseSeconds: LIVE_MAX_SESSION_SECONDS + 300,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    assert.equal(midBeat.shouldStop, false, "à 40 s, la conversation continue");
+    assert.equal(midBeat.remainingSeconds, 50, "il reste 50 s, calculé par la base");
+    assert.equal(store.session(last.sessionId).state, "active");
+
+    // Au-delà du plafond : le SERVEUR arrête et facture, sans dépendre du client.
+    clock += 60_000;
+    const lateBeat = await voiceUsage.touchVoiceSession(env, {
+      userId: tight,
+      sessionId: last.sessionId,
+      leaseSeconds: LIVE_MAX_SESSION_SECONDS + 300,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    assert.equal(lateBeat.shouldStop, true, "au-delà du plafond, le serveur ordonne l'arrêt");
+    assert.equal(lateBeat.expired, true, "et il a clos la session lui-même");
+    assert.equal(store.session(last.sessionId).state, "settled", "la session est fermée en base");
+    assert.equal(
+      store.session(last.sessionId).chargedSeconds,
+      90,
+      "facturée à son plafond de 90 s, pas au temps du navigateur",
+    );
+    assert.equal(store.consumed(tight), 1_800, "quota atteint, jamais dépassé");
+
+    // Un client qui ignorerait `shouldStop` ne peut plus rien consommer.
+    clock += 600_000;
+    const zombie = await voiceUsage.touchVoiceSession(env, {
+      userId: tight,
+      sessionId: last.sessionId,
+      leaseSeconds: 300,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      fetchImpl: store.fetch,
+    });
+    assert.equal(zombie.shouldStop, true, "une session close reste arrêtée");
+    assert.equal(zombie.kind, "not_active");
+    assert.equal(store.consumed(tight), 1_800, "10 minutes de plus ne coûtent rien de plus");
+    pass("plafond : c'est le serveur qui arrête la session, un client qui l'ignore ne consomme rien");
+  }
+
+  // ── 11.g La route de battement de cœur ──────────────────────────────────
+  {
+    resetQuotas();
+    const store = createVoiceStoreStub({ now: () => Date.now() });
+    installStub({ rows: proPlan(), store });
+
+    const opened = await callSession({ body: { sdp: OFFER_SDP, voice: "brise" } });
+    assert.equal(opened.status, 201);
+
+    const beat = await callHeartbeat({ sessionId: opened.body.sessionId });
+    assert.equal(beat.status, 200, "le battement répond");
+    assert.equal(beat.body.stop, false, "la conversation continue");
+    assert.ok(beat.body.remainingSeconds > 0, "le temps restant vient du serveur");
+
+    const anonymous = await callHeartbeat({ sessionId: opened.body.sessionId, token: null });
+    assert.equal(anonymous.status, 401, "sans jeton, pas de battement");
+
+    const badId = await callHeartbeat({ sessionId: "pas-un-uuid" });
+    assert.equal(badId.status, 400);
+
+    const foreign = await callHeartbeat({
+      sessionId: "00000000-0000-4000-8000-ffffffffffff",
+    });
+    assert.equal(foreign.status, 200);
+    assert.equal(foreign.body.stop, true, "une session inconnue doit être arrêtée côté client");
+    pass("/api/voice-heartbeat : authentifié, borné, et `stop` sur session inconnue");
+  }
+
+  // ── 11.h Le client annonce `session.close` avant de fermer ──────────────
+  {
+    const source = readFileSync(new URL("../src/lib/useVoiceLive.js", import.meta.url), "utf8");
+    assert.ok(
+      source.includes("session.close"),
+      "le hook envoie l'événement documenté de fermeture fournisseur",
+    );
+    assert.ok(
+      /channelRef\.current\.send\(JSON\.stringify\(\{ type: 'session\.close' \}\)\)/.test(source),
+      "l'événement est envoyé sur le canal de données, avant sa fermeture",
+    );
+    assert.ok(
+      source.includes("heartbeatVoiceSession"),
+      "le hook interroge le serveur pendant la session",
+    );
+    assert.ok(
+      source.includes("result.settled === true"),
+      "il ne redemande pas un règlement déjà fait par la base",
+    );
+    pass("client : session.close envoyé, et le battement de cœur obéit au serveur");
+  }
+}
+
 restoreEnv();
 resetQuotas();
 

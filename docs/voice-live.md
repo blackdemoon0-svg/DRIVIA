@@ -172,7 +172,7 @@ en `voice_curfew` plutôt que d'ouvrir une session de quelques secondes.
 C'est un choix assumé, pas un oubli : un comptage non ambigu vaut mieux qu'une
 conversation facturée à cheval sur deux jours.
 
-### Les six opérations
+### Les huit opérations
 
 1. **Réserver** (`voice_reserve`) — tout le crédit restant, borné par les trois
    limites ci-dessus. Condition d'autorisation dans le `UPDATE ... WHERE` :
@@ -184,6 +184,10 @@ conversation facturée à cheval sur deux jours.
 4. **Régulariser** (`voice_settle`) — durée mesurée, idempotent.
 5. **Rembourser** (`voice_refund`) — rend la réservation, idempotent.
 6. **Balayer** (`voice_expire_stale`, `voice_close_overdue`) — voir ci-dessous.
+7. **Surveiller** (`voice_touch`, via `/api/voice-heartbeat`) — toutes les 15 s,
+   calcule le temps restant et **arrête et facture** au plafond.
+8. **Relire** (`voice_session_state`) — l'état réel, sans effet de bord, quand un
+   résultat réseau est incertain.
 
 ### Le bail ne libère jamais une conversation active
 
@@ -210,6 +214,61 @@ compteurs (RLS : lecture seule de ses propres lignes).
 
 Si Supabase est injoignable, la route répond `503 voice_store_unavailable` :
 elle **échoue fermé**, sans jamais retomber sur un compteur en mémoire.
+
+### Un remboursement ne libère jamais une session activée
+
+`voice_activate` réussir en base et sa réponse HTTP se perdre sont deux choses
+différentes. Quand la réponse se perdait, la route concluait « activation
+échouée » et remboursait — et `voice_refund` acceptait `active`, donc la
+réservation d'une conversation **déjà activée** était rendue en entier, sans
+facturation.
+
+Trois garde-fous, du plus profond au plus visible :
+
+1. **La base refuse.** `voice_refund` n'accepte plus que `pending`. Sur une
+   session `active`, elle répond `active_not_refundable` avec
+   `released: false`. La règle n'est pas dans l'appelant.
+2. **La route ne devine pas.** Après une erreur réseau à l'activation, elle
+   relit l'état réel (`voice_session_state`) et décide sur ce fait :
+   `settle` → la session est active, on ne rembourse pas ; `refundable` → elle
+   est restée `pending`, le remboursement est légitime ; lecture impossible →
+   **rien n'est décidé**, et le bail de réservation rend le crédit tout seul.
+3. **Le type le dit.** `refundVoiceReservation` renvoie `released` et
+   `refundable` : un refus ne peut plus être confondu avec un succès.
+
+### Le plafond arrête la conversation, pas seulement le compteur
+
+Le plafond de réservation bornait ce qui est **facturé** sans arrêter ce qui est
+**diffusé** : seul un `setTimeout` du navigateur terminait la session. Un onglet
+suspendu, un timer throttlé ou un client modifié continuaient après le plafond,
+et le fournisseur était payé pour du temps que PostgreSQL avait cessé de
+facturer.
+
+- `POST /api/voice-heartbeat` est appelé toutes les 15 s pendant la session. Il
+  ne transporte **aucune durée** : uniquement l'identifiant de session.
+- `voice_touch` calcule `remaining_seconds` et clôt **et facture** la session
+  au plafond, dans la même transaction. `should_stop` est une instruction, pas
+  un conseil : le client ferme le peer connection dessus.
+- Un client qui l'ignorerait ne consomme plus rien : la session n'est plus
+  `active`, donc `voice_touch` répond `not_active` et `should_stop: true`.
+- Le minuteur local subsiste, mais seulement comme **secours** quand le réseau
+  est coupé ; il s'appuie sur `maxSessionSeconds`, la réservation accordée par
+  la base, jamais sur un chiffre inventé côté client.
+
+### Fermeture du fournisseur : ce qui est possible, et ce qui ne l'est pas
+
+À la fermeture, le client envoie l'événement `session.close` sur le canal de
+données (`oai-events`) avant de le fermer. C'est le seul mécanisme documenté :
+une session GPT-Live se termine par un **événement client**, pas par un appel
+REST. `v1/live/sessions` n'expose aucun endpoint de fermeture côté serveur, et
+le `hangup` que documente OpenAI appartient à l'API Realtime
+(`/v1/realtime/calls`), que ce projet n'utilise pas.
+
+Conséquence assumée : si le navigateur ne reçoit jamais le SDP, le serveur
+**ne peut pas** couper la session chez le fournisseur — elle expire d'elle-même,
+sans être facturée par VEYVRO. Ce qui est couvert en revanche : la route règle
+immédiatement si la livraison du 201 échoue, et `voice_close_overdue` clôt toute
+session active arrivée à sa réservation. Un test vérifie ce chemin.
 
 ### Migration rejouable, sans perte
 

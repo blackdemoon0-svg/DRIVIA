@@ -277,23 +277,94 @@ export async function settleVoiceSeconds(
   };
 }
 
+export type RefundResult = {
+  kind: string;
+  /** True only when the database actually gave the reservation back. */
+  released: boolean;
+  /** `active_not_refundable` means: settle it, do not try again. */
+  refundable: boolean;
+  state: string;
+};
+
 /**
- * Give the reservation back, for a session that never started.
+ * Give the reservation back — for a `pending` session only.
  *
  * Called when the provider fails, times out, or returns no SDP: the user must
- * not pay for a conversation that did not happen. Idempotent in the database.
+ * not pay for a conversation that did not happen.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  SECURITY FIX — A REFUND MUST NEVER RELEASE AN ACTIVATED SESSION
+ * ─────────────────────────────────────────────────────────────────────────────
+ * `voice_activate` succeeding and its HTTP response being lost are two different
+ * things. When the response was lost, this route used to assume the activation
+ * had failed and refund. `voice_refund` accepted `active` rows, so an activated
+ * conversation — real time consumed — was released in full and never billed.
+ *
+ * The database now refuses (`active_not_refundable`, `released: false`) and this
+ * function surfaces that refusal instead of flattening it to a `kind` string,
+ * so a caller cannot mistake a refusal for a success. `released` is the only
+ * thing to branch on.
  */
 export async function refundVoiceReservation(
   env: VoiceStoreEnv,
   options: { userId: string; sessionId: string; fetchImpl?: typeof fetch },
-): Promise<{ kind: string }> {
+): Promise<RefundResult> {
   const payload = await callVoiceFunction(
     env,
     "voice_refund",
     { p_user_id: options.userId, p_session_id: options.sessionId },
     options.fetchImpl ?? fetch,
   );
-  return { kind: typeof payload.kind === "string" ? payload.kind : "unknown" };
+  const kind = typeof payload.kind === "string" ? payload.kind : "unknown";
+  return {
+    kind,
+    released: payload.released === true,
+    // Anything that is not an explicit refusal is a completed release path:
+    // `refunded` and `already_released` both leave the reservation with the
+    // user, which is the outcome a caller wants.
+    refundable: kind !== "active_not_refundable" && kind !== "unknown_session",
+    state: typeof payload.state === "string" ? payload.state : "unknown",
+  };
+}
+
+export type SessionStateResult =
+  | { found: true; state: string; action: "refundable" | "settle" | "closed"; reservedSeconds: number; chargedSeconds: number }
+  | { found: false; state: "unknown_session" };
+
+/**
+ * Read the REAL state of a session, without modifying anything.
+ *
+ * This is the answer to "did my write land?" — the question a lost HTTP response
+ * leaves open. Used before any compensating action, so the decision rests on a
+ * fact read from the database instead of on an assumption about the network.
+ *
+ * Throws `VoiceStoreUnavailableError` when the read itself fails: at that point
+ * nothing is known, and the caller must not refund on a guess.
+ */
+export async function readVoiceSessionState(
+  env: VoiceStoreEnv,
+  options: { userId: string; sessionId: string; fetchImpl?: typeof fetch },
+): Promise<SessionStateResult> {
+  const payload = await callVoiceFunction(
+    env,
+    "voice_session_state",
+    { p_user_id: options.userId, p_session_id: options.sessionId },
+    options.fetchImpl ?? fetch,
+  );
+  if (payload.ok !== true || typeof payload.state !== "string") {
+    return { found: false, state: "unknown_session" };
+  }
+  const action =
+    payload.action === "refundable" || payload.action === "settle" || payload.action === "closed"
+      ? payload.action
+      : "closed";
+  return {
+    found: true,
+    state: payload.state,
+    action,
+    reservedSeconds: Number(payload.reserved_seconds ?? 0),
+    chargedSeconds: Number(payload.charged_seconds ?? 0),
+  };
 }
 
 /**
@@ -336,10 +407,37 @@ export async function activateVoiceSession(
  * conversation stays visibly alive, and so `lease_expires_at` keeps a meaning
  * for diagnosis.
  */
+export type TouchResult = {
+  kind: string;
+  /** Seconds of reservation left, as computed by PostgreSQL. */
+  remainingSeconds: number;
+  /** True when the session must end now — the database is the authority. */
+  shouldStop: boolean;
+  /** The database closed and billed the session during this call. */
+  expired: boolean;
+  state: string;
+};
+
+/**
+ * Heartbeat that also ENFORCES the ceiling.
+ *
+ * `shouldStop` is not advice: it is PostgreSQL saying the reservation is spent.
+ * The browser must close the conversation on it. A client that ignores it (a
+ * modified client, a suspended tab, a throttled timer) still cannot run up an
+ * unpaid session, because the ledger settles on the server side either way —
+ * but relying on a JavaScript timer alone would leave the provider streaming
+ * audio past the limit, which is exactly what this call exists to prevent.
+ */
 export async function touchVoiceSession(
   env: VoiceStoreEnv,
-  options: { userId: string; sessionId: string; leaseSeconds: number; fetchImpl?: typeof fetch },
-): Promise<{ kind: string }> {
+  options: {
+    userId: string;
+    sessionId: string;
+    leaseSeconds: number;
+    maxSessionSeconds: number;
+    fetchImpl?: typeof fetch;
+  },
+): Promise<TouchResult> {
   const payload = await callVoiceFunction(
     env,
     "voice_touch",
@@ -347,29 +445,63 @@ export async function touchVoiceSession(
       p_user_id: options.userId,
       p_session_id: options.sessionId,
       p_lease_seconds: Math.max(120, Math.trunc(options.leaseSeconds)),
+      p_max_session_seconds: requireCeiling("touchVoiceSession", options.maxSessionSeconds),
     },
     options.fetchImpl ?? fetch,
   );
-  return { kind: typeof payload.kind === "string" ? payload.kind : "unknown" };
+  const remaining = Number(payload.remaining_seconds ?? 0);
+  return {
+    kind: typeof payload.kind === "string" ? payload.kind : "unknown",
+    remainingSeconds: Number.isFinite(remaining) ? Math.max(0, remaining) : 0,
+    shouldStop: payload.should_stop === true,
+    expired: payload.expired === true,
+    state: typeof payload.state === "string" ? payload.state : "unknown",
+  };
 }
 
-/** Today's consumption for one account, without touching anything. */
+/**
+ * Today's consumption for one account, without touching anything.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  `remainingSeconds` IS THE REMAINDER, NOT THE USAGE
+ * ─────────────────────────────────────────────────────────────────────────────
+ * This function used to return `Math.max(0, consumed + reserved)`: the amount
+ * ALREADY USED, labelled as remaining. On an untouched Pro account (0 consumed)
+ * it answered `0` seconds left, and on a half-used one it answered `900` — the
+ * exact opposite of the truth, in a way that only shows on a screen.
+ *
+ * `allowanceSeconds` is therefore REQUIRED: a remaining figure cannot be derived
+ * from consumption alone, and defaulting it would have produced a second, silent
+ * version of the same lie.
+ */
 export async function readVoiceAllowance(
   env: VoiceStoreEnv,
-  options: { userId: string; fetchImpl?: typeof fetch },
-): Promise<{ consumedSeconds: number; reservedSeconds: number; remainingSeconds: number }> {
+  options: { userId: string; allowanceSeconds: number; fetchImpl?: typeof fetch },
+): Promise<{
+  consumedSeconds: number;
+  reservedSeconds: number;
+  /** Allowance minus consumed minus reserved. Never negative. */
+  remainingSeconds: number;
+}> {
+  if (!Number.isFinite(options.allowanceSeconds) || options.allowanceSeconds < 0) {
+    throw new TypeError("readVoiceAllowance: allowanceSeconds is required (no default).");
+  }
   const payload = await callVoiceFunction(
     env,
     "voice_usage_read",
     { p_user_id: options.userId },
     options.fetchImpl ?? fetch,
   );
-  const consumed = Number(payload.consumed_seconds ?? 0);
-  const reserved = Number(payload.reserved_seconds ?? 0);
+  const consumedRaw = Number(payload.consumed_seconds ?? 0);
+  const reservedRaw = Number(payload.reserved_seconds ?? 0);
+  const consumed = Number.isFinite(consumedRaw) ? Math.max(0, consumedRaw) : 0;
+  const reserved = Number.isFinite(reservedRaw) ? Math.max(0, reservedRaw) : 0;
   return {
-    consumedSeconds: Number.isFinite(consumed) ? consumed : 0,
-    reservedSeconds: Number.isFinite(reserved) ? reserved : 0,
-    remainingSeconds: Math.max(0, consumed + reserved),
+    consumedSeconds: consumed,
+    reservedSeconds: reserved,
+    // Both consumed AND reserved consume the allowance: a reservation is held
+    // credit, not free credit.
+    remainingSeconds: Math.max(0, Math.trunc(options.allowanceSeconds) - consumed - reserved),
   };
 }
 

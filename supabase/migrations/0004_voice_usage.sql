@@ -595,12 +595,29 @@ end
 $$;
 
 -- ---------------------------------------------------------------------
--- 9. Battement de cœur (diagnostic ; ne sert jamais à facturer)
+-- 9. Battement de cœur — l'AUTORITÉ qui arrête la session
 -- ---------------------------------------------------------------------
+-- ⚠️ CORRECTION (revue du 2026-11-22, commit 7fbeb50).
+--
+-- Cette fonction ne servait qu'au diagnostic et n'était appelée nulle part : le
+-- plafond de réservation n'était donc appliqué que par un `setTimeout` du
+-- navigateur. Un onglet suspendu, un timer throttlé, un client modifié
+-- continuaient la conversation APRÈS le plafond — le compteur SQL restait juste,
+-- mais le fournisseur continuait d'être payé pour du temps non refacturé.
+--
+-- Le battement de cœur est désormais un CONTRÔLE, et il répond à la seule
+-- question qui compte pour arrêter une session : « reste-t-il du temps ».
+-- Il renvoie `remaining_seconds` (calculé ici), et `should_stop` dès que zéro
+-- est atteint. La décision appartient à PostgreSQL ; le navigateur ne fait
+-- qu'obéir.
+--
+-- La réponse porte aussi `expired`: la session a été close et facturée pendant
+-- l'appel, donc la conversation doit s'arrêter immédiatement.
 create or replace function public.voice_touch(
-  p_user_id uuid,
-  p_session_id uuid,
-  p_lease_seconds integer
+  p_user_id             uuid,
+  p_session_id          uuid,
+  p_lease_seconds       integer,
+  p_max_session_seconds integer
 )
 returns jsonb
 language plpgsql
@@ -608,23 +625,58 @@ security definer
 set search_path = public
 as $$
 declare
-  v_state text;
+  v_session  record;
+  v_bound    integer;
+  v_measured integer;
+  v_remaining integer;
 begin
   if p_lease_seconds is null or p_lease_seconds <= 0 then
     raise exception 'voice_touch: p_lease_seconds is required';
   end if;
+  if p_max_session_seconds is null or p_max_session_seconds <= 0 then
+    raise exception 'voice_touch: p_max_session_seconds is required (no SQL default)';
+  end if;
 
-  select state into v_state
+  select id, state, usage_day, reserved_seconds, started_at
+    into v_session
     from public.voice_sessions
    where id = p_session_id and user_id = p_user_id
    for update;
 
   if not found then
-    return jsonb_build_object('ok', false, 'kind', 'unknown_session');
+    return jsonb_build_object('ok', false, 'kind', 'unknown_session', 'should_stop', true);
   end if;
 
-  if v_state <> 'active' then
-    return jsonb_build_object('ok', false, 'kind', 'not_active', 'state', v_state);
+  if v_session.state <> 'active' then
+    -- Close, remboursée ou expirée : plus rien à arrêter, mais on ne relance pas.
+    return jsonb_build_object(
+      'ok', false, 'kind', 'not_active', 'state', v_session.state,
+      'remaining_seconds', 0, 'should_stop', true
+    );
+  end if;
+
+  v_bound := least(v_session.reserved_seconds, p_max_session_seconds);
+  v_measured := greatest(0, floor(extract(epoch from (now() - v_session.started_at)))::integer);
+  v_remaining := greatest(0, v_bound - v_measured);
+
+  -- Plafond atteint : on clôt et on facture ICI, dans la même transaction, avec
+  -- exactement le calcul de `voice_settle` et de `voice_close_overdue`.
+  if v_remaining <= 0 then
+    update public.voice_usage_daily
+       set reserved_seconds = greatest(0, reserved_seconds - v_session.reserved_seconds),
+           consumed_seconds = consumed_seconds + v_bound,
+           updated_at = now()
+     where user_id = p_user_id and usage_day = v_session.usage_day;
+
+    update public.voice_sessions
+       set state = 'settled', closed_at = now(), charged_seconds = v_bound
+     where id = p_session_id;
+
+    return jsonb_build_object(
+      'ok', true, 'kind', 'ceiling_reached', 'state', 'settled',
+      'remaining_seconds', 0, 'should_stop', true, 'expired', true,
+      'measured_seconds', v_measured, 'charged_seconds', v_bound
+    );
   end if;
 
   update public.voice_sessions
@@ -632,7 +684,16 @@ begin
          last_heartbeat_at = now()
    where id = p_session_id;
 
-  return jsonb_build_object('ok', true, 'kind', 'touched');
+  return jsonb_build_object(
+    'ok', true, 'kind', 'touched', 'state', 'active',
+    'remaining_seconds', v_remaining,
+    'reserved_seconds', v_bound,
+    -- Vrai dès qu'il reste moins de 30 s : le navigateur peut annoncer la fin
+    -- avant la coupure, plutôt que de la subir en pleine phrase.
+    'should_stop', v_remaining <= 0,
+    'expiring_soon', v_remaining <= 30,
+    'expired', false
+  );
 end
 $$;
 
@@ -732,8 +793,23 @@ end
 $$;
 
 -- ---------------------------------------------------------------------
--- 11. Remboursement
+-- 11. Remboursement : RÉSERVÉ AUX SESSIONS `pending`
 -- ---------------------------------------------------------------------
+-- ⚠️ CORRECTION DE SÉCURITÉ (revue du 2026-11-22, commit 7fbeb50).
+--
+-- La version précédente acceptait `pending` ET `active`. Scénario réel :
+--   1. `voice_activate` réussit en base et pose `started_at` ;
+--   2. la réponse réseau se perd (timeout, coupure) ;
+--   3. la route croit l'activation échouée et appelle `voice_refund` ;
+--   4. l'ancienne version rendait INTÉGRALEMENT la réservation d'une session
+--      déjà activée — donc non facturée, alors qu'elle a consommé du temps.
+--
+-- La règle est maintenant portée par la base, pas par l'appelant :
+-- une session `active` ne peut JAMAIS être remboursée. Elle ne peut que d'être
+-- RÉGLÉE (`voice_settle`), ce qui la facture au temps réellement mesuré.
+--
+-- `released` à false est un refus explicite : l'appelant doit relire l'état et
+-- régler, jamais réessayer un remboursement.
 create or replace function public.voice_refund(
   p_user_id uuid,
   p_session_id uuid
@@ -746,7 +822,7 @@ as $$
 declare
   v_session record;
 begin
-  select id, usage_day, reserved_seconds, state
+  select id, usage_day, reserved_seconds, state, charged_seconds
     into v_session
     from public.voice_sessions
    where id = p_session_id and user_id = p_user_id
@@ -756,8 +832,23 @@ begin
     return jsonb_build_object('ok', false, 'kind', 'unknown_session');
   end if;
 
-  if v_session.state not in ('pending', 'active') then
-    return jsonb_build_object('ok', true, 'kind', 'already_released', 'charged_seconds', 0);
+  -- Une session ACTIVÉE a consommé du temps : elle se règle, jamais ne se rend.
+  if v_session.state = 'active' then
+    return jsonb_build_object(
+      'ok', false,
+      'kind', 'active_not_refundable',
+      'state', v_session.state,
+      'released', false,
+      'charged_seconds', 0
+    );
+  end if;
+
+  -- Déjà close : rien à rendre, et surtout aucune seconde libération.
+  if v_session.state <> 'pending' then
+    return jsonb_build_object(
+      'ok', true, 'kind', 'already_released', 'state', v_session.state,
+      'released', false, 'charged_seconds', coalesce(v_session.charged_seconds, 0)
+    );
   end if;
 
   if v_session.usage_day is not null then
@@ -771,7 +862,55 @@ begin
      set state = 'refunded', closed_at = now(), charged_seconds = 0
    where id = v_session.id;
 
-  return jsonb_build_object('ok', true, 'kind', 'refunded', 'charged_seconds', 0);
+  return jsonb_build_object(
+    'ok', true, 'kind', 'refunded', 'state', 'refunded',
+    'released', true, 'released_seconds', v_session.reserved_seconds,
+    'charged_seconds', 0
+  );
+end
+$$;
+
+-- ---------------------------------------------------------------------
+-- 11 bis. Relecture d'état : la réponse à « le résultat est-il passé ? »
+-- ---------------------------------------------------------------------
+-- Quand un appel réseau échoue, on ne sait pas si la base a été modifiée.
+-- Deviner est ce qui a créé le défaut ci-dessus. Cette lecture ne modifie
+-- RIEN : elle permet de décider sur des faits.
+create or replace function public.voice_session_state(
+  p_user_id uuid,
+  p_session_id uuid
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_session record;
+begin
+  select id, state, usage_day, reserved_seconds, charged_seconds, started_at
+    into v_session
+    from public.voice_sessions
+   where id = p_session_id and user_id = p_user_id;
+
+  if not found then
+    return jsonb_build_object('ok', false, 'kind', 'unknown_session');
+  end if;
+
+  return jsonb_build_object(
+    'ok', true,
+    'session_id', v_session.id,
+    'state', v_session.state,
+    'reserved_seconds', v_session.reserved_seconds,
+    'charged_seconds', v_session.charged_seconds,
+    'started_at', v_session.started_at,
+    -- Ce que le serveur doit faire ensuite, décidé à partir de l'état réel.
+    'action', case
+      when v_session.state = 'pending' then 'refundable'
+      when v_session.state = 'active' then 'settle'
+      else 'closed'
+    end
+  );
 end
 $$;
 
@@ -810,9 +949,10 @@ revoke all on function public.voice_expire_stale(uuid) from public, anon, authen
 revoke all on function public.voice_close_overdue(uuid, integer) from public, anon, authenticated;
 revoke all on function public.voice_reserve(uuid, integer, integer, text, integer, integer) from public, anon, authenticated;
 revoke all on function public.voice_activate(uuid, uuid, integer, text) from public, anon, authenticated;
-revoke all on function public.voice_touch(uuid, uuid, integer) from public, anon, authenticated;
+revoke all on function public.voice_touch(uuid, uuid, integer, integer) from public, anon, authenticated;
 revoke all on function public.voice_settle(uuid, uuid, integer) from public, anon, authenticated;
 revoke all on function public.voice_refund(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.voice_session_state(uuid, uuid) from public, anon, authenticated;
 revoke all on function public.voice_usage_read(uuid) from public, anon, authenticated;
 
 grant execute on function public.voice_usage_row(uuid, date) to service_role;
@@ -820,9 +960,10 @@ grant execute on function public.voice_expire_stale(uuid) to service_role;
 grant execute on function public.voice_close_overdue(uuid, integer) to service_role;
 grant execute on function public.voice_reserve(uuid, integer, integer, text, integer, integer) to service_role;
 grant execute on function public.voice_activate(uuid, uuid, integer, text) to service_role;
-grant execute on function public.voice_touch(uuid, uuid, integer) to service_role;
+grant execute on function public.voice_touch(uuid, uuid, integer, integer) to service_role;
 grant execute on function public.voice_settle(uuid, uuid, integer) to service_role;
 grant execute on function public.voice_refund(uuid, uuid) to service_role;
+grant execute on function public.voice_session_state(uuid, uuid) to service_role;
 grant execute on function public.voice_usage_read(uuid) to service_role;
 
 grant select on public.voice_usage_daily to authenticated;

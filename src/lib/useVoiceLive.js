@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { startVoiceSession, endVoiceSession, voiceErrorMessage } from './chatApi'
+import { startVoiceSession, endVoiceSession, heartbeatVoiceSession, voiceErrorMessage } from './chatApi'
 
 // Conversation vocale temps réel avec GPT-Live, en WebRTC.
 //
@@ -18,6 +18,9 @@ import { startVoiceSession, endVoiceSession, voiceErrorMessage } from './chatApi
 
 const ICE_GATHERING_TIMEOUT_MS = 5000
 const DATA_CHANNEL_LABEL = 'oai-events'
+// Cadence du battement de cœur. Assez court pour couper une session quelques
+// secondes après son plafond, assez long pour ne pas marteler /api/voice-heartbeat.
+const HEARTBEAT_INTERVAL_MS = 15000
 
 // Mémoire de la conversation vocale, conservée entre deux sessions.
 //
@@ -152,12 +155,102 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
     voiceHistoryRef.current = pushMemory(voiceHistoryRef.current, role, content)
   }, [])
 
-  const cleanupPeer = useCallback(async () => {
+  // ── Battement de cœur ────────────────────────────────────────────────────
+  //
+  // Un `setTimeout` local ne suffit PAS à arrêter une conversation : un onglet
+  // suspendu, un timer throttlé ou un client modifié continuent après le plafond,
+  // et le fournisseur continue d'être payé pour du temps que PostgreSQL a cessé
+  // de facturer. L'autorité est donc le serveur : il répond `stop` quand la
+  // réservation est épuisée, et il a alors déjà close et facturé la session.
+  //
+  // Le minuteur local reste, mais comme SECOURS : si le réseau est coupé, la
+  // session n'est pas maintenue indéfiniment par un compteur optimiste.
+  const beatRef = useRef(null)
+
+  const stopHeartbeat = useCallback(() => {
+    if (beatRef.current) {
+      clearInterval(beatRef.current)
+      beatRef.current = null
+    }
+  }, [])
+
+  // La fonction de fermeture est lue à travers une ref : `cleanupPeer` est
+  // défini APRÈS ce bloc, et le capturer directement créerait une dépendance
+  // circulaire dans le tableau de dépendances.
+  const cleanupRef = useRef(null)
+
+  const startHeartbeat = useCallback(
+    (maxSessionSeconds) => {
+      stopHeartbeat()
+      if (!accessToken) return
+
+      // Plafond local, en secondes : jamais un chiffre inventé côté client, il
+      // vient de la réservation accordée par PostgreSQL (`maxSessionSeconds`).
+      const localDeadlineMs =
+        Number.isFinite(maxSessionSeconds) && maxSessionSeconds > 0
+          ? Date.now() + maxSessionSeconds * 1000
+          : null
+
+      const beat = async () => {
+        const sessionId = sessionIdRef.current
+        if (!sessionId) return
+
+        // Filet de sécurité purement local : si le serveur est injoignable, la
+        // conversation s'arrête quand même à la borne annoncée.
+        if (localDeadlineMs && Date.now() >= localDeadlineMs) {
+          await cleanupRef.current?.()
+          setMicEnabled(false)
+          setStatus('idle')
+          return
+        }
+
+        const result = await heartbeatVoiceSession({ sessionId, accessToken }).catch(() => null)
+        if (!result) return // panne réseau : on retentera au battement suivant
+
+        if (result.stop === true) {
+          await cleanupRef.current?.({ alreadySettled: result.settled === true })
+          setMicEnabled(false)
+          setStatus('idle')
+        }
+      }
+
+      beatRef.current = setInterval(beat, HEARTBEAT_INTERVAL_MS)
+    },
+    [accessToken, stopHeartbeat]
+  )
+
+  const cleanupPeer = useCallback(async (options = {}) => {
+    // `alreadySettled` : la session a été close et facturée par PostgreSQL
+    // pendant un battement de cœur. Rappeler /api/voice-end serait sans effet
+    // (idempotent) mais enverrait un règlement pour une session déjà close.
+    const alreadySettled = options.alreadySettled === true
     const sessionId = sessionIdRef.current
     const durationSeconds = elapsedSeconds()
     sessionIdRef.current = null
     startedAtRef.current = null
     activeRef.current = false
+
+    // Fermeture GRACIEUSE côté fournisseur.
+    //
+    // `session.close` est un ÉVÉNEMENT du canal de données : c'est le seul moyen
+    // documenté de terminer une session GPT-Live depuis le client. Sans lui, le
+    // fournisseur garde la session ouverte jusqu'à son expiration — du temps
+    // facturé par OpenAI que VEYVRO ne refacture pas.
+    //
+    // On ne peut pas le faire depuis le serveur : `v1/live/sessions` n'expose
+    // aucun endpoint de fermeture, et le `hangup` documenté appartient à l'API
+    // Realtime (`/v1/realtime/calls`), que ce projet n'utilise pas.
+    //
+    // On envoie puis on ferme la connexion dans la même tâche : attendre
+    // `session.closed` ajouterait un aller-retour avant de régler, et le
+    // règlement reste la seule chose qui arrête la facturation VEYVRO.
+    try {
+      if (channelRef.current?.readyState === 'open') {
+        channelRef.current.send(JSON.stringify({ type: 'session.close' }))
+      }
+    } catch {
+      /* canal déjà fermé : rien à signaler au fournisseur */
+    }
 
     try {
       channelRef.current?.close()
@@ -185,12 +278,13 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
     // `durationSeconds` n'est qu'un indice de diagnostic. Le serveur facture
     // `now() - started_at`, mesuré par PostgreSQL : envoyer 0, une valeur
     // négative ou un chiffre énorme ne change rien à ce qui est débité.
-    if (sessionId && accessToken) {
+    if (sessionId && accessToken && !alreadySettled) {
       await endVoiceSession({ sessionId, durationSeconds, accessToken }).catch(() => null)
     }
   }, [accessToken])
 
   const stop = useCallback(async () => {
+    stopHeartbeat()
     await cleanupPeer()
     setMicEnabled(false)
     setStatus('idle')
@@ -236,6 +330,10 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
    * ait re-rendu avec la nouvelle préférence. Un événement de clic n'est pas un
    * identifiant de voix : tout ce qui n'est pas une chaîne est ignoré.
    */
+  // `cleanupPeer` est la seule fermeture correcte : on publie sa version
+  // courante pour que le battement de cœur l'appelle sans la capturer.
+  cleanupRef.current = cleanupPeer
+
   const startSession = useCallback(
     async (voiceOverride) => {
       const sessionVoice = typeof voiceOverride === 'string' && voiceOverride ? voiceOverride : voice
@@ -339,6 +437,8 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
           onVoiceSubstituted(answer.voice.id)
         }
         setMicEnabled(true)
+        // L'autorité de fin de session est le serveur, interrogé régulièrement.
+        startHeartbeat(answer.quota?.maxSessionSeconds)
         // `status` passe à « live » sur session.started ; en attendant, on reste
         // en « connecting » pour ne pas promettre une session qui n'a pas démarré.
       } catch (err) {
@@ -413,9 +513,10 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
   // Nettoyage au démontage : jamais de session ni de micro abandonnés.
   useEffect(() => {
     return () => {
+      stopHeartbeat()
       cleanupPeer()
     }
-  }, [cleanupPeer])
+  }, [cleanupPeer, stopHeartbeat])
 
   return {
     status,
