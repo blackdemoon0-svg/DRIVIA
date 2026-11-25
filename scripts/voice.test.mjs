@@ -296,7 +296,12 @@ const days = (n) => new Date(Date.now() + n * 86_400_000).toISOString();
   pass("quota : le champ vocal s'ajoute sans modifier les limites existantes");
 
   // Le stockage est ailleurs désormais : voici son double, fidèle au SQL.
-  const store = createVoiceStoreStub({ now: () => NOON });
+  // Horloge pilotable : les durées sont mesurées, pas annoncées.
+  let clock = NOON;
+  const store = createVoiceStoreStub({ now: () => clock });
+  const advance = (seconds) => {
+    clock += seconds * 1_000;
+  };
 
   // Formule sans voix : refus avant tout appel fournisseur, sans rien écrire.
   const refused = await voiceUsage.reserveVoiceSeconds(
@@ -330,12 +335,18 @@ const days = (n) => new Date(Date.now() + n * 86_400_000).toISOString();
   assert.equal(store.reserved(USER), 60, "le refus n'ajoute pas une seconde réservation");
   pass("quota : une deuxième session simultanée est refusée (voice_session_open)");
 
-  // Règlement à la durée réelle : une session de 20 s rend 40 s.
+  // Règlement à la durée réelle : 20 s de conversation, mesurées.
+  await voiceUsage.activateVoiceSession(
+    { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
+    { userId: USER, sessionId: plus.sessionId, fetchImpl: store.fetch },
+  );
+  advance(20);
   const settled = await voiceUsage.settleVoiceSeconds(
     { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
-    { userId: USER, sessionId: plus.sessionId, actualSeconds: 20, fetchImpl: store.fetch },
+    { userId: USER, sessionId: plus.sessionId, fetchImpl: store.fetch },
   );
   assert.equal(settled.kind, "settled");
+  assert.equal(settled.measuredSeconds, 20, "la durée est mesurée, pas reçue");
   assert.equal(settled.chargedSeconds, 20);
   assert.equal(settled.usedSeconds, 20, "seule la durée réelle est consommée");
   assert.equal(store.reserved(USER), 0);
@@ -346,9 +357,14 @@ const days = (n) => new Date(Date.now() + n * 86_400_000).toISOString();
     { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
     { userId: USER, allowanceSeconds: 600, reserveSeconds: 60, voiceId: "brise", fetchImpl: store.fetch },
   );
+  await voiceUsage.activateVoiceSession(
+    { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
+    { userId: USER, sessionId: reopen.sessionId, fetchImpl: store.fetch },
+  );
+  advance(90);
   const longer = await voiceUsage.settleVoiceSeconds(
     { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
-    { userId: USER, sessionId: reopen.sessionId, actualSeconds: 90, fetchImpl: store.fetch },
+    { userId: USER, sessionId: reopen.sessionId, fetchImpl: store.fetch },
   );
   assert.equal(longer.usedSeconds, 110, "le dépassement de la réservation est facturé");
   pass("quota : une session de 90 s consomme 90 s malgré la réservation de 60 s");
@@ -359,9 +375,14 @@ const days = (n) => new Date(Date.now() + n * 86_400_000).toISOString();
     { userId: USER, allowanceSeconds: 600, reserveSeconds: 600 - 110, voiceId: "brise", fetchImpl: store.fetch },
   );
   assert.equal(big.ok, true, "ce qui reste est encore réservable");
+  await voiceUsage.activateVoiceSession(
+    { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
+    { userId: USER, sessionId: big.sessionId, fetchImpl: store.fetch },
+  );
+  advance(600 - 110);
   await voiceUsage.settleVoiceSeconds(
     { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
-    { userId: USER, sessionId: big.sessionId, actualSeconds: 600 - 110, fetchImpl: store.fetch },
+    { userId: USER, sessionId: big.sessionId, fetchImpl: store.fetch },
   );
   const exhausted = await voiceUsage.reserveVoiceSeconds(
     { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
@@ -764,17 +785,24 @@ function proPlan() {
   // Quota épuisé : 429 avec Retry-After, sans appel fournisseur.
   {
     resetQuotas();
-    // Le quota est déjà plein pour ce compte : le magasin est pré-rempli.
-    const saturated = createVoiceStoreStub();
+    // Le quota est déjà plein pour ce compte : 1800 s réellement consommées.
+    let clock = Date.now();
+    const saturated = createVoiceStoreStub({ now: () => clock });
     const prefill = await voiceUsage.reserveVoiceSeconds(
       { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
-      { userId: USER, allowanceSeconds: 1800, reserveSeconds: 1800, voiceId: "brise", fetchImpl: saturated.fetch },
+      { userId: USER, allowanceSeconds: 1800, reserveSeconds: 60, voiceId: "brise", fetchImpl: saturated.fetch },
     );
-    assert.equal(prefill.ok, true, "le magasin de test démarre saturé");
-    await voiceUsage.settleVoiceSeconds(
+    assert.equal(prefill.ok, true, "la session de pré-remplissage s'ouvre");
+    await voiceUsage.activateVoiceSession(
       { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
-      { userId: USER, sessionId: prefill.sessionId, actualSeconds: 1800, fetchImpl: saturated.fetch },
+      { userId: USER, sessionId: prefill.sessionId, fetchImpl: saturated.fetch },
     );
+    clock += 1800 * 1_000;
+    const settledPrefill = await voiceUsage.settleVoiceSeconds(
+      { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" },
+      { userId: USER, sessionId: prefill.sessionId, fetchImpl: saturated.fetch },
+    );
+    assert.equal(settledPrefill.chargedSeconds, 1800, "les 30 minutes du plan Pro sont consommées");
     const calls = installStub({ rows: proPlan(), store: saturated });
     const out = await callSession();
     assert.equal(out.status, 429);
@@ -836,10 +864,15 @@ function proPlan() {
   await callEnd({ body: { sessionId: third.body.sessionId } });
   pass("sessions simultanées : la fermeture libère la place, une nouvelle session passe");
 
-  // Épuisement par accumulation, sur un compte Plus (10 min = 600 s) : dix
-  // sessions de 60 s remplissent exactement le quota, la onzième est refusée.
+  // Épuisement par accumulation, sur un compte Plus (10 min = 600 s).
+  //
+  // Chaque session doit être RÉELLEMENT vécue : on l'active, on avance
+  // l'horloge de 60 s, puis on la ferme. C'est la seule façon de consommer des
+  // minutes depuis que la durée n'est plus fournie par le client — une session
+  // fermée aussitôt ne coûte rien, ce qui est le comportement voulu.
   resetQuotas();
-  const plusStore = createVoiceStoreStub();
+  let plusClock = Date.now();
+  const plusStore = createVoiceStoreStub({ now: () => plusClock });
   installStub({
     rows: [{ user_id: USER, plan: "plus", status: "active", current_period_ends_at: days(20) }],
     store: plusStore,
@@ -850,17 +883,17 @@ function proPlan() {
     const attempt = await callSession({ body: { sdp: OFFER_SDP, voice: "brise" } });
     if (attempt.status === 201) {
       accepted += 1;
-      // Chaque session est refermée immédiatement : on teste le cumul des
-      // réservations pleines, pas la protection contre les sessions ouvertes.
+      plusClock += 60_000;
       await callEnd({ body: { sessionId: attempt.body.sessionId, durationSeconds: 60 } });
     } else {
       refusedWith = attempt.body.code;
       break;
     }
   }
-  assert.equal(accepted, 10, "10 réservations de 60 s remplissent les 10 minutes du plan Plus");
+  assert.equal(accepted, 10, "10 sessions d'une minute remplissent les 10 minutes du plan Plus");
   assert.equal(refusedWith, "voice_minutes_exhausted", "la 11e session est refusée pour quota");
-  pass("sessions simultanées : 10 sessions de 60 s saturent Plus, la suivante est refusée");
+  assert.equal(plusStore.consumed(USER), 600, "600 s réellement consommées, pas 660");
+  pass("sessions simultanées : 10 sessions d'une minute saturent Plus, la suivante est refusée");
 
   // Fermer une session rend le temps non consommé.
   resetQuotas();
@@ -1052,22 +1085,104 @@ async function callEnd({ token = TOKEN, body, sessionId } = {}) {
     pass("/api/voice-end : une durée annoncée par le client n'est jamais facturée");
   }
 
-  // Une réservation orpheline (ligne supprimée hors bande) est rattrapée par le
-  // bail, au moment de la réservation suivante. C'est le seul endroit qui
-  // réconcilie le compte, et il ne dépend d'aucune parole du client.
+  // Une RÉSERVATION orpheline (jamais activée) est rattrapée par le bail, à la
+  // réservation suivante. C'est le seul endroit qui réconcilie le compte, et il
+  // ne dépend d'aucune parole du client.
   {
     resetQuotas();
     const calls = installStub({ rows: proPlan() });
-    const open = await callSession({ body: { sdp: OFFER_SDP, voice: "brise" } });
-    // La session est antidatée au-delà de son bail, comme un onglet tué.
-    const row = calls.store.sessions.get(open.body.sessionId);
-    row.reservationExpiresAt = Date.now() - 1_000;
-    assert.equal(calls.store.reserved(USER), 60, "la réservation est en place");
+    const env = { url: SUPABASE_URL, serviceRoleKey: "sb_secret_stub_key" };
+    // Réservation au niveau du magasin : la route, elle, active aussitôt.
+    const orphan = await voiceUsage.reserveVoiceSeconds(env, {
+      userId: USER,
+      allowanceSeconds: 1800,
+      reserveSeconds: 60,
+      voiceId: "brise",
+      fetchImpl: calls.store.fetch,
+    });
+    assert.equal(orphan.ok, true);
+    const row = calls.store.sessions.get(orphan.sessionId);
+    assert.equal(row.state, "pending", "une réservation non activée reste pending");
+    row.leaseExpiresAt = Date.now() - 1_000;
+
     const next = await callSession({ body: { sdp: OFFER_SDP, voice: "brise" } });
     assert.equal(next.status, 201, "le bail périmé est libéré, la nouvelle session passe");
-    assert.equal(calls.store.consumed(USER), 0, "une session expirée ne consomme rien");
-    assert.equal(calls.store.openSessions(USER).length, 1, "une seule session ouverte après nettoyage");
-    pass("/api/voice-end : un bail périmé est libéré à la réservation suivante, sans rien facturer");
+    assert.equal(calls.store.consumed(USER), 0, "une réservation expirée ne consomme rien");
+    assert.equal(row.state, "expired", "la réservation abandonnée est marquée expirée");
+    pass("/api/voice-end : une réservation abandonnée est libérée par son bail, sans rien facturer");
+  }
+
+  // ── Correction du défaut bloquant : la durée ne vient PAS du client ──────
+  //
+  // Ces trois contrôles sont la raison d'être de la refonte. Avant, la route
+  // transmettait `body.durationSeconds` à `voice_settle`, qui l'utilisait comme
+  // durée facturée. `durationSeconds: 0` suffisait à ne rien payer.
+  {
+    for (const forged of [0, -999, 1, 999_999]) {
+      resetQuotas();
+      let clock = Date.now();
+      const store = createVoiceStoreStub({ now: () => clock });
+      installStub({ rows: proPlan(), store });
+
+      const open = await callSession({ body: { sdp: OFFER_SDP, voice: "brise" } });
+      assert.equal(open.status, 201);
+      const sessionRow = store.sessions.get(open.body.sessionId);
+      assert.equal(sessionRow.state, "active", "la session est active après la réponse fournisseur");
+
+      // 47 secondes de conversation réelle.
+      clock += 47_000;
+      const end = await callEnd({
+        body: { sessionId: open.body.sessionId, durationSeconds: forged },
+      });
+
+      assert.equal(end.status, 200);
+      assert.equal(
+        end.body.chargedSeconds,
+        47,
+        `durationSeconds: ${forged} ne change pas la facture (47 s réelles)`,
+      );
+      assert.equal(end.body.measuredSeconds, 47, "la durée facturée est la durée mesurée");
+      assert.equal(
+        end.body.clientReportedSeconds,
+        Math.max(0, forged),
+        "la valeur du client est renvoyée pour diagnostic seulement",
+      );
+      assert.equal(store.consumed(USER), 47, "47 s consommées, quoi que dise le client");
+    }
+    pass("/api/voice-end : durationSeconds 0, négatif, 1 ou 999999 ne réduit pas la facture");
+  }
+
+  // ── Scénario « deux appareils » au niveau de la route ────────────────────
+  {
+    resetQuotas();
+    let clock = Date.now();
+    const store = createVoiceStoreStub({ now: () => clock });
+    installStub({ rows: proPlan(), store });
+
+    // Première conversation, réellement active depuis 45 minutes.
+    const first = await callSession({ body: { sdp: OFFER_SDP, voice: "brise" } });
+    assert.equal(first.status, 201);
+    clock += 45 * 60_000;
+
+    // Deuxième appareil.
+    const second = await callSession({ body: { sdp: OFFER_SDP, voice: "marin" } });
+    assert.equal(second.status, 409, "la deuxième conversation est refusée");
+    assert.equal(second.body.code, "voice_session_open");
+    assert.equal(store.openSessions(USER).length, 1, "une seule conversation en cours");
+    assert.equal(store.consumed(USER), 0, "et surtout : rien n'a été facturé à ce stade");
+
+    // Le bail (même très ancien) ne libère JAMAIS une session active.
+    const activeRow = store.sessions.get(first.body.sessionId);
+    activeRow.leaseExpiresAt = Date.now() - 3_600_000;
+    const third = await callSession({ body: { sdp: OFFER_SDP, voice: "marin" } });
+    assert.equal(third.status, 409, "un bail périmé de session active ne libère pas la place");
+    assert.equal(activeRow.state, "active", "la conversation en cours reste active");
+
+    // La conversation dure 50 minutes : la fermeture facture le temps réel.
+    clock += 5 * 60_000;
+    const end = await callEnd({ body: { sessionId: first.body.sessionId, durationSeconds: 0 } });
+    assert.equal(end.body.chargedSeconds, 50 * 60, "50 minutes facturées, pas 0");
+    pass("/api/voice-end : deux appareils refusés, bail inopérant sur une session active");
   }
 }
 
@@ -1511,6 +1626,34 @@ async function callProfiles({ method = "GET", token = null, body } = {}) {
     "le modèle de transcription vient du catalogue, pas d'une chaîne en dur",
   );
   pass("contexte : la transcription de la parole utilisateur est demandée par la session");
+
+  // Le changement de voix ferme ET règle l'ancienne session avant d'en ouvrir
+  // une nouvelle. L'ordre est vérifiable dans le code : `restartWithVoice`
+  // appelle `cleanupPeer` (qui attend `/api/voice-end`) avant `start`.
+  const hookSource = readFileSync(new URL("../src/lib/useVoiceLive.js", import.meta.url), "utf8");
+  const restart = hookSource.slice(hookSource.indexOf("const restartWithVoice"));
+  const body = restart.slice(0, restart.indexOf(");"));
+  const cleanupAt = body.indexOf("await cleanupPeer()");
+  const startAt = body.indexOf("await startRef.current(");
+  assert.ok(cleanupAt > -1, "restartWithVoice ferme la session en cours");
+  assert.ok(startAt > -1, "restartWithVoice en ouvre une nouvelle");
+  assert.ok(
+    cleanupAt < startAt,
+    "la fermeture réglée précède l'ouverture : jamais deux sessions facturées",
+  );
+  pass("contexte : le changement de voix ferme et règle l'ancienne session avant d'ouvrir la suivante");
+
+  // La durée envoyée par le client est explicitement documentée comme un
+  // simple indice, jamais comme la base de la facturation.
+  assert.ok(
+    /n'est qu'un indice de diagnostic/.test(hookSource),
+    "le client documente que sa durée n'est pas facturée",
+  );
+  assert.ok(
+    !/actualSeconds/.test(readFileSync(new URL("../server/voiceUsage.ts", import.meta.url), "utf8")),
+    "aucun paramètre de durée ne subsiste dans le client de stockage",
+  );
+  pass("contexte : aucun paramètre de durée côté serveur, la valeur client est un indice");
 }
 
 // ---------------------------------------------------------------------------

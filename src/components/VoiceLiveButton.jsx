@@ -53,6 +53,17 @@ export default function VoiceLiveButton({ session, accessToken, history = [], di
   // un navigateur sans WebRTC doit le dire au lieu d'afficher un bouton mort.
   const unsupported = notice ?? (supported ? null : "La conversation vocale n'est pas prise en charge par ce navigateur.")
 
+  /**
+   * Choix d'une voix, y compris en cours de conversation.
+   *
+   * Ordre impératif : `restartWithVoice` ferme la session en cours ET la règle
+   * côté serveur (`cleanupPeer` → `/api/voice-end`) avant d'en ouvrir une
+   * nouvelle. Sans cet ordre, deux sessions seraient facturées en parallèle —
+   * et la base les refuserait de toute façon, la seconde en `409`.
+   *
+   * La préférence est enregistrée avant, pour que la nouvelle session trouve
+   * la bonne voix même si le parent n'a pas encore re-rendu.
+   */
   const handleVoiceSelect = async (voiceId) => {
     const result = await choose(voiceId)
     if (!result.ok) {
@@ -60,8 +71,8 @@ export default function VoiceLiveButton({ session, accessToken, history = [], di
       return
     }
     setNotice(null)
-    // Session active : on la redémarre avec la nouvelle voix, sans perdre le fil.
     if (status === 'live' || status === 'connecting') {
+      // `restartWithVoice` attend la fermeture réglée avant de rouvrir.
       await restartWithVoice(voiceId)
     }
   }

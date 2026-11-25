@@ -17,7 +17,10 @@
  *   • an atomic reservation — the authorisation condition sits in the `UPDATE`
  *     ... `WHERE`, so two concurrent reservations cannot both succeed;
  *   • settlement and refund are idempotent — the session row records that it
- *     was already settled, whatever the network did.
+ *     was already settled, whatever the network did;
+ *   • the charged duration is `now() - started_at`, computed in SQL. No
+ *     duration parameter exists anywhere on this path: a forged
+ *     `durationSeconds` cannot reach the database.
  *
  * This module only carries the calls. It holds no allowance state of its own: a
  * second instance reading the same account sees the same numbers.
@@ -128,8 +131,10 @@ export async function reserveVoiceSeconds(
     allowanceSeconds: number;
     reserveSeconds: number;
     voiceId: string;
-    /** How long the reservation may sit unused before it is released. */
+    /** How long the RESERVATION may sit unused before it is released. */
     ttlSeconds?: number;
+    /** Hard session ceiling copied from the Live model's documented limit. */
+    maxSessionSeconds?: number;
     fetchImpl?: typeof fetch;
   },
 ): Promise<ReserveResult> {
@@ -141,7 +146,8 @@ export async function reserveVoiceSeconds(
       p_allowance_seconds: Math.max(0, Math.trunc(options.allowanceSeconds)),
       p_reserve_seconds: Math.max(1, Math.trunc(options.reserveSeconds)),
       p_voice_id: options.voiceId,
-      p_ttl_seconds: Math.max(60, Math.trunc(options.ttlSeconds ?? 3_600)),
+      p_ttl_seconds: Math.max(30, Math.trunc(options.ttlSeconds ?? 300)),
+      p_max_session_seconds: Math.max(60, Math.trunc(options.maxSessionSeconds ?? 3_600)),
     },
     options.fetchImpl ?? fetch,
   );
@@ -196,26 +202,33 @@ export async function settleVoiceSeconds(
   options: {
     userId: string;
     sessionId: string;
-    actualSeconds: number;
+    /** Bound applied by the database; never a duration. */
+    maxSessionSeconds?: number;
     fetchImpl?: typeof fetch;
   },
-): Promise<{ kind: string; chargedSeconds: number; usedSeconds: number | null }> {
+): Promise<{ kind: string; chargedSeconds: number; measuredSeconds: number | null; usedSeconds: number | null }> {
+  // Deliberately NO duration parameter. The billed duration is `now() -
+  // started_at`, computed by PostgreSQL. A previous version forwarded the
+  // browser's `durationSeconds` here, which let a client send 0 and pay
+  // nothing. Removing the parameter removes the possibility.
   const payload = await callVoiceFunction(
     env,
     "voice_settle",
     {
       p_user_id: options.userId,
       p_session_id: options.sessionId,
-      p_actual_seconds: Math.max(0, Math.round(options.actualSeconds)),
+      p_max_session_seconds: Math.max(60, Math.trunc(options.maxSessionSeconds ?? 3_600)),
     },
     options.fetchImpl ?? fetch,
   );
 
   const kind = typeof payload.kind === "string" ? payload.kind : "unknown";
+  const measured = payload.measured_seconds;
   const usedRaw = payload.used_seconds;
   return {
     kind,
     chargedSeconds: Number(payload.charged_seconds ?? 0),
+    measuredSeconds: typeof measured === "number" && Number.isFinite(measured) ? measured : null,
     usedSeconds: typeof usedRaw === "number" && Number.isFinite(usedRaw) ? usedRaw : null,
   };
 }
@@ -234,6 +247,63 @@ export async function refundVoiceReservation(
     env,
     "voice_refund",
     { p_user_id: options.userId, p_session_id: options.sessionId },
+    options.fetchImpl ?? fetch,
+  );
+  return { kind: typeof payload.kind === "string" ? payload.kind : "unknown" };
+}
+
+/**
+ * Mark the reservation as a live conversation.
+ *
+ * Called AFTER the provider answered successfully. This is where `started_at`
+ * is set, so the SDP exchange — up to 20 seconds — is not billed. Until this
+ * call, the row is `pending` and cannot be charged.
+ */
+export async function activateVoiceSession(
+  env: VoiceStoreEnv,
+  options: {
+    userId: string;
+    sessionId: string;
+    /** How long the active session's lease should last. */
+    leaseSeconds?: number;
+    providerSessionId?: string | null;
+    fetchImpl?: typeof fetch;
+  },
+): Promise<{ kind: string }> {
+  const payload = await callVoiceFunction(
+    env,
+    "voice_activate",
+    {
+      p_user_id: options.userId,
+      p_session_id: options.sessionId,
+      p_lease_seconds: Math.max(120, Math.trunc(options.leaseSeconds ?? 3_900)),
+      p_provider_session_id: options.providerSessionId ?? null,
+    },
+    options.fetchImpl ?? fetch,
+  );
+  return { kind: typeof payload.kind === "string" ? payload.kind : "unknown" };
+}
+
+/**
+ * Heartbeat: extends the lease of an active session.
+ *
+ * Never used for billing. Its absence does not extend anything either — the
+ * hard session ceiling remains the only bound. It exists so a long
+ * conversation stays visibly alive, and so `lease_expires_at` keeps a meaning
+ * for diagnosis.
+ */
+export async function touchVoiceSession(
+  env: VoiceStoreEnv,
+  options: { userId: string; sessionId: string; leaseSeconds?: number; fetchImpl?: typeof fetch },
+): Promise<{ kind: string }> {
+  const payload = await callVoiceFunction(
+    env,
+    "voice_touch",
+    {
+      p_user_id: options.userId,
+      p_session_id: options.sessionId,
+      p_lease_seconds: Math.max(120, Math.trunc(options.leaseSeconds ?? 3_900)),
+    },
     options.fetchImpl ?? fetch,
   );
   return { kind: typeof payload.kind === "string" ? payload.kind : "unknown" };

@@ -181,8 +181,10 @@ export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }
     }
 
     // Toujours régler côté serveur : c'est ce qui arrête la facturation.
-    // `durationSeconds` n'est qu'une indication : le serveur l'ignore s'il connaît
-    // la session, et la plafonne à la réservation sinon.
+    //
+    // `durationSeconds` n'est qu'un indice de diagnostic. Le serveur facture
+    // `now() - started_at`, mesuré par PostgreSQL : envoyer 0, une valeur
+    // négative ou un chiffre énorme ne change rien à ce qui est débité.
     if (sessionId && accessToken) {
       await endVoiceSession({ sessionId, durationSeconds, accessToken }).catch(() => null)
     }

@@ -10,10 +10,14 @@ import { settleVoiceSeconds, VoiceStoreUnavailableError } from "../server/voiceU
  * ─────────────────────────────────────────────────────────────────────────────
  *  WHO DECIDES THE DURATION
  * ─────────────────────────────────────────────────────────────────────────────
- * The duration is computed by the server from the session row created when the
- * session opened (`voice_sessions.started_at`), never from what the browser
- * claims: a client-reported duration would let anyone declare a three-second
- * conversation.
+ * The duration is computed BY POSTGRESQL, from `voice_sessions.started_at`, which
+ * is set once the provider has answered — not by this route, and not by the
+ * browser. `voice_settle` has no duration parameter at all, so a forged
+ * `durationSeconds` cannot be forwarded even by accident.
+
+ * A previous version passed the browser's value down as `p_actual_seconds`.
+ * That was a real defect: a client sending 0 paid nothing. It is fixed by
+ * removing the parameter, not by validating it.
  *
  * `voice_settle` is idempotent in the database: a second close returns
  * `already_settled` with the duration recorded at the first one, so a duplicated
@@ -110,17 +114,20 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     });
   }
 
+  // Diagnostic only. This value is echoed back for support, and is NEVER used
+  // to bill: the charged duration is measured by PostgreSQL from
+  // `voice_sessions.started_at`. A client sending 0, a negative number or a
+  // huge one changes nothing.
   const reported = Number.isFinite(Number(body.durationSeconds))
     ? Math.max(0, Math.round(Number(body.durationSeconds)))
     : null;
 
   try {
+    // No duration is sent. The database computes `now() - started_at`; a
+    // forged `durationSeconds` in the body cannot reach it.
     const settled = await settleVoiceSeconds(storeEnv, {
       userId: access.userId,
       sessionId,
-      // The database decides the real duration; this value is only used when
-      // the row is unknown, where the settlement is refused anyway.
-      actualSeconds: reported ?? 0,
     });
 
     if (settled.kind === "unknown_session") {
@@ -149,6 +156,16 @@ export default async function handler(request: ApiRequest, response: ApiResponse
       });
     }
 
+    if (settled.kind === "never_started") {
+      // The reservation was never activated: nothing happened, nothing billed.
+      return response.status(200).json({
+        settledWith: "never-started",
+        chargedSeconds: 0,
+        usedSeconds: settled.usedSeconds,
+        clientReportedSeconds: reported,
+      });
+    }
+
     if (settled.kind === "already_released") {
       return response.status(200).json({
         settledWith: "already-released",
@@ -160,7 +177,10 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     return response.status(200).json({
       settledWith: "duration",
       chargedSeconds: settled.chargedSeconds,
+      // The duration PostgreSQL measured, before the hard ceiling.
+      measuredSeconds: settled.measuredSeconds,
       usedSeconds: settled.usedSeconds,
+      clientReportedSeconds: reported,
     });
   } catch (error) {
     if (error instanceof VoiceStoreUnavailableError) {

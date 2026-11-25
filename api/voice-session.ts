@@ -1,8 +1,9 @@
 import crypto from "node:crypto";
 import { authorizeRequest, IdentityUnavailableError, readAccessEnv } from "../server/access.js";
 import {
-  reserveVoiceSeconds,
+  activateVoiceSession,
   refundVoiceReservation,
+  reserveVoiceSeconds,
   VoiceStoreUnavailableError,
   type VoiceStoreEnv,
 } from "../server/voiceUsage.js";
@@ -64,6 +65,16 @@ export const config = {
 const MAX_SDP_CHARACTERS = 400_000;
 const MAX_HISTORY_MESSAGES = 12;
 const PROVIDER_TIMEOUT_MS = 20_000;
+
+/**
+ * Lease of an ACTIVE session, in seconds.
+ *
+ * Longer than the documented 60-minute ceiling of a Live session plus the
+ * handshake: an active conversation must never have its lease expire, because
+ * the lease only protects reservations. The hard ceiling closes overdue
+ * sessions; the lease never does.
+ */
+const LIVE_SESSION_LEASE_SECONDS = 3_900;
 
 function readEnvVar(...names: string[]): string | undefined {
   for (const name of names) {
@@ -360,6 +371,7 @@ export default async function handler(request: ApiRequest, response: ApiResponse
       reserveSeconds: VOICE_RESERVATION_SECONDS,
       voiceId: voice.id,
       ttlSeconds: VOICE_RESERVATION_TTL_SECONDS,
+      maxSessionSeconds: LIVE_SESSION_LEASE_SECONDS,
     });
   } catch (error) {
     if (error instanceof VoiceStoreUnavailableError) {
@@ -422,6 +434,37 @@ export default async function handler(request: ApiRequest, response: ApiResponse
       response.setHeader("Retry-After", "5");
     }
     return response.status(created.status).json({ code: created.code, error: created.error });
+  }
+
+  // The provider answered: the conversation is about to start. Only now does
+  // the billable clock start (`started_at`), so the SDP exchange — up to 20 s of
+  // preparation — is not charged to the user.
+  let activated = true;
+  try {
+    const activation = await activateVoiceSession(storeEnv, {
+      userId: access.userId,
+      sessionId: reservation.sessionId,
+      leaseSeconds: LIVE_SESSION_LEASE_SECONDS,
+      providerSessionId: created.providerSessionId,
+    });
+    activated = activation.kind === "activated" || activation.kind === "already_active";
+  } catch (error) {
+    if (!(error instanceof VoiceStoreUnavailableError)) throw error;
+    activated = false;
+  }
+
+  if (!activated) {
+    // The conversation exists upstream but the ledger could not open its
+    // clock. Refuse it: better no session than an unbilled one. The
+    // reservation is released and the browser had no SDP to apply.
+    await refundVoiceReservation(storeEnv, {
+      userId: access.userId,
+      sessionId: reservation.sessionId,
+    }).catch(() => null);
+    return response.status(503).json({
+      code: "voice_store_unavailable",
+      error: "La conversation n'a pas pu être ouverte. Réessayez. / The voice session could not be opened. Please try again.",
+    });
   }
 
   return response.status(201).json({

@@ -251,9 +251,16 @@ export function resetQuotas(): void {
 export const VOICE_RESERVATION_SECONDS = 60;
 
 /**
- * How long a reservation may sit unused before it is released.
+ * How long a RESERVATION may sit unused before it is released.
  *
- * One hour: longer than any plausible session, short enough that a tab killed
- * mid-handshake does not block the account until midnight.
+ * Five minutes, and deliberately short. It covers the SDP exchange (up to 20 s
+ * against the provider) and a slow client, and nothing more. Once the session
+ * is activated, the row leaves `pending` and this lease stops applying: an
+ * active conversation is protected by its own lease and the hard session
+ * ceiling, never by this value.
+ *
+ * A short lease is what keeps an abandoned handshake from blocking the account:
+ * a tab killed between the reservation and the provider answer releases itself
+ * five minutes later, not in an hour.
  */
-export const VOICE_RESERVATION_TTL_SECONDS = 3_600;
+export const VOICE_RESERVATION_TTL_SECONDS = 300;

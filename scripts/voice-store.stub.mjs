@@ -47,8 +47,8 @@ export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
     let count = 0;
     for (const session of sessions.values()) {
       if (session.userId !== userId) continue;
-      if (session.state !== "open") continue;
-      if (session.reservationExpiresAt >= nowMs) continue;
+      if (session.state !== "pending") continue;
+      if (session.leaseExpiresAt >= nowMs) continue;
       session.state = "expired";
       session.closedAt = nowMs;
       session.chargedSeconds = 0;
@@ -73,16 +73,16 @@ export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
 
       expireStale(userId, nowMs);
 
-      const open = [...sessions.values()].find((s) => s.userId === userId && s.state === "open");
+      const open = [...sessions.values()].find(
+        (s) => s.userId === userId && (s.state === "pending" || s.state === "active"),
+      );
       if (open) {
         return {
           ok: false,
           kind: "voice_session_open",
           open_session_id: open.id,
-          retry_after_seconds: Math.max(
-            1,
-            Math.ceil((open.reservationExpiresAt - nowMs) / 1_000),
-          ),
+          open_state: open.state,
+          retry_after_seconds: Math.max(1, Math.ceil((open.leaseExpiresAt - nowMs) / 1_000)),
         };
       }
 
@@ -106,11 +106,14 @@ export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
         voiceId: args.p_voice_id ?? "brise",
         usageDay: day,
         reservedSeconds: reserve,
-        state: "open",
-        startedAt: nowMs,
-        reservationExpiresAt: nowMs + Math.max(60, Number(args.p_ttl_seconds ?? 3_600)) * 1_000,
+        state: "pending",
+        // Aucun horodatage de facturation tant que voice_activate n'a pas été
+        // appelé : c'est là que le chrono démarre.
+        startedAt: null,
+        leaseExpiresAt: nowMs + Math.max(30, Number(args.p_ttl_seconds ?? 300)) * 1_000,
         closedAt: null,
         chargedSeconds: null,
+        providerSessionId: null,
       });
 
       return {
@@ -122,14 +125,70 @@ export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
       };
     },
 
+    voice_activate(args) {
+      const nowMs = now();
+      const session = sessions.get(args.p_session_id);
+      if (!session || session.userId !== args.p_user_id) {
+        return { ok: false, kind: "unknown_session" };
+      }
+      if (session.state === "active") {
+        // Idempotent : `started_at` ne recule pas.
+        return { ok: true, kind: "already_active" };
+      }
+      if (session.state !== "pending") {
+        return { ok: false, kind: "not_pending", state: session.state };
+      }
+      session.state = "active";
+      // C'est ICI que le chrono démarre, pas à la réservation.
+      session.startedAt = nowMs;
+      session.leaseExpiresAt =
+        nowMs + Math.max(120, Number(args.p_lease_seconds ?? 3_900)) * 1_000;
+      session.providerSessionId = args.p_provider_session_id ?? null;
+      return { ok: true, kind: "activated" };
+    },
+
+    voice_touch(args) {
+      const nowMs = now();
+      const session = sessions.get(args.p_session_id);
+      if (!session || session.userId !== args.p_user_id) {
+        return { ok: false, kind: "unknown_session" };
+      }
+      if (session.state !== "active") {
+        return { ok: false, kind: "not_active", state: session.state };
+      }
+      session.leaseExpiresAt =
+        nowMs + Math.max(120, Number(args.p_lease_seconds ?? 3_900)) * 1_000;
+      return { ok: true, kind: "touched" };
+    },
+
+    voice_close_overdue(args) {
+      const nowMs = now();
+      const max = Math.max(60, Number(args.p_max_session_seconds ?? 3_600));
+      let count = 0;
+      for (const session of sessions.values()) {
+        if (session.state !== "active" || session.startedAt === null) continue;
+        if (typeof args.p_user_id === "string" && session.userId !== args.p_user_id) continue;
+        if (session.startedAt + max * 1_000 > nowMs) continue;
+        const row = usageRow(session.userId, session.usageDay);
+        row.reserved = Math.max(0, row.reserved - session.reservedSeconds);
+        row.consumed += max;
+        session.state = "settled";
+        session.closedAt = nowMs;
+        session.chargedSeconds = max;
+        count += 1;
+      }
+      return count;
+    },
+
     voice_settle(args) {
       const nowMs = now();
       const session = sessions.get(args.p_session_id);
       if (!session || session.userId !== args.p_user_id) {
         return { ok: false, kind: "unknown_session" };
       }
+      const row = usageRow(session.userId, session.usageDay);
+
       if (session.state === "settled") {
-        const row = usageRow(session.userId, session.usageDay);
         return {
           ok: true,
           kind: "already_settled",
@@ -141,8 +200,20 @@ export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
         return { ok: true, kind: "already_released", charged_seconds: 0 };
       }
 
-      const charge = Math.max(0, Math.round(Number(args.p_actual_seconds ?? 0)));
-      const row = usageRow(session.userId, session.usageDay);
+      // Réservation jamais activée : rien ne s'est passé.
+      if (session.state === "pending") {
+        row.reserved = Math.max(0, row.reserved - session.reservedSeconds);
+        session.state = "refunded";
+        session.closedAt = nowMs;
+        session.chargedSeconds = 0;
+        return { ok: true, kind: "never_started", charged_seconds: 0, used_seconds: row.consumed };
+      }
+
+      // LA DURÉE VIENT DE L'HORODATAGE, pas de l'appelant.
+      const max = Math.max(60, Number(args.p_max_session_seconds ?? 3_600));
+      const measured = Math.max(0, Math.floor((nowMs - session.startedAt) / 1_000));
+      const charge = Math.min(measured, max);
+
       row.reserved = Math.max(0, row.reserved - session.reservedSeconds);
       row.consumed += charge;
       session.state = "settled";
@@ -152,6 +223,7 @@ export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
         ok: true,
         kind: "settled",
         charged_seconds: charge,
+        measured_seconds: measured,
         used_seconds: row.consumed,
       };
     },
@@ -162,7 +234,7 @@ export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
       if (!session || session.userId !== args.p_user_id) {
         return { ok: false, kind: "unknown_session" };
       }
-      if (session.state !== "open") {
+      if (session.state !== "pending" && session.state !== "active") {
         return { ok: true, kind: "already_released", charged_seconds: 0 };
       }
       const row = usageRow(session.userId, session.usageDay);
@@ -215,7 +287,9 @@ export function createVoiceStoreStub({ now = () => Date.now() } = {}) {
       return usageRow(userId, utcDay(nowMs)).reserved;
     },
     openSessions(userId) {
-      return [...sessions.values()].filter((s) => s.userId === userId && s.state === "open");
+      return [...sessions.values()].filter(
+        (s) => s.userId === userId && (s.state === "pending" || s.state === "active"),
+      );
     },
   };
 }

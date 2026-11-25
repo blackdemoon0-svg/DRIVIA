@@ -24,7 +24,7 @@ compte** et **enregistré sur le compte**.
 | `server/voiceUsage.ts` | Appels aux fonctions SQL `voice_*` : réservation, règlement, remboursement. Aucun état local |
 | ~~`server/voiceSessions.ts`~~ | **Supprimé** : le registre en mémoire est remplacé par la table `voice_sessions` |
 | `supabase/migrations/0004_voice_usage.sql` | Tables `voice_usage_daily` et `voice_sessions`, cinq fonctions, RLS. **Non exécutée** |
-| `scripts/sql/voice-usage.sql.test.mjs` | Exécute la migration dans un PostgreSQL 16 réel (PGlite) et prouve les garanties |
+| `scripts/sql/voice-usage.sql.test.mjs` | 20 contrôles : exécute la migration dans un PostgreSQL 16 réel (PGlite) et prouve les garanties, y compris la concurrence |
 | `api/_liveConfig.ts` | Construction de la configuration de session (modèle, voix, consignes, délégation). Préfixe `_` : ce n'est pas une route |
 | `api/voice-session.ts` | `POST` une offre SDP → authentification → validation de la voix → quota → session Live → réponse SDP |
 | `api/voice-end.ts` | Ferme une session et règle la durée réelle côté serveur |
@@ -33,7 +33,7 @@ compte** et **enregistré sur le compte**.
 | `src/lib/useVoiceLive.js` | Session WebRTC : micro, data channel `oai-events`, fin, changement de voix |
 | `src/components/VoicePicker.jsx` | Sélecteur de voix (aperçus uniquement s'ils sont réels) |
 | `src/components/VoiceLiveButton.jsx` | Bouton micro, état de session, quota restant |
-| `scripts/voice.test.mjs` | 102 contrôles : catalogue, validation, quota, sessions simultanées, fermetures anormales, contexte, erreurs, formules, périmètre, additivité |
+| `scripts/voice.test.mjs` | 106 contrôles : catalogue, validation, quota, durée non falsifiable, sessions simultanées, fermetures anormales, contexte, erreurs, formules, périmètre |
 | `scripts/voice-store.stub.mjs` | Double fidèle des fonctions SQL pour les tests de route (sans réseau) |
 
 **Modifiés — de façon strictement additive**
@@ -79,11 +79,13 @@ préférence enregistrée.
 ```jsonc
 { "sessionId": "…" }
 // 200
-{ "settledWith": "duration" | "already-closed" | "already-released" | "unknown-session",
-  "chargedSeconds": 42, "usedSeconds": 42 }
+{ "settledWith": "duration" | "never-started" | "already-closed" | "already-released" | "unknown-session",
+  "chargedSeconds": 42, "measuredSeconds": 42, "usedSeconds": 42,
+  "clientReportedSeconds": 0 }
 ```
 
-La durée vient de la base (`voice_sessions.started_at`), **jamais du client**.
+La durée vient de la base (`now() - started_at`), **jamais du client**.
+`clientReportedSeconds` n'est qu'un renseignement de support.
 Fermer deux fois ne facture pas deux fois. Une session inconnue ne facture rien
 et renvoie `clientReportedSeconds` pour le diagnostic seulement.
 
@@ -96,44 +98,74 @@ catalogue, sinon `brise`. `PUT { voice }` valide puis écrit
 **fusionne** les métadonnées — c'est ce qui préserve `avatar_url` et
 `avatar_path`.
 
-## Quota vocal — persistant et partagé
+## Quota vocal — persistant, partagé, facturé au temps réel
 
-Le compteur vocal **n'est plus en mémoire**. Il vivait dans un `Map` par
-instance : un redémarrage à froid le remettait à zéro, et deux instances Vercel
-ne partageaient rien — un compte Pro pouvait donc consommer 30 minutes **par
-instance**. Il vit désormais dans Postgres (`0004_voice_usage.sql`), partagé par
-toutes les instances.
+Le compteur vivait dans un `Map` par instance : perdu au redémarrage, et non
+partagé — 30 minutes **par instance** au lieu de 30 minutes par jour. Il vit
+désormais dans Postgres (`0004_voice_usage.sql`).
 
 Formules : Découverte **0**, Plus **10**, Pro **30** minutes par jour UTC.
 
-### Les cinq opérations
+### Deux phases, et c'est ce qui protège la facturation
 
-1. **Réserver** (`voice_reserve`) — 60 s, avant l'appel fournisseur. L'incrément
-   et la condition d'autorisation sont dans le **même `UPDATE ... WHERE`** : deux
-   réservations concurrentes ne peuvent pas passer toutes les deux, quelle que
-   soit l'instance.
-2. **Refuser une seconde session** — un index unique partiel impose **une seule
-   session ouverte par compte**. Deux onglets sont refusés en `409
-   voice_session_open`, pas facturés deux fois.
-3. **Régulariser** (`voice_settle`) — à la fermeture, la réservation est
-   remplacée par la durée réelle, lue depuis `voice_sessions.started_at`. Une
-   session de 90 s coûte 90 s. Idempotent : un beacon tardif ne refacture rien.
-4. **Rembourser** (`voice_refund`) — si le fournisseur échoue, la réservation est
-   rendue en entier. Idempotent par état.
-5. **Libérer un bail expiré** (`voice_expire_stale`) — une session ouverte depuis
-   plus d'une heure sans fermeture est expirée et sa réservation rendue. Un
-   onglet tué ne bloque pas le compte jusqu'à minuit.
+Une session n'est pas une seule ligne droite. Elle a deux états :
+
+| État | `started_at` | Facturable | Ce qui s'y passe |
+| --- | --- | --- | --- |
+| `pending` | `NULL` | **non** | la réservation est posée, l'offre SDP voyage |
+| `active` | posé par `voice_activate` | oui | la conversation a commencé |
+
+`started_at` est écrit **après** la réponse réussie du fournisseur. Les 20
+secondes de préparation de la connexion ne sont donc pas facturées.
+
+### La durée est calculée par PostgreSQL, pas reçue
+
+`voice_settle` **n'accepte aucun paramètre de durée**. Elle calcule
+`now() - started_at`, puis borne au plafond de session (3600 s).
+
+C'est une correction, pas un détail : la version précédente recevait
+`p_actual_seconds`, c'est-à-dire le `durationSeconds` du navigateur. Un client
+envoyant `0` ne payait rien. Le paramètre a été **supprimé** — on ne peut pas
+transmettre par accident ce qui n'existe pas. La valeur du client est renvoyée
+sous `clientReportedSeconds`, pour le diagnostic uniquement.
+
+### Les six opérations
+
+1. **Réserver** (`voice_reserve`) — 60 s, condition d'autorisation dans le
+   `UPDATE ... WHERE`. Atomique sous concurrence.
+2. **Refuser une deuxième session** — un index unique partiel interdit deux
+   lignes `pending` **ou** `active` par compte. Deux appareils sont refusés en
+   `409 voice_session_open`, sans aucune facturation.
+3. **Activer** (`voice_activate`) — pose `started_at`, allonge le bail.
+4. **Régulariser** (`voice_settle`) — durée mesurée, idempotent.
+5. **Rembourser** (`voice_refund`) — rend la réservation, idempotent.
+6. **Balayer** (`voice_expire_stale`, `voice_close_overdue`) — voir ci-dessous.
+
+### Le bail ne libère jamais une conversation active
+
+C'est la réponse au scénario « deux appareils » :
+
+- `voice_expire_stale` ne regarde **que** les réservations `pending`. Une
+  session `active` n'est jamais libérée par expiration, même si son bail est
+  ancien. Un bail de réservation dure 5 minutes ; le bail d'une session active
+  en dure 65.
+- Une session `active` ne peut se terminer que par un règlement, un
+  remboursement, ou **le plafond dur** : `voice_close_overdue` clôt et facture
+  toute session active depuis plus de 3600 s — la limite documentée d'une
+  session GPT-Live. Elle le fait **avant** d'autoriser une nouvelle session.
+
+Conséquence : une conversation de plus d'une heure ne peut jamais être suivie
+d'une seconde conversation simultanée. Elle est close et facturée, puis la
+place se libère — ou le quota bloque, si la facture l'épuise.
 
 ### Ce que le client ne peut pas faire
 
-**La durée n'est jamais celle annoncée par le navigateur.** Elle est lue dans la
-base. La valeur envoyée par le client n'est renvoyée que pour le diagnostic
-(`clientReportedSeconds`), et une session inconnue ne facture **rien** — la
-version précédente la facturait, plafonnée à 60 s, ce qui restait un chiffre
-fourni par le client.
+Il ne peut pas fournir la durée, ni la réduire, ni la gonfler au-delà du
+plafond. Il ne peut pas ouvrir deux sessions. Il ne peut pas écrire les
+compteurs (RLS : lecture seule de ses propres lignes).
 
 Si Supabase est injoignable, la route répond `503 voice_store_unavailable` :
-elle **échoue fermé**, elle ne retombe pas sur un compteur en mémoire.
+elle **échoue fermé**, sans jamais retomber sur un compteur en mémoire.
 
 ## Contexte vocal — conservé lors d'un changement de voix
 
@@ -211,6 +243,14 @@ environnement, pas dans le code :
   testée sur PostgreSQL 16, **jamais exécutée sur Supabase**. Tant qu'elle ne
   l'est pas, les routes renvoient `503 voice_store_unavailable` (le message
   nomme la migration).
+- **Le plafond dur est une supposition raisonnée.** 3600 s correspond à la
+  limite documentée d'une session GPT-Live, mais aucune session réelle n'a été
+  observée au-delà de quelques minutes : la valeur n'est pas confirmée par
+  l'expérience.
+- **`voice_touch` n'est pas appelé par l'interface.** Le bail d'une session
+  active est posé à l'activation et n'a pas besoin d'être prolongé (65 min de
+  bail pour 60 min de plafond). La fonction existe pour le diagnostic, pas pour
+  la facturation.
 
 ## Notes d'exploitation
 
