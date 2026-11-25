@@ -254,13 +254,20 @@ export async function startVoiceSession({ sdp, voice, history, accessToken, sign
   })
 }
 
-/** Ferme une session Live et règle sa durée côté serveur. */
-export async function endVoiceSession({ sessionId, accessToken, signal } = {}) {
+/**
+ * Ferme une session Live et règle sa durée côté serveur.
+ *
+ * `durationSeconds` n'est qu'une indication : le serveur facture la durée qu'il
+ * a lui-même mesurée. Elle ne sert qu'au cas où le registre serveur a perdu la
+ * session (autre instance), pour ne pas laisser la réservation à la charge de
+ * l'utilisateur.
+ */
+export async function endVoiceSession({ sessionId, durationSeconds, accessToken, signal } = {}) {
   if (!accessToken) return null
   return voiceRequest('/api/voice-end', {
     method: 'POST',
     accessToken,
-    body: { sessionId },
+    body: { sessionId, durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : undefined },
     signal,
   })
 }

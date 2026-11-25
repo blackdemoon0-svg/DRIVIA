@@ -23,6 +23,7 @@ export default function VoiceLiveButton({ session, accessToken, history = [], di
 
   const [pickerOpen, setPickerOpen] = useState(false)
   const [notice, setNotice] = useState(null)
+  const [substitutedVoice, setSubstitutedVoice] = useState(null)
 
   const {
     status,
@@ -35,7 +36,18 @@ export default function VoiceLiveButton({ session, accessToken, history = [], di
     toggleMic,
     restartWithVoice,
     supported,
-  } = useVoiceLive({ accessToken, voice: selected, history })
+  } = useVoiceLive({
+    accessToken,
+    voice: selected,
+    history,
+    // Le serveur valide la voix et peut la remplacer (identifiant retiré du
+    // catalogue). On répare alors la préférence du compte : sans cela, la même
+    // requête serait refusée puis corrigée à chaque session.
+    onVoiceSubstituted: (voiceId) => {
+      setSubstitutedVoice(voiceId)
+      choose(voiceId)
+    },
+  })
 
   // L'élément audio doit exister dans le DOM pour recevoir la piste distante, et
   // un navigateur sans WebRTC doit le dire au lieu d'afficher un bouton mort.
@@ -117,7 +129,17 @@ export default function VoiceLiveButton({ session, accessToken, history = [], di
           {error || unsupported}
         </p>
       )}
-      {quota?.limitMinutes ? (
+      {substitutedVoice && !error ? (
+        <p className="voice-live-quota" role="status">
+          Cette voix n'est plus disponible : VEYVRO utilise la voix par défaut.
+        </p>
+      ) : null}
+      {/*
+        Le quota n'est affiché que pendant une session. Le chiffre renvoyé au
+        démarrage est une photo de l'instant, périmée dès la fermeture : l'afficher
+        après coup annoncerait des minutes qui ont déjà été consommées.
+      */}
+      {quota?.limitMinutes && (live || connecting) ? (
         <p className="voice-live-quota">
           {Math.max(0, Math.floor((quota.remainingSeconds ?? 0) / 60))} min restantes aujourd'hui sur{' '}
           {quota.limitMinutes} min.

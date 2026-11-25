@@ -42,7 +42,7 @@ export function microphoneErrorMessage(error) {
   return 'Impossible de démarrer le microphone.'
 }
 
-export function useVoiceLive({ accessToken, voice, history }) {
+export function useVoiceLive({ accessToken, voice, history, onVoiceSubstituted }) {
   const [status, setStatus] = useState('idle') // idle | connecting | live | error
   const [micEnabled, setMicEnabled] = useState(false)
   const [error, setError] = useState(null)
@@ -55,13 +55,25 @@ export function useVoiceLive({ accessToken, voice, history }) {
   const sessionIdRef = useRef(null)
   const audioRef = useRef(null)
   const startingRef = useRef(false)
+  // Instant où la session a réellement été ouverte, pour pouvoir déclarer une
+  // durée si le serveur a perdu la trace (autre instance serverless).
+  const startedAtRef = useRef(null)
   // Une session est ouverte : l'état React peut retarder d'un rendu, ce drapeau
   // non. Il empêche deux sessions simultanées, donc deux facturations.
   const activeRef = useRef(false)
 
+  /** Secondes écoulées depuis l'ouverture de la session, ou null. */
+  const elapsedSeconds = () => {
+    const startedAt = startedAtRef.current
+    if (!startedAt) return null
+    return Math.max(0, Math.round((Date.now() - startedAt) / 1000))
+  }
+
   const cleanupPeer = useCallback(async () => {
     const sessionId = sessionIdRef.current
+    const durationSeconds = elapsedSeconds()
     sessionIdRef.current = null
+    startedAtRef.current = null
     activeRef.current = false
 
     try {
@@ -86,8 +98,10 @@ export function useVoiceLive({ accessToken, voice, history }) {
     }
 
     // Toujours régler côté serveur : c'est ce qui arrête la facturation.
+    // `durationSeconds` n'est qu'une indication : le serveur l'ignore s'il connaît
+    // la session, et la plafonne à la réservation sinon.
     if (sessionId && accessToken) {
-      await endVoiceSession({ sessionId, accessToken }).catch(() => null)
+      await endVoiceSession({ sessionId, durationSeconds, accessToken }).catch(() => null)
     }
   }, [accessToken])
 
@@ -209,8 +223,15 @@ export function useVoiceLive({ accessToken, voice, history }) {
 
         await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp })
         sessionIdRef.current = answer.sessionId
+        startedAtRef.current = Date.now()
         activeRef.current = true
         setQuota(answer.quota ?? null)
+
+        // Le serveur a refusé l'identifiant demandé et utilisé un autre : on le
+        // dit à l'appelant pour qu'il répare la préférence du compte.
+        if (answer.voice?.replacedInvalidRequest && typeof onVoiceSubstituted === 'function') {
+          onVoiceSubstituted(answer.voice.id)
+        }
         setMicEnabled(true)
         // `status` passe à « live » sur session.started ; en attendant, on reste
         // en « connecting » pour ne pas promettre une session qui n'a pas démarré.
@@ -225,7 +246,7 @@ export function useVoiceLive({ accessToken, voice, history }) {
         startingRef.current = false
       }
     },
-    [accessToken, cleanupPeer, history, voice]
+    [accessToken, cleanupPeer, history, onVoiceSubstituted, voice]
   )
 
   /**
@@ -262,7 +283,7 @@ export function useVoiceLive({ accessToken, voice, history }) {
         fetch('/api/voice-end', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
-          body: JSON.stringify({ sessionId }),
+          body: JSON.stringify({ sessionId, durationSeconds: elapsedSeconds() }),
           keepalive: true,
         }).catch(() => {})
       } catch {

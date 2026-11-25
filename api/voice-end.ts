@@ -1,5 +1,5 @@
 import { authorizeRequest, IdentityUnavailableError } from "../server/access.js";
-import { readVoiceUsage, settleVoiceQuota } from "../server/quotas.js";
+import { VOICE_RESERVATION_SECONDS, readVoiceUsage, settleVoiceQuota } from "../server/quotas.js";
 import { closeVoiceSession } from "../server/voiceSessions.js";
 
 /**
@@ -10,9 +10,12 @@ import { closeVoiceSession } from "../server/voiceSessions.js";
  *
  * The duration is computed from the server-side registry, not from the client:
  * a client-reported duration would let anyone claim a three-second conversation.
- * If the session is unknown — typically because a cold start replaced the
- * instance — the reservation itself is released, and the response says so with
- * `settledWith: "reservation"`. It never charges nothing silently.
+ * If the session is unknown — typically because another serverless instance
+ * opened it — the reservation is settled instead of being left in the counter:
+ * either against the browser's reported duration, clamped to the reservation
+ * (`settledWith: "client-duration"`), or released in full when the browser sends
+ * nothing usable (`settledWith: "reservation-released"`). The allowance is never
+ * silently leaked, and never silently overcharged.
  *
  * Idempotent: closing twice does not charge twice.
  */
@@ -75,13 +78,46 @@ export default async function handler(request: ApiRequest, response: ApiResponse
   const closed = closeVoiceSession(sessionId, access.userId);
 
   if (!closed) {
-    // Unknown session (other instance, or already forgotten). The safest honest
-    // answer: nothing is charged here, and the reservation will simply expire
-    // with the instance. Reported explicitly rather than hidden.
+    // Unknown session: it was opened on another serverless instance, or already
+    // forgotten. The registry cannot know the duration, so the browser's own
+    // duration is used — bounded — instead of charging nothing silently.
+    //
+    // Why this matters: a user whose session ended should not keep paying for
+    // it. Leaving the 60-second reservation in the counter would leak the
+    // allowance a little more with every instance switch, and a user on a 10
+    // minute plan would be blocked after ten sessions they never used.
+    //
+    // The client value is only a hint: it is clamped to the reservation made at
+    // session start, which the server owns. A lying client can therefore never
+    // charge less than zero, nor more than it reserved.
+    const reported = Number.isFinite(Number(body.durationSeconds))
+      ? Math.max(0, Math.round(Number(body.durationSeconds)))
+      : null;
+
+    if (reported === null) {
+      // No usable duration: give the reservation back in full. A session we
+      // cannot measure must not cost the user anything.
+      const refunded = settleVoiceQuota({
+        userId: access.userId,
+        reservedSeconds: VOICE_RESERVATION_SECONDS,
+        actualSeconds: 0,
+      });
+      return response.status(200).json({
+        settledWith: "reservation-released",
+        chargedSeconds: 0,
+        usedSeconds: refunded.usedSeconds,
+      });
+    }
+
+    const settled = settleVoiceQuota({
+      userId: access.userId,
+      reservedSeconds: VOICE_RESERVATION_SECONDS,
+      actualSeconds: Math.min(reported, VOICE_RESERVATION_SECONDS),
+    });
     return response.status(200).json({
-      settledWith: "unavailable",
-      chargedSeconds: 0,
-      usedSeconds: readVoiceUsage(access.userId),
+      settledWith: "client-duration",
+      chargedSeconds: settled.chargedSeconds,
+      usedSeconds: settled.usedSeconds,
     });
   }
 

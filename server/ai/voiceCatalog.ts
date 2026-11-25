@@ -8,10 +8,16 @@
  *   https://developers.openai.com/api/docs/guides/live-conversations  → "Voice options"
  *   https://developers.openai.com/api/docs/models/gpt-live-1.1
  *
- * The documented table lists 21 voices for GPT-Live, plus the documented
+ * The documented table lists 28 voices for GPT-Live, plus the documented
  * default (`marin`). No identifier here is invented: `scripts/voice.test.mjs`
  * asserts the exact set, so adding or removing a voice is a deliberate edit,
  * never a typo.
+ *
+ * Correction of 2026-11-22: the first version of this file shipped 21 voices and
+ * was missing the seven additions of the current table — including all five
+ * Spanish voices. Spanish is one of the four languages VEYVRO must speak, so a
+ * user asking for a Spanish voice was being shown French and German ones. The
+ * table now mirrors the documentation line for line.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  *  WHAT THE "LANGUAGE" FIELD MEANS — AND DOES NOT MEAN
@@ -58,13 +64,14 @@ export type LiveVoice = {
   previewAvailable: boolean;
   /**
    * Whether this voice is offered in the short list. Every documented voice
-   * stays selectable; `featured` only drives the suggested order of the picker.
+   * stays selectable; `featured` only drives the suggested order of the picker,
+   * and the short list covers each supported language (FR, EN, ES, PT).
    */
   featured: boolean;
 };
 
 /**
- * The 21 documented GPT-Live voices, in the order of the documentation table.
+ * The 28 documented GPT-Live voices, in the order of the documentation table.
  *
  * `previewAvailable` is false everywhere by default: previews are real audio
  * captured from a real GPT-Live session (see `scripts/voice-samples.mjs`), and
@@ -72,8 +79,10 @@ export type LiveVoice = {
  * the voice it claims to be would be worse than having none.
  */
 export const LIVE_VOICES: readonly LiveVoice[] = [
+  { id: "pearl", label: "Pearl", language: "Anglais", accent: "Australien", presentation: "feminine", source: "natural", previewAvailable: false, featured: false },
   { id: "quartz", label: "Quartz", language: "Anglais", accent: "Australien", presentation: "feminine", source: "generated", previewAvailable: false, featured: true },
   { id: "ripple", label: "Ripple", language: "Anglais", accent: "Australien", presentation: "masculine", source: "natural", previewAvailable: false, featured: false },
+  { id: "halo", label: "Halo", language: "Anglais", accent: "Britannique", presentation: "feminine", source: "natural", previewAvailable: false, featured: false },
   { id: "vesper", label: "Vesper", language: "Anglais", accent: "Britannique", presentation: "masculine", source: "natural", previewAvailable: false, featured: true },
   { id: "willow", label: "Willow", language: "Anglais", accent: "Irlandais", presentation: "feminine", source: "natural", previewAvailable: false, featured: false },
   { id: "stone", label: "Stone", language: "Anglais", accent: "Irlandais", presentation: "masculine", source: "natural", previewAvailable: false, featured: false },
@@ -84,6 +93,11 @@ export const LIVE_VOICES: readonly LiveVoice[] = [
   { id: "beacon", label: "Beacon", language: "Anglais", accent: "Philippin", presentation: "masculine", source: "generated", previewAvailable: false, featured: false },
   { id: "delta", label: "Delta", language: "Anglais", accent: "Sud des États-Unis", presentation: "feminine", source: "generated", previewAvailable: false, featured: false },
   { id: "cinder", label: "Cinder", language: "Anglais", accent: "Sud des États-Unis", presentation: "masculine", source: "generated", previewAvailable: false, featured: false },
+  { id: "calandria", label: "Calandria", language: "Espagnol", accent: "Argentin", presentation: "feminine", source: "natural", previewAvailable: false, featured: true },
+  { id: "compas", label: "Compás", language: "Espagnol", accent: "Argentin", presentation: "masculine", source: "natural", previewAvailable: false, featured: false },
+  { id: "hornero", label: "Hornero", language: "Espagnol", accent: "Argentin", presentation: "masculine", source: "natural", previewAvailable: false, featured: false },
+  { id: "luciernaga", label: "Luciérnaga", language: "Espagnol", accent: "Mexicain", presentation: "feminine", source: "natural", previewAvailable: false, featured: false },
+  { id: "destello", label: "Destello", language: "Espagnol", accent: "Mexicain", presentation: "masculine", source: "natural", previewAvailable: false, featured: false },
   { id: "nuri", label: "Nuri", language: "Allemand", accent: "—", presentation: "feminine", source: "natural", previewAvailable: false, featured: true },
   { id: "juni", label: "Juni", language: "Allemand", accent: "—", presentation: "feminine", source: "natural", previewAvailable: false, featured: false },
   { id: "flitz", label: "Flitz", language: "Allemand", accent: "—", presentation: "masculine", source: "natural", previewAvailable: false, featured: false },
@@ -96,13 +110,14 @@ export const LIVE_VOICES: readonly LiveVoice[] = [
 ];
 
 /**
- * Voices accepted by GPT-Live that the 21-voice table does not list.
+ * Voices accepted by GPT-Live that the documented table does not list.
  *
  * `marin` is the documented default voice of a Live session. It is accepted by
  * the API, so it is accepted here — refusing it would be stricter than OpenAI.
  * It is not in the table above, so it is kept apart: the catalogue test asserts
  * both sets separately.
  */
+/** Documented default voice of a Live session. */
 export const EXTRA_VOICES: readonly LiveVoice[] = [
   { id: "marin", label: "Marin (défaut OpenAI)", language: "—", accent: "—", presentation: "feminine", source: "natural", previewAvailable: false, featured: false },
 ];
@@ -114,7 +129,7 @@ const ALL_VOICES: readonly LiveVoice[] = [...LIVE_VOICES, ...EXTRA_VOICES];
 
 const BY_ID = new Map<VoiceId, LiveVoice>(ALL_VOICES.map((voice) => [voice.id, voice]));
 
-/** Every selectable voice: the 21 documented ones, then the extra accepted ids. */
+/** Every selectable voice: the 28 documented ones, then the extra accepted ids. */
 export function listVoices(): readonly LiveVoice[] {
   return ALL_VOICES;
 }

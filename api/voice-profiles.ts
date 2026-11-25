@@ -18,9 +18,11 @@ import { DEFAULT_VOICE_ID, listVoices, publicVoice, resolveVoice } from "../serv
  * that disappears from the documentation stops being offered.
  *
  * Where the preference is stored: `auth.users.raw_user_meta_data`, through the
- * Supabase auth API — exactly the mechanism the project already uses for
- * `avatar_url`. No new table, no migration, and the value survives sessions and
- * devices because it lives on the account.
+ * user's own authenticated session — exactly the mechanism the project already
+ * uses for `avatar_url` (`client.auth.updateUser`). No new table, no migration,
+ * no service-role key, and the value survives sessions and devices because it
+ * lives on the account. Writing it must not touch the keys the avatar uses, so
+ * the merge semantics of `/auth/v1/user` matter here (see `saveVoice`).
  *
  * The value is not a secret: it is the name of a voice.
  */
@@ -67,20 +69,36 @@ export function readStoredVoice(metadata: unknown): string | null {
   return voice ? voice.id : null;
 }
 
+/**
+ * Save the voice on the account, WITHOUT destroying the other preferences.
+ *
+ * The first version of this route used the admin endpoint
+ * (`PUT /auth/v1/admin/users/{id}` with `{ data: … }`), which replaces the whole
+ * `raw_user_meta_data` object. That would have silently wiped `avatar_url`,
+ * `avatar_path` and `avatar_updated_at` — the profile photo the project already
+ * stores in the same place — the first time a user picked a voice. A voice
+ * setting must never cost a user their photo.
+ *
+ * So the write goes through the user's own session (`PUT /auth/v1/user` with the
+ * caller's token), exactly like `client.auth.updateUser` used by the avatar
+ * feature: Supabase merges the supplied `data` keys instead of replacing them.
+ * No service-role key is needed, which is also one secret less in this route.
+ */
 async function saveVoice(
-  env: { url: string; serviceRoleKey: string },
-  userId: string,
+  env: { url: string; anonKey: string },
+  accessToken: string,
   voiceId: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
   try {
-    const response = await fetchImpl(`${env.url}/auth/v1/admin/users/${userId}`, {
+    const response = await fetchImpl(`${env.url}/auth/v1/user`, {
       method: "PUT",
       headers: {
-        apikey: env.serviceRoleKey,
-        Authorization: `Bearer ${env.serviceRoleKey}`,
+        apikey: env.anonKey,
+        Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
       },
+      // `data` is merged into the existing metadata by Supabase, not substituted.
       body: JSON.stringify({ data: { [VOICE_METADATA_KEY]: voiceId } }),
     });
     if (!response.ok) {
@@ -167,7 +185,7 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     });
   }
 
-  const saved = await saveVoice(env, identity.userId, requested.id);
+  const saved = await saveVoice(env, token, requested.id);
   if (!saved.ok) {
     return response.status(saved.status).json({ code: "save_failed", error: saved.error });
   }

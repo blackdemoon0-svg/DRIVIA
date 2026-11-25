@@ -10,7 +10,7 @@ compte** et **enregistré sur le compte**.
 | Modèle vocal | `gpt-live-1.1` (délégué à `gpt-6-luna`) |
 | Transport | WebRTC, échange SDP côté serveur |
 | Voix par défaut | `brise` |
-| Voix proposées | 21 voix documentées + `marin` (défaut OpenAI) |
+| Voix proposées | 28 voix documentées + `marin` (défaut OpenAI) |
 | Quota vocal | `voiceMinutesPerDay` : Découverte 0, Plus 10, Pro 30 |
 | Préférence | `raw_user_meta_data.veyvro_voice` (aucune table, aucune migration) |
 
@@ -30,7 +30,7 @@ compte** et **enregistré sur le compte**.
 | `src/lib/useVoiceLive.js` | Session WebRTC : micro, data channel `oai-events`, fin, changement de voix |
 | `src/components/VoicePicker.jsx` | Sélecteur de voix (aperçus uniquement s'ils sont réels) |
 | `src/components/VoiceLiveButton.jsx` | Bouton micro, état de session, quota restant |
-| `scripts/voice.test.mjs` | 67 contrôles : catalogue, validation, quota, sessions, erreurs, périmètre, additivité |
+| `scripts/voice.test.mjs` | 94 contrôles : catalogue, validation, quota, sessions simultanées, fermetures anormales, erreurs, formules, périmètre, additivité |
 
 **Modifiés — de façon strictement additive**
 
@@ -44,7 +44,7 @@ compte** et **enregistré sur le compte**.
 | `src/components/ChatView.jsx`, `HomeView.jsx` | Transmission de `voiceSlot` |
 | `src/components/Icons.jsx` | `MicIcon`, `MicOffIcon` |
 | `src/index.css` | Styles du bouton et du sélecteur |
-| `scripts/access.test.mjs` | Les trois `deepEqual` de `PLAN_LIMITS` incluent le nouveau champ (sinon le test échouerait sur un champ ajouté) |
+| `scripts/access.test.mjs` | Les trois `deepEqual` de `PLAN_LIMITS` incluent le nouveau champ ; la fixture « abonnement Pro » est ancrée sur l'horloge réelle (voir plus bas) |
 | `package.json` | `test:voice` ajouté à la suite `test` |
 
 ## Contrats d'API
@@ -102,6 +102,33 @@ existante (`messages`, `quotes`), remise à zéro avec elles à minuit UTC.
 3. La fermeture **règle** la durée réelle (`réservé − réel`, négatif autorisé :
    une session de 90 s consomme 90 s).
 
+## Corrections apportées après la revue du 2026-11-22
+
+Sept défauts réels ont été trouvés en confrontant le code à la documentation
+officielle, puis corrigés dans la même PR. Chacun a un test qui échoue si on le
+réintroduit.
+
+| # | Défaut | Conséquence | Correction |
+| --- | --- | --- | --- |
+| 1 | Catalogue de 21 voix | **Sept voix réelles manquaient, dont les cinq espagnoles.** L'espagnol fait partie des langues exigées : un utilisateur hispanophone ne voyait que des voix françaises et allemandes. | Les 28 voix de la documentation, à l'identique. |
+| 2 | Garde-fou de longueur des consignes mal calibré | Un prompt dépassant la limite réelle de 16 384 tokens aurait été accepté par le garde-fou puis refusé par OpenAI : **toutes les sessions vocales auraient échoué**, avec un message d'erreur opaque. | Garde-fou ramené à `16 384 × 3` caractères (~49 000), volontairement **sous** la limite réelle estimée (~65 000 caractères à 4 car/token) : il échoue avant OpenAI. Prompt actuel : 5 636 caractères, soit ~1 400 tokens. |
+| 3 | La délégation recevait le prompt de *conversation* | Le backend aurait répondu en phrases courtes au lieu de raisonner. Ce sont deux canaux distincts dans la documentation. | `delegation.responses.instructions` = prompt VEYVRO + bloc « backend » ; `instructions` = prompt VEYVRO + bloc « conversation ». |
+| 4 | Aucune salutation | L'utilisateur ouvrait le micro et **entendait le silence** : une session Live écoute d'abord. | Message `developer` de salutation dans `session.input`, selon la recette documentée « Greet before the caller speaks ». |
+| 5 | Session inconnue à la fermeture : rien n'était réglé | Sur plusieurs instances serverless, **la réservation de 60 s restait consommée** à chaque session : fuite de quota, utilisateur bloqué sans avoir parlé. | Réservation rendue si aucune durée n'est fournie ; sinon durée du navigateur utilisée, **plafonnée à la réservation**. Le registre serveur reste prioritaire. |
+| 6 | Préférence écrite via l'endpoint **admin** Supabase | `PUT /auth/v1/admin/users/{id}` remplace tout `raw_user_meta_data` : **la photo de profil aurait été effacée** au premier changement de voix. | Écriture via `PUT /auth/v1/user` avec le jeton de l'utilisateur — la même mécanique que `client.auth.updateUser` de l'avatar. Aucune clé de service nécessaire. |
+| 7 | Interface | Les minutes restantes d'une session **terminée** étaient affichées (chiffre périmé) ; une voix remplacée par le serveur n'était pas signalée ; le composeur transmettait l'événement de clic comme identifiant de voix au redémarrage. | Quota affiché seulement pendant la session ; substitution signalée et préférence réparée ; identifiant de voix validé avant redémarrage. |
+
+### Un test qui masquait un vrai problème
+
+`scripts/access.test.mjs` échouait sur `main` (`'decouverte' == 'pro'`). Ce n'était
+pas un bug de `server/access.ts` — vérifié en l'exécutant isolément. La fixture
+« abonnement Pro en cours » construisait son échéance à partir d'une constante
+`NOW` fixée au **1er novembre 2026 à midi** ; une fois cette date passée, un
+abonnement « valable 20 jours » était expiré, et le test comparait un refus
+légitime. La fixture utilise maintenant l'horloge réelle pour les cas qui
+passent par `authorizeRequest`. Le test passe, et `/api/voice-session` conserve
+donc sa couverture des trois formules.
+
 ## Ce qui n'a pas pu être vérifié ici
 
 Ces points ne sont **pas** des tests passés. Ils sont bloqués dans cet
@@ -113,7 +140,7 @@ environnement, pas dans le code :
   vrai service.
 - **Aucune poignée de main WebRTC réelle**, donc aucun son, aucune mesure de
   latence.
-- **Aucun aperçu audio livré.** Les 21 voix sont marquées
+- **Aucun aperçu audio livré.** Les 28 voix sont marquées
   `previewAvailable: false` : un aperçu doit être enregistré depuis une vraie
   session GPT-Live, et l'API TTS d'OpenAI ne partage qu'une seule voix avec
   Live (`marin`). Jouer un échantillon qui n'est pas la voix annoncée serait
