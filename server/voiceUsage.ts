@@ -101,11 +101,32 @@ async function callVoiceFunction(
   return asRecord(payload);
 }
 
+/**
+ * Refuse a missing ceiling instead of substituting one.
+ *
+ * Every previous bug on this path came from a silent default: 3600 here, 3900
+ * there, 60 as a "reservation". A throw at the call site is louder than a
+ * number chosen in a hurry, and it names the caller.
+ */
+function requireCeiling(caller: string, value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    throw new TypeError(`${caller}: maxSessionSeconds is required (no default).`);
+  }
+  return Math.trunc(value);
+}
+
 export type ReserveResult =
   | {
       ok: true;
       sessionId: string;
+      /**
+       * What the database reserved, and therefore the MOST this session can ever
+       * be billed. Equal to `maxSessionSeconds`: the reservation is the ceiling.
+       * Not a fixed amount — on an account with 90 s left it is 90, not 3600.
+       */
       reservedSeconds: number;
+      /** Duration the browser may announce, identical to `reservedSeconds`. */
+      maxSessionSeconds: number;
       usedSeconds: number;
       remainingSeconds: number;
     }
@@ -119,35 +140,50 @@ export type ReserveResult =
     };
 
 /**
- * Reserve the session's seconds.
+ * Reserve the session.
  *
  * `allowanceSeconds` comes from the plan read in the database by
  * `authorizeRequest` — never from the browser.
+ *
+ * There is no `reserveSeconds`: the amount is decided by `voice_reserve`, which
+ * reserves the WHOLE remaining allowance, bounded by `maxSessionSeconds` and by
+ * the time left before UTC midnight. Passing an amount from here would put a
+ * second decision-maker next to the database, and the previous version's flat
+ * 60 s is exactly how a Pro account with a minute left came to overrun a
+ * 30-minute quota.
  */
 export async function reserveVoiceSeconds(
   env: VoiceStoreEnv,
   options: {
     userId: string;
     allowanceSeconds: number;
-    reserveSeconds: number;
     voiceId: string;
+    /**
+     * Hard session ceiling, from `LIVE_MAX_SESSION_SECONDS`. REQUIRED: a default
+     * here would be a second source of truth next to the SQL, and the two
+     * billing paths could drift apart again.
+     */
+    maxSessionSeconds: number;
     /** How long the RESERVATION may sit unused before it is released. */
     ttlSeconds?: number;
-    /** Hard session ceiling copied from the Live model's documented limit. */
-    maxSessionSeconds?: number;
+    /** Floor below which a session is not worth opening. */
+    minReservationSeconds?: number;
     fetchImpl?: typeof fetch;
   },
 ): Promise<ReserveResult> {
+  if (!Number.isFinite(options.maxSessionSeconds) || options.maxSessionSeconds <= 0) {
+    throw new TypeError("reserveVoiceSeconds: maxSessionSeconds is required.");
+  }
   const payload = await callVoiceFunction(
     env,
     "voice_reserve",
     {
       p_user_id: options.userId,
       p_allowance_seconds: Math.max(0, Math.trunc(options.allowanceSeconds)),
-      p_reserve_seconds: Math.max(1, Math.trunc(options.reserveSeconds)),
+      p_max_session_seconds: Math.trunc(options.maxSessionSeconds),
       p_voice_id: options.voiceId,
       p_ttl_seconds: Math.max(30, Math.trunc(options.ttlSeconds ?? 300)),
-      p_max_session_seconds: Math.max(60, Math.trunc(options.maxSessionSeconds ?? 3_600)),
+      p_min_reservation_seconds: Math.max(1, Math.trunc(options.minReservationSeconds ?? 60)),
     },
     options.fetchImpl ?? fetch,
   );
@@ -163,10 +199,15 @@ export async function reserveVoiceSeconds(
       // settled. Treat it as an outage rather than guessing.
       throw new VoiceStoreUnavailableError("voice_reserve returned no session id.");
     }
+    // `max_session_seconds` is what the DATABASE granted, not what we asked for.
+    // It is the number the browser must announce and the number settlement will
+    // bound to. Falling back to the request would hide a database refusal.
+    const granted = Number(payload.max_session_seconds ?? payload.reserved_seconds ?? 0);
     return {
       ok: true,
       sessionId,
-      reservedSeconds: Number(payload.reserved_seconds ?? options.reserveSeconds),
+      reservedSeconds: Number(granted),
+      maxSessionSeconds: Number(granted),
       usedSeconds: Number(payload.used_seconds ?? 0),
       remainingSeconds: Number(payload.remaining_seconds ?? 0),
     };
@@ -178,10 +219,10 @@ export async function reserveVoiceSeconds(
 
   return {
     ok: false,
+    // `voice_curfew` (too little time left before UTC midnight) is reported as
+    // exhaustion: from the user's side both mean "not now, come back".
     kind:
-      kind === "voice_not_in_plan" ||
-      kind === "voice_minutes_exhausted" ||
-      kind === "voice_session_open"
+      kind === "voice_not_in_plan" || kind === "voice_session_open"
         ? kind
         : "voice_minutes_exhausted",
     retryAfterSeconds: Math.max(0, Math.trunc(retryAfter)),
@@ -202,8 +243,11 @@ export async function settleVoiceSeconds(
   options: {
     userId: string;
     sessionId: string;
-    /** Bound applied by the database; never a duration. */
-    maxSessionSeconds?: number;
+    /**
+     * Safety ceiling applied by the database; never a duration. REQUIRED, and
+     * the same constant as the reservation path: `LIVE_MAX_SESSION_SECONDS`.
+     */
+    maxSessionSeconds: number;
     fetchImpl?: typeof fetch;
   },
 ): Promise<{ kind: string; chargedSeconds: number; measuredSeconds: number | null; usedSeconds: number | null }> {
@@ -217,7 +261,7 @@ export async function settleVoiceSeconds(
     {
       p_user_id: options.userId,
       p_session_id: options.sessionId,
-      p_max_session_seconds: Math.max(60, Math.trunc(options.maxSessionSeconds ?? 3_600)),
+      p_max_session_seconds: requireCeiling("settleVoiceSeconds", options.maxSessionSeconds),
     },
     options.fetchImpl ?? fetch,
   );
@@ -264,8 +308,8 @@ export async function activateVoiceSession(
   options: {
     userId: string;
     sessionId: string;
-    /** How long the active session's lease should last. */
-    leaseSeconds?: number;
+    /** Safety ceiling; the database derives the lease from the reservation. */
+    maxSessionSeconds: number;
     providerSessionId?: string | null;
     fetchImpl?: typeof fetch;
   },
@@ -276,7 +320,7 @@ export async function activateVoiceSession(
     {
       p_user_id: options.userId,
       p_session_id: options.sessionId,
-      p_lease_seconds: Math.max(120, Math.trunc(options.leaseSeconds ?? 3_900)),
+      p_max_session_seconds: requireCeiling("activateVoiceSession", options.maxSessionSeconds),
       p_provider_session_id: options.providerSessionId ?? null,
     },
     options.fetchImpl ?? fetch,
@@ -294,7 +338,7 @@ export async function activateVoiceSession(
  */
 export async function touchVoiceSession(
   env: VoiceStoreEnv,
-  options: { userId: string; sessionId: string; leaseSeconds?: number; fetchImpl?: typeof fetch },
+  options: { userId: string; sessionId: string; leaseSeconds: number; fetchImpl?: typeof fetch },
 ): Promise<{ kind: string }> {
   const payload = await callVoiceFunction(
     env,
@@ -302,7 +346,7 @@ export async function touchVoiceSession(
     {
       p_user_id: options.userId,
       p_session_id: options.sessionId,
-      p_lease_seconds: Math.max(120, Math.trunc(options.leaseSeconds ?? 3_900)),
+      p_lease_seconds: Math.max(120, Math.trunc(options.leaseSeconds)),
     },
     options.fetchImpl ?? fetch,
   );

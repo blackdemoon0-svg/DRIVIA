@@ -1,5 +1,6 @@
 import { authorizeRequest, IdentityUnavailableError, readAccessEnv } from "../server/access.js";
 import { settleVoiceSeconds, VoiceStoreUnavailableError } from "../server/voiceUsage.js";
+import { LIVE_MAX_SESSION_SECONDS } from "../server/ai/voiceCatalog.js";
 
 /**
  * Close a voice session and settle its duration.
@@ -128,6 +129,9 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     const settled = await settleVoiceSeconds(storeEnv, {
       userId: access.userId,
       sessionId,
+      // Same constant as the reservation path. No default: the whole point of
+      // the fix is that a session cannot be billed under two different ceilings.
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
     });
 
     if (settled.kind === "unknown_session") {

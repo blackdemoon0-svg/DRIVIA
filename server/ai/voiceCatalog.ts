@@ -207,5 +207,37 @@ export const LIVE_DELEGATION_EFFORT: ReasoningEffort = "low";
  */
 export const LIVE_TRANSCRIPTION_MODEL = "whisper-1";
 
-/** Hard platform limit documented for a Live session. */
+/**
+ * Hard platform limit documented for a Live session: 60 minutes.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  THE ONLY PLACE THIS NUMBER IS DEFINED
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Before, two different ceilings existed: 3600 in `voice_settle` and 3900 as a
+ * "lease" passed by the route, which `voice_reserve` then reused as the hard
+ * ceiling. The same session could therefore be billed two different amounts
+ * depending on which path closed it. Both paths now derive from THIS constant.
+ *
+ * Source: the Live session limit documented for GPT-Live ("a session can run
+ * for up to 60 minutes"). It is a provider ceiling, not a product choice: past
+ * it, the provider would end the session anyway.
+ *
+ * The migration receives it as a parameter and carries no default of its own —
+ * a default in SQL would be a second source of truth.
+ */
 export const LIVE_MAX_SESSION_MINUTES = 60;
+
+/** The same limit in seconds: what the database receives as its hard ceiling. */
+export const LIVE_MAX_SESSION_SECONDS = LIVE_MAX_SESSION_MINUTES * 60;
+
+/**
+ * Lease margin applied around a session, in seconds.
+ *
+ * A pure margin, NOT a ceiling: `voice_activate` grants a lease of
+ * `reservation + this` so an active conversation is never released by lease
+ * expiry before it has been billed. It is exported so the SQL and this file
+ * cannot disagree about the number, but it must never be passed as
+ * `p_max_session_seconds` — that confusion is exactly how the 3900/3600 split
+ * appeared.
+ */
+export const SESSION_LEASE_MARGIN_SECONDS = 300;

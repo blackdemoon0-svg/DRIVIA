@@ -7,9 +7,13 @@ import {
   VoiceStoreUnavailableError,
   type VoiceStoreEnv,
 } from "../server/voiceUsage.js";
-import { VOICE_RESERVATION_SECONDS, VOICE_RESERVATION_TTL_SECONDS } from "../server/quotas.js";
+import { VOICE_MIN_RESERVATION_SECONDS, VOICE_RESERVATION_TTL_SECONDS } from "../server/quotas.js";
 import { buildLiveSessionConfig, buildSessionInput } from "./_liveConfig.js";
-import { selectVoice, type LiveVoice } from "../server/ai/voiceCatalog.js";
+import {
+  LIVE_MAX_SESSION_SECONDS,
+  selectVoice,
+  type LiveVoice,
+} from "../server/ai/voiceCatalog.js";
 
 /**
  * Start a GPT-Live WebRTC session.
@@ -65,16 +69,6 @@ export const config = {
 const MAX_SDP_CHARACTERS = 400_000;
 const MAX_HISTORY_MESSAGES = 12;
 const PROVIDER_TIMEOUT_MS = 20_000;
-
-/**
- * Lease of an ACTIVE session, in seconds.
- *
- * Longer than the documented 60-minute ceiling of a Live session plus the
- * handshake: an active conversation must never have its lease expire, because
- * the lease only protects reservations. The hard ceiling closes overdue
- * sessions; the lease never does.
- */
-const LIVE_SESSION_LEASE_SECONDS = 3_900;
 
 function readEnvVar(...names: string[]): string | undefined {
   for (const name of names) {
@@ -368,10 +362,14 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     reservation = await reserveVoiceSeconds(storeEnv, {
       userId: access.userId,
       allowanceSeconds: access.limits.voiceMinutesPerDay * 60,
-      reserveSeconds: VOICE_RESERVATION_SECONDS,
       voiceId: voice.id,
       ttlSeconds: VOICE_RESERVATION_TTL_SECONDS,
-      maxSessionSeconds: LIVE_SESSION_LEASE_SECONDS,
+      // THE ceiling, and the only one. It used to be sent as 3900 here while
+      // `voice_settle` defaulted to 3600, so the same session could be billed two
+      // different amounts depending on which path closed it. One constant now,
+      // imported from `voiceCatalog.ts`, no default anywhere.
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
+      minReservationSeconds: VOICE_MIN_RESERVATION_SECONDS,
     });
   } catch (error) {
     if (error instanceof VoiceStoreUnavailableError) {
@@ -444,7 +442,7 @@ export default async function handler(request: ApiRequest, response: ApiResponse
     const activation = await activateVoiceSession(storeEnv, {
       userId: access.userId,
       sessionId: reservation.sessionId,
-      leaseSeconds: LIVE_SESSION_LEASE_SECONDS,
+      maxSessionSeconds: LIVE_MAX_SESSION_SECONDS,
       providerSessionId: created.providerSessionId,
     });
     activated = activation.kind === "activated" || activation.kind === "already_active";
@@ -479,6 +477,10 @@ export default async function handler(request: ApiRequest, response: ApiResponse
       limitMinutes: Math.floor(access.limits.voiceMinutesPerDay),
       remainingSeconds: reservation.remainingSeconds,
       usedSeconds: reservation.usedSeconds,
+      // What PostgreSQL actually granted, which may be far less than the
+      // session ceiling when little credit is left. The browser ends the
+      // conversation at this point instead of discovering the limit mid-sentence.
+      maxSessionSeconds: reservation.maxSessionSeconds,
     },
   });
 }

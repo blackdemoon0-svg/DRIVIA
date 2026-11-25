@@ -247,8 +247,19 @@ export function resetQuotas(): void {
 // What remains here is the one constant the route still needs, so the
 // reservation length has a single definition.
 
-/** How long one session may reserve before the database releases the lease. */
-export const VOICE_RESERVATION_SECONDS = 60;
+/**
+ * Smallest reservation allowed, in seconds.
+ *
+ * It is NOT the amount reserved. The reservation is the whole remaining
+ * allowance capped by the hard session ceiling — see `voice_reserve` in
+ * `0004_voice_usage.sql`. Reserving a flat 60 s while a session may run for an
+ * hour let a Pro account with 60 s left open a 20-minute conversation and
+ * overrun its quota.
+ *
+ * This value now has exactly two uses: it is the floor below which a session is
+ * not worth starting, and the length of the first slice of the period split.
+ */
+export const VOICE_MIN_RESERVATION_SECONDS = 60;
 
 /**
  * How long a RESERVATION may sit unused before it is released.

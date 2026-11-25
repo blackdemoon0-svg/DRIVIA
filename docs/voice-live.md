@@ -41,7 +41,7 @@ compte** et **enregistré sur le compte**.
 | Fichier | Modification |
 | --- | --- |
 | `src/lib/planLimits.ts` | Champ `voiceMinutesPerDay` + valeurs 0 / 10 / 30 |
-| `server/quotas.ts` | Champ `voiceSeconds` dans l'entrée existante, remis à zéro à minuit UTC ; `reserveVoiceQuota`, `settleVoiceQuota`, `readVoiceUsage` |
+| `server/quotas.ts` | Plus aucun compteur vocal en mémoire : `VOICE_MIN_RESERVATION_SECONDS` et `VOICE_RESERVATION_TTL_SECONDS` seulement, le reste vit en base |
 | `src/lib/chatApi.js` | Ajout de `VoiceApiError`, `fetchVoiceProfiles`, `saveVoicePreference`, `startVoiceSession`, `endVoiceSession`, `voiceErrorMessage`. `streamChat`, `parseSseBlock`, `trimHistory` inchangés |
 | `src/App.jsx` | Montage du bouton vocal pour un compte authentifié, avec l'historique de la conversation |
 | `src/components/ChatComposer.jsx` | Nouvelle prop optionnelle `voiceSlot` (par défaut `null` : rendu identique sans elle) |
@@ -121,7 +121,8 @@ secondes de préparation de la connexion ne sont donc pas facturées.
 ### La durée est calculée par PostgreSQL, pas reçue
 
 `voice_settle` **n'accepte aucun paramètre de durée**. Elle calcule
-`now() - started_at`, puis borne au plafond de session (3600 s).
+`now() - started_at`, puis borne à **la réservation** — qui est elle-même le
+plafond de la session (voir la section suivante).
 
 C'est une correction, pas un détail : la version précédente recevait
 `p_actual_seconds`, c'est-à-dire le `durationSeconds` du navigateur. Un client
@@ -129,10 +130,53 @@ envoyant `0` ne payait rien. Le paramètre a été **supprimé** — on ne peut 
 transmettre par accident ce qui n'existe pas. La valeur du client est renvoyée
 sous `clientReportedSeconds`, pour le diagnostic uniquement.
 
+### La réservation est le plafond, et c'est ce qui protège le quota
+
+La version précédente réservait **60 s** alors qu'une session pouvait être
+facturée jusqu'à **3600 s**. Un compte Pro avec une minute restante ouvrait donc
+20 minutes et dépassait son quota de 19 minutes. Réserver un forfait ne
+protège rien : seule une réservation qui couvre **tout ce que la session peut
+consommer** protège.
+
+`voice_reserve` réserve désormais **tout le crédit restant**, borné par trois
+limites — la plus petite gagne :
+
+```
+réservation = min(plafond de session, crédit restant, temps avant minuit UTC)
+```
+
+Le plafond de session est `LIVE_MAX_SESSION_SECONDS`, dérivé de
+`LIVE_MAX_SESSION_MINUTES = 60` (`server/ai/voiceCatalog.ts`) — la limite
+documentée d'une session GPT-Live. Il est **transmis en paramètre** ; le SQL n'a
+**aucun défaut**, parce qu'un défaut serait une seconde source de vérité.
+
+Et puisque la réservation est le plafond, le dépassement de quota devient
+structurellement impossible :
+
+- `voice_settle` borne la facture à la réservation ;
+- `voice_close_overdue` clôt à `started_at + réservation` ;
+- une session n'est jamais facturée au-delà de ce qui a été réservé.
+
+Ce qui est réservé mais non consommé est **rendu au règlement**. Sur une
+réservation de 600 s fermée après 45 s, 555 s redeviennent disponibles
+immédiatement.
+
+### Minuit UTC : une session ne traverse pas le jour
+
+La réservation est bornée par le temps restant avant minuit UTC, donc une
+session appartient toujours à un seul jour et le crédit d'un jour n'est jamais
+entamé par la veille. Une conversation commencée à 23:58 s'arrête à minuit et
+doit être relancée ; moins d'une minute avant minuit, la réservation est refusée
+en `voice_curfew` plutôt que d'ouvrir une session de quelques secondes.
+
+C'est un choix assumé, pas un oubli : un comptage non ambigu vaut mieux qu'une
+conversation facturée à cheval sur deux jours.
+
 ### Les six opérations
 
-1. **Réserver** (`voice_reserve`) — 60 s, condition d'autorisation dans le
-   `UPDATE ... WHERE`. Atomique sous concurrence.
+1. **Réserver** (`voice_reserve`) — tout le crédit restant, borné par les trois
+   limites ci-dessus. Condition d'autorisation dans le `UPDATE ... WHERE` :
+   atomique sous concurrence.
 2. **Refuser une deuxième session** — un index unique partiel interdit deux
    lignes `pending` **ou** `active` par compte. Deux appareils sont refusés en
    `409 voice_session_open`, sans aucune facturation.
@@ -150,13 +194,13 @@ C'est la réponse au scénario « deux appareils » :
   ancien. Un bail de réservation dure 5 minutes ; le bail d'une session active
   en dure 65.
 - Une session `active` ne peut se terminer que par un règlement, un
-  remboursement, ou **le plafond dur** : `voice_close_overdue` clôt et facture
-  toute session active depuis plus de 3600 s — la limite documentée d'une
-  session GPT-Live. Elle le fait **avant** d'autoriser une nouvelle session.
+  remboursement, ou **sa réservation épuisée** : `voice_close_overdue` clôt et
+  facture à `started_at + réservation`. Elle le fait **avant** d'autoriser une
+  nouvelle session, sur le même calcul que le règlement manuel — même
+  `started_at`, même borne, donc même montant.
 
-Conséquence : une conversation de plus d'une heure ne peut jamais être suivie
-d'une seconde conversation simultanée. Elle est close et facturée, puis la
-place se libère — ou le quota bloque, si la facture l'épuise.
+Conséquence : une conversation qui épuise sa réservation est close et facturée,
+puis la place se libère — ou le quota bloque, si la facture l'épuise.
 
 ### Ce que le client ne peut pas faire
 
@@ -166,6 +210,29 @@ compteurs (RLS : lecture seule de ses propres lignes).
 
 Si Supabase est injoignable, la route répond `503 voice_store_unavailable` :
 elle **échoue fermé**, sans jamais retomber sur un compteur en mémoire.
+
+### Migration rejouable, sans perte
+
+Une migration qui commence par `DROP TABLE IF EXISTS` n'est pas idempotente :
+elle **détruit** l'historique au second passage. `0004_voice_usage.sql` a été
+réécrite pour ne plus rien supprimer :
+
+- `create table if not exists` pour les deux tables ;
+- colonnes manquantes ajoutées par `alter table ... add column if not exists`,
+  données existantes reprises par `coalesce` (une valeur présente n'est jamais
+  écrasée) ;
+- contraintes et index créés seulement s'ils manquent, en `not valid`, pour ne
+  jamais exiger la suppression d'une ligne ;
+- fonctions remplacées : c'est du code, pas des données ;
+- une structure **incompatible** n'est jamais écrasée : la migration s'arrête
+  par un `raise exception` explicite, sans avoir modifié une seule ligne.
+
+Le rejeu est vérifié par un test, pas par une intention : le fichier de tests SQL
+insère des sessions dans plusieurs états, rejoue la migration **deux fois**, et
+compare ligne par ligne. Le compte, les états, les secondes facturées et les
+jours d'usage sont identiques. Le test vérifie aussi que le SQL exécutable ne
+contient aucune instruction destructive (`DROP TABLE`, `DROP COLUMN`,
+`TRUNCATE`, `DELETE`).
 
 ## Contexte vocal — conservé lors d'un changement de voix
 
@@ -200,7 +267,7 @@ réintroduit.
 | 2 | Garde-fou de longueur des consignes mal calibré | Un prompt dépassant la limite réelle de 16 384 tokens aurait été accepté par le garde-fou puis refusé par OpenAI : **toutes les sessions vocales auraient échoué**, avec un message d'erreur opaque. | Garde-fou ramené à `16 384 × 3` caractères (~49 000), volontairement **sous** la limite réelle estimée (~65 000 caractères à 4 car/token) : il échoue avant OpenAI. Prompt actuel : 5 636 caractères, soit ~1 400 tokens. |
 | 3 | La délégation recevait le prompt de *conversation* | Le backend aurait répondu en phrases courtes au lieu de raisonner. Ce sont deux canaux distincts dans la documentation. | `delegation.responses.instructions` = prompt VEYVRO + bloc « backend » ; `instructions` = prompt VEYVRO + bloc « conversation ». |
 | 4 | Aucune salutation | L'utilisateur ouvrait le micro et **entendait le silence** : une session Live écoute d'abord. | Message `developer` de salutation dans `session.input`, selon la recette documentée « Greet before the caller speaks ». |
-| 5 | Session inconnue à la fermeture : rien n'était réglé | Sur plusieurs instances serverless, **la réservation de 60 s restait consommée** à chaque session : fuite de quota, utilisateur bloqué sans avoir parlé. | Réservation rendue si aucune durée n'est fournie ; sinon durée du navigateur utilisée, **plafonnée à la réservation**. Le registre serveur reste prioritaire. |
+| 5 | Session inconnue à la fermeture : rien n'était réglé | Sur plusieurs instances serverless, **la réservation restait consommée** à chaque session : fuite de quota, utilisateur bloqué sans avoir parlé. | Réservation rendue si la session n'a jamais été activée ; sinon durée mesurée par PostgreSQL, **plafonnée à la réservation**. |
 | 6 | Préférence écrite via l'endpoint **admin** Supabase | `PUT /auth/v1/admin/users/{id}` remplace tout `raw_user_meta_data` : **la photo de profil aurait été effacée** au premier changement de voix. | Écriture via `PUT /auth/v1/user` avec le jeton de l'utilisateur — la même mécanique que `client.auth.updateUser` de l'avatar. Aucune clé de service nécessaire. |
 | 7 | Interface | Les minutes restantes d'une session **terminée** étaient affichées (chiffre périmé) ; une voix remplacée par le serveur n'était pas signalée ; le composeur transmettait l'événement de clic comme identifiant de voix au redémarrage. | Quota affiché seulement pendant la session ; substitution signalée et préférence réparée ; identifiant de voix validé avant redémarrage. |
 
@@ -243,10 +310,13 @@ environnement, pas dans le code :
   testée sur PostgreSQL 16, **jamais exécutée sur Supabase**. Tant qu'elle ne
   l'est pas, les routes renvoient `503 voice_store_unavailable` (le message
   nomme la migration).
-- **Le plafond dur est une supposition raisonnée.** 3600 s correspond à la
-  limite documentée d'une session GPT-Live, mais aucune session réelle n'a été
-  observée au-delà de quelques minutes : la valeur n'est pas confirmée par
-  l'expérience.
+- **Le plafond dur est une supposition raisonnée.** `LIVE_MAX_SESSION_SECONDS`
+  (3600 s) correspond à la limite documentée d'une session GPT-Live, mais aucune
+  session réelle n'a été observée au-delà de quelques minutes : la valeur n'est
+  pas confirmée par l'expérience. Elle est en revanche définie à **un seul
+  endroit** et transmise en paramètre, sans défaut SQL — deux chiffres distincts
+  sur ce chemin (3600 au règlement, 3900 à la route) permettaient de facturer
+  deux montants pour une même session.
 - **`voice_touch` n'est pas appelé par l'interface.** Le bail d'une session
   active est posé à l'activation et n'a pas besoin d'être prolongé (65 min de
   bail pour 60 min de plafond). La fonction existe pour le diagnostic, pas pour
