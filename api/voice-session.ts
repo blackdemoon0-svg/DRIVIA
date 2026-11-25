@@ -137,11 +137,50 @@ export function safetyIdentifier(userId: string): string {
   return crypto.createHash("sha256").update(`veyvro:${userId}`, "utf8").digest("hex").slice(0, 64);
 }
 
+/**
+ * The 201 body of `POST /v1/live/sessions`, as OpenAI documents it.
+ *
+ * It is NESTED — `{ session: { id }, transport: { type, sdp } }` — not flat.
+ * Reading `payload.sdp` / `payload.id` yields `undefined` on every real
+ * response, which the guard below turns into a systematic 502 and a provider
+ * session identifier that is never stored.
+ *
+ * Source: Live API reference, `## Create session` example, and
+ * `SessionForkResponse` (`session: object { id }` + `transport: object { sdp,
+ * type }`). The WebRTC guide repeats it: "Read `result.session.id` and pass
+ * `result.transport.sdp` to `setRemoteDescription`".
+ */
 type LiveSessionPayload = {
-  id?: unknown;
-  sdp?: unknown;
-  session?: unknown;
+  session?: { id?: unknown } | null;
+  transport?: { sdp?: unknown; type?: unknown } | null;
 };
+
+/**
+ * A validated provider answer: both fields read from their documented place.
+ *
+ * Validating strictly is deliberate. A 201 whose body does not carry both
+ * values is not a usable session: without the SDP the browser cannot connect,
+ * and without the session id the provider session can never be closed or
+ * reconciled. Both cases must fail here, before `voice_activate`, so no
+ * billable clock starts on an unusable session.
+ */
+type ParsedLiveSession = {
+  sdp: string;
+  providerSessionId: string;
+};
+
+export function parseLiveSessionPayload(
+  payload: unknown,
+): { ok: true } & ParsedLiveSession | { ok: false; missing: "transport.sdp" | "session.id" } {
+  const body = (payload ?? {}) as LiveSessionPayload;
+  const sdp = typeof body?.transport?.sdp === "string" ? body.transport.sdp : "";
+  if (!sdp.trim()) return { ok: false, missing: "transport.sdp" };
+
+  const providerSessionId = typeof body?.session?.id === "string" ? body.session.id : "";
+  if (!providerSessionId.trim()) return { ok: false, missing: "session.id" };
+
+  return { ok: true, sdp, providerSessionId };
+}
 
 /**
  * Exchange the browser's SDP offer for an SDP answer.
@@ -216,7 +255,7 @@ export async function createLiveSession(options: {
   userId: string;
   fetchImpl?: typeof fetch;
 }): Promise<
-  | { ok: true; sdp: string; providerSessionId: string | null }
+  | { ok: true; sdp: string; providerSessionId: string }
   | { ok: false; status: number; code: string; error: string }
 > {
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -246,21 +285,26 @@ export async function createLiveSession(options: {
       return classifyLiveError(response.status, payload);
     }
 
-    const payload = (await response.json().catch(() => null)) as LiveSessionPayload | null;
-    const sdp = typeof payload?.sdp === "string" ? payload.sdp : "";
-    if (!sdp) {
+    const payload = (await response.json().catch(() => null)) as unknown;
+    const parsed = parseLiveSessionPayload(payload);
+    if (!parsed.ok) {
+      // Two distinct failures, one code: the provider answered 2xx but the body
+      // is unusable. Reported separately in the message so a support engineer
+      // knows which field was missing, without ever echoing the body itself.
       return {
         ok: false,
         status: 502,
         code: "provider_error",
         error:
-          "Le fournisseur vocal n'a pas renvoyé de description de session. / The voice provider returned no session description.",
+          parsed.missing === "transport.sdp"
+            ? "Le fournisseur vocal n'a pas renvoyé de description de session. / The voice provider returned no session description."
+            : "Le fournisseur vocal n'a pas renvoyé d'identifiant de session. / The voice provider returned no session identifier.",
       };
     }
     return {
       ok: true,
-      sdp,
-      providerSessionId: typeof payload?.id === "string" ? payload.id : null,
+      sdp: parsed.sdp,
+      providerSessionId: parsed.providerSessionId,
     };
   } catch (error) {
     if (controller.signal.aborted) {

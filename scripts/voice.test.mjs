@@ -717,12 +717,24 @@ function installStub({ rows = [], provider = defaultProvider, store } = {}) {
 /** Offre SDP minimale : la route ne fait que la transmettre. */
 const OFFER_SDP = "v=0\r\no=- 1 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n";
 
-/** Réponse fournisseur par défaut : une session ouverte. */
-function defaultProvider(body) {
-  return new Response(JSON.stringify({ id: "live_sess_stub", sdp: "v=0\r\no=- 9 9 IN IP4 0.0.0.0\r\n" }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
+/**
+ * Réponse fournisseur par défaut : une session ouverte.
+ *
+ * Forme EXACTE de la réponse officielle `201 Created` de
+ * `POST /v1/live/sessions` (référence Live, `## Create session`, exemple HTTP
+ * 201) : imbriquée, `session.id` ET `transport.sdp`. L'ancien stub renvoyait
+ * `{ id, sdp }` à plat — c'est précisément ce qui masquait le bug de lecture.
+ */
+const OPENAI_SESSION_ID = "live_sess_stub";
+
+function defaultProvider() {
+  return new Response(
+    JSON.stringify({
+      session: { id: OPENAI_SESSION_ID },
+      transport: { type: "webrtc", sdp: "v=0\r\no=- 9 9 IN IP4 0.0.0.0\r\n" },
+    }),
+    { status: 201, headers: { "Content-Type": "application/json" } },
+  );
 }
 
 async function callSession({ token = TOKEN, body } = {}) {
@@ -879,13 +891,109 @@ function proPlan() {
     resetQuotas();
     const calls = installStub({
       rows: proPlan(),
-      provider: () => new Response(JSON.stringify({ id: "live_sess_stub" }), { status: 200, headers: { "Content-Type": "application/json" } }),
+      provider: () => new Response(JSON.stringify({ session: { id: "live_sess_stub" } }), { status: 200, headers: { "Content-Type": "application/json" } }),
     });
     const out = await callSession();
     assert.equal(out.status, 502);
     assert.equal(out.body.code, "provider_error");
     assert.equal(calls.store.reserved(USER) + calls.store.consumed(USER), 0);
     pass("/api/voice-session : réponse sans SDP → 502, aucune session fantôme");
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  //  Forme officielle de la réponse 201 : imbriquée, pas à plat
+  // ───────────────────────────────────────────────────────────────────────────
+  // Régression corrigée ici : le code lisait `payload.sdp` et `payload.id`.
+  // Sur une vraie réponse OpenAI les deux valent `undefined`, donc la route
+  // renvoyait un 502 systématique et `provider_session_id` n'était jamais
+  // enregistré. Les tests ne le voyaient pas parce que le stub simulait
+  // l'ancienne forme plate.
+  {
+    resetQuotas();
+    const calls = installStub({
+      rows: proPlan(),
+      // Corps recopié de la référence Live (`## Create session`, exemple 201).
+      provider: () =>
+        new Response(
+          JSON.stringify({
+            session: { id: "live_123" },
+            transport: { type: "webrtc", sdp: "v=0\r\no=- 123 456 IN IP4 0.0.0.0\r\n" },
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        ),
+    });
+    const out = await callSession({ body: { sdp: OFFER_SDP, voice: "marin", history: [] } });
+    assert.equal(out.status, 201, "la réponse officielle imbriquée est acceptée");
+    assert.ok(out.body.sdp.includes("v=0"), "le SDP relayé vient de transport.sdp");
+    assert.equal(out.body.sdp, "v=0\r\no=- 123 456 IN IP4 0.0.0.0\r\n", "aucune transformation du SDP");
+    assert.ok(out.body.sessionId, "l'identifiant serveur reste celui de la réservation");
+    pass("/api/voice-session : réponse officielle imbriquée {session,transport} acceptée");
+  }
+
+  // L'identifiant fournisseur est bien celui de `session.id`, et il est
+  // enregistré : c'est la condition d'une fermeture ultérieure possible.
+  {
+    resetQuotas();
+    const calls = installStub({
+      rows: proPlan(),
+      provider: () =>
+        new Response(
+          JSON.stringify({
+            session: { id: "live_abc123" },
+            transport: { type: "webrtc", sdp: "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\n" },
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        ),
+    });
+    const out = await callSession({ body: { sdp: OFFER_SDP, voice: "marin", history: [] } });
+    assert.equal(out.status, 201);
+    const row = calls.store.session(out.body.sessionId);
+    assert.ok(row, "la session existe en base");
+    assert.equal(row.providerSessionId, "live_abc123", "provider_session_id vient de session.id");
+    assert.equal(row.state, "active");
+    pass("/api/voice-session : provider_session_id = session.id, transmis puis enregistré");
+  }
+
+  // Forme à plat (l'ancien stub) : désormais refusée, jamais acceptée par
+  // tolérance. Une réponse plate ne prouve pas la forme du fournisseur.
+  {
+    resetQuotas();
+    const calls = installStub({
+      rows: proPlan(),
+      provider: () => new Response(JSON.stringify({ id: "live_flat", sdp: "v=0\r\n" }), { status: 201, headers: { "Content-Type": "application/json" } }),
+    });
+    const out = await callSession();
+    assert.equal(out.status, 502, "une réponse à plat n'est pas la forme officielle");
+    assert.equal(out.body.code, "provider_error");
+    assert.equal(calls.store.reserved(USER) + calls.store.consumed(USER), 0, "aucun quota mangé");
+    pass("/api/voice-session : réponse à plat {id,sdp} refusée (502), quota rendu");
+  }
+
+  // Validation stricte : chaque champ manquant, à sa place, est refusé.
+  {
+    const cases = [
+      { label: "session.id absent", body: { transport: { type: "webrtc", sdp: "v=0\r\n" } } },
+      { label: "session.id vide", body: { session: { id: "   " }, transport: { sdp: "v=0\r\n" } } },
+      { label: "session.id non textuel", body: { session: { id: 42 }, transport: { sdp: "v=0\r\n" } } },
+      { label: "transport.sdp absent", body: { session: { id: "live_1" }, transport: { type: "webrtc" } } },
+      { label: "transport.sdp vide", body: { session: { id: "live_1" }, transport: { sdp: "  \r\n " } } },
+      { label: "transport.sdp non textuel", body: { session: { id: "live_1" }, transport: { sdp: null } } },
+      { label: "transport absent", body: { session: { id: "live_1" } } },
+      { label: "session absent", body: { transport: { sdp: "v=0\r\n" } } },
+      { label: "corps nul", body: null },
+    ];
+    for (const { label, body } of cases) {
+      resetQuotas();
+      const calls = installStub({
+        rows: proPlan(),
+        provider: () => new Response(JSON.stringify(body), { status: 201, headers: { "Content-Type": "application/json" } }),
+      });
+      const out = await callSession();
+      assert.equal(out.status, 502, `${label} → 502`);
+      assert.equal(out.body.code, "provider_error", `${label} → provider_error`);
+      assert.equal(calls.store.reserved(USER) + calls.store.consumed(USER), 0, `${label} → aucun quota mangé`);
+    }
+    pass("/api/voice-session : validation stricte, 9 corps invalides refusés sans quota");
   }
 
   // Clé absente : 503 et quota rendu.
