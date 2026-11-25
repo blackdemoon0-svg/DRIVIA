@@ -44,6 +44,17 @@ const ENV = {
 const NOW = Date.parse("2026-11-01T12:00:00.000Z");
 const inDays = (days) => new Date(NOW + days * 86_400_000).toISOString();
 
+/**
+ * Same idea, anchored on the real clock.
+ *
+ * `authorizeRequest` compares against `Date.now()`, while `NOW` is a fixed
+ * 2026-11-01 noon used to make the pure functions deterministic. Once the real
+ * date passed 2026-11-01, a "Pro subscription ends in 20 days" built on `NOW`
+ * became a subscription that expired in the past — the test then asserted Pro
+ * and got Découverte. The route was right; the fixture had aged.
+ */
+const fromNowInDays = (days) => new Date(Date.now() + days * 86_400_000).toISOString();
+
 function row(overrides = {}) {
   return {
     user_id: USER_ID,
@@ -188,6 +199,8 @@ function restore() {
     attachments: false,
     quoteAnalysis: true,
     requestsPerMinute: 10,
+    // Voix : absente de la formule gratuite (refus avant tout appel fournisseur).
+    voiceMinutesPerDay: 0,
   });
   assert.deepEqual(PLAN_LIMITS.plus, {
     messagesPerDay: 200,
@@ -195,6 +208,7 @@ function restore() {
     attachments: true,
     quoteAnalysis: true,
     requestsPerMinute: 20,
+    voiceMinutesPerDay: 10,
   });
   assert.deepEqual(PLAN_LIMITS.pro, {
     messagesPerDay: 600,
@@ -202,6 +216,7 @@ function restore() {
     attachments: true,
     quoteAnalysis: true,
     requestsPerMinute: 30,
+    voiceMinutesPerDay: 30,
   });
 
   // Un plan inconnu retombe sur le plus restrictif, jamais sur un plan payant.
@@ -372,7 +387,7 @@ function restore() {
       });
     }
     assert.match(String(url), /subscriptions\?user_id=eq\./, "la lecture est filtrée sur le compte vérifié");
-    return new Response(JSON.stringify([row({ plan: "pro" })]), {
+    return new Response(JSON.stringify([row({ plan: "pro", current_period_ends_at: fromNowInDays(20) })]), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });

@@ -210,7 +210,11 @@ export function readQuotaUsage(
   const entry = counters.get(quotaKey(userId));
   const day = utcDayKey(nowMs);
   if (!entry || entry.day !== day) return { messages: 0, quotes: 0, day };
-  return { messages: entry.messages, quotes: entry.quotes, day };
+  return {
+    messages: entry.messages,
+    quotes: entry.quotes,
+    day,
+  };
 }
 
 /**
@@ -222,3 +226,52 @@ export function readQuotaUsage(
 export function resetQuotas(): void {
   counters.clear();
 }
+
+// ---------------------------------------------------------------------------
+// Voice Live allowance — MOVED TO POSTGRES
+// ---------------------------------------------------------------------------
+//
+// The voice allowance used to live here, in the same in-memory entry as messages
+// and quotes. That was wrong for one reason: a voice session is not a discrete
+// request but a duration, and a duration must be shared by every instance and
+// survive a cold start. In memory it did neither — a Pro account could consume
+// 30 minutes per instance.
+//
+// It now lives in `public.voice_usage_daily` and `public.voice_sessions`
+// (migration `0004_voice_usage.sql`), behind the `voice_*` functions, called from
+// `server/voiceUsage.ts`. The database enforces what memory could not:
+//   • an atomic reservation, with the condition inside the UPDATE;
+//   • one open session per account, by partial unique index;
+//   • idempotent settlement and refund.
+//
+// What remains here is the one constant the route still needs, so the
+// reservation length has a single definition.
+
+/**
+ * Smallest reservation allowed, in seconds.
+ *
+ * It is NOT the amount reserved. The reservation is the whole remaining
+ * allowance capped by the hard session ceiling — see `voice_reserve` in
+ * `0004_voice_usage.sql`. Reserving a flat 60 s while a session may run for an
+ * hour let a Pro account with 60 s left open a 20-minute conversation and
+ * overrun its quota.
+ *
+ * This value now has exactly two uses: it is the floor below which a session is
+ * not worth starting, and the length of the first slice of the period split.
+ */
+export const VOICE_MIN_RESERVATION_SECONDS = 60;
+
+/**
+ * How long a RESERVATION may sit unused before it is released.
+ *
+ * Five minutes, and deliberately short. It covers the SDP exchange (up to 20 s
+ * against the provider) and a slow client, and nothing more. Once the session
+ * is activated, the row leaves `pending` and this lease stops applying: an
+ * active conversation is protected by its own lease and the hard session
+ * ceiling, never by this value.
+ *
+ * A short lease is what keeps an abandoned handshake from blocking the account:
+ * a tab killed between the reservation and the provider answer releases itself
+ * five minutes later, not in an hour.
+ */
+export const VOICE_RESERVATION_TTL_SECONDS = 300;

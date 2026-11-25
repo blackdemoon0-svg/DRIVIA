@@ -6,6 +6,7 @@ import { AlertIcon } from './Icons'
 
 // Vue de conversation : fil de messages centré + barre de saisie toujours visible.
 export default function ChatView({
+  voiceSlot,
   messages,
   isLoading,
   error,
@@ -97,6 +98,7 @@ export default function ChatView({
           textareaRef={textareaRef}
           compact
           disabled={disabled}
+          voiceSlot={voiceSlot}
         />
       </div>
     </div>

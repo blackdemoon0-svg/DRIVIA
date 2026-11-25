@@ -13,7 +13,7 @@
     "test:paddle": "tsx scripts/paddle-flow.test.mjs",
     "test:attribution": "tsx scripts/paddle-attribution.test.mjs",
     "test:webhook": "tsx scripts/paddle-webhook.test.mjs",
-    "test": "npm run test:paddle && npm run test:attribution && npm run test:webhook && npm run test:activation && npm run test:entitlement && npm run test:auth && npm run test:access && npm run test:quotas && npm run test:chat-access && npm run test:plan-change && npm run test:purchase-guard && npm run test:schema && npm run test:avatar && npm run test:ai",
+    "test": "npm run test:paddle && npm run test:attribution && npm run test:webhook && npm run test:activation && npm run test:entitlement && npm run test:auth && npm run test:access && npm run test:quotas && npm run test:chat-access && npm run test:plan-change && npm run test:purchase-guard && npm run test:schema && npm run test:avatar && npm run test:ai && npm run test:voice && npm run test:voice-sql",
     "test:entitlement": "tsx scripts/entitlement.test.mjs",
     "test:schema": "tsx scripts/schema-alignment.test.mjs",
     "test:auth": "tsx scripts/auth.test.mjs",
@@ -26,6 +26,8 @@
     "test:ai-provider": "tsx scripts/ai-provider.test.mjs",
     "test:ai-pipeline": "tsx scripts/ai-pipeline.test.mjs",
     "test:ai": "npm run test:ai-routing && npm run test:ai-provider && npm run test:ai-pipeline",
+    "test:voice": "tsx scripts/voice.test.mjs",
+    "test:voice-sql": "tsx scripts/sql/voice-usage.sql.test.mjs",
     "ai:models": "tsx scripts/ai-model-check.mjs",
     "test:plan-change": "tsx scripts/paddle-plan-change.test.mjs",
     "test:activation": "tsx scripts/paddle-activation.test.mjs"
@@ -40,6 +42,7 @@
     "tailwind-merge": "3.4.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.2.17",
     "@tailwindcss/vite": "4.1.17",
     "@types/node": "22.19.17",
     "@types/react": "19.2.7",

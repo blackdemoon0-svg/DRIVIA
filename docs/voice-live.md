@@ -1,0 +1,396 @@
+# Vocal Live VEYVRO — GPT-Live 1.1 en WebRTC
+
+## Ce qui est livré
+
+La conversation vocale temps réel, avec un choix de voix **propre à chaque
+compte** et **enregistré sur le compte**.
+
+| Élément | Valeur |
+| --- | --- |
+| Modèle vocal | `gpt-live-1.1` (délégué à `gpt-6-luna`) |
+| Transport | WebRTC, échange SDP côté serveur |
+| Voix par défaut | `brise` |
+| Voix proposées | 28 voix documentées + `marin` (défaut OpenAI) |
+| Quota vocal | `voiceMinutesPerDay` : Découverte 0, Plus 10, Pro 30, **persistant en base** |
+| Préférence | `raw_user_meta_data.veyvro_voice` (aucune table, aucune migration) |
+
+## Fichiers
+
+**Nouveaux**
+
+| Fichier | Rôle |
+| --- | --- |
+| `server/ai/voiceCatalog.ts` | Le catalogue des voix, source unique ; résolution et validation d'un identifiant ; modèle et cible de délégation |
+| `server/voiceUsage.ts` | Appels aux fonctions SQL `voice_*` : réservation, règlement, remboursement. Aucun état local |
+| ~~`server/voiceSessions.ts`~~ | **Supprimé** : le registre en mémoire est remplacé par la table `voice_sessions` |
+| `supabase/migrations/0004_voice_usage.sql` | Tables `voice_usage_daily` et `voice_sessions`, cinq fonctions, RLS. **Non exécutée** |
+| `scripts/sql/voice-usage.sql.test.mjs` | 20 contrôles : exécute la migration dans un PostgreSQL 16 réel (PGlite) et prouve les garanties, y compris la concurrence |
+| `api/_liveConfig.ts` | Construction de la configuration de session (modèle, voix, consignes, délégation). Préfixe `_` : ce n'est pas une route |
+| `api/voice-session.ts` | `POST` une offre SDP → authentification → validation de la voix → quota → session Live → réponse SDP |
+| `api/voice-end.ts` | Ferme une session et règle la durée réelle côté serveur |
+| `api/voice-profiles.ts` | `GET` catalogue + voix du compte ; `PUT` valide et enregistre le choix |
+| `src/lib/useVoicePreference.js` | Préférence : compte d'abord, cache local ensuite |
+| `src/lib/useVoiceLive.js` | Session WebRTC : micro, data channel `oai-events`, fin, changement de voix |
+| `src/components/VoicePicker.jsx` | Sélecteur de voix (aperçus uniquement s'ils sont réels) |
+| `src/components/VoiceLiveButton.jsx` | Bouton micro, état de session, quota restant |
+| `scripts/voice.test.mjs` | 106 contrôles : catalogue, validation, quota, durée non falsifiable, sessions simultanées, fermetures anormales, contexte, erreurs, formules, périmètre |
+| `scripts/voice-store.stub.mjs` | Double fidèle des fonctions SQL pour les tests de route (sans réseau) |
+
+**Modifiés — de façon strictement additive**
+
+| Fichier | Modification |
+| --- | --- |
+| `src/lib/planLimits.ts` | Champ `voiceMinutesPerDay` + valeurs 0 / 10 / 30 |
+| `server/quotas.ts` | Plus aucun compteur vocal en mémoire : `VOICE_MIN_RESERVATION_SECONDS` et `VOICE_RESERVATION_TTL_SECONDS` seulement, le reste vit en base |
+| `src/lib/chatApi.js` | Ajout de `VoiceApiError`, `fetchVoiceProfiles`, `saveVoicePreference`, `startVoiceSession`, `endVoiceSession`, `voiceErrorMessage`. `streamChat`, `parseSseBlock`, `trimHistory` inchangés |
+| `src/App.jsx` | Montage du bouton vocal pour un compte authentifié, avec l'historique de la conversation |
+| `src/components/ChatComposer.jsx` | Nouvelle prop optionnelle `voiceSlot` (par défaut `null` : rendu identique sans elle) |
+| `src/components/ChatView.jsx`, `HomeView.jsx` | Transmission de `voiceSlot` |
+| `src/components/Icons.jsx` | `MicIcon`, `MicOffIcon` |
+| `src/index.css` | Styles du bouton et du sélecteur |
+| `scripts/access.test.mjs` | Les trois `deepEqual` de `PLAN_LIMITS` incluent le nouveau champ ; la fixture « abonnement Pro » est ancrée sur l'horloge réelle (voir plus bas) |
+| `package.json` | `test:voice` et `test:voice-sql` ajoutés à la suite `test` ; `@electric-sql/pglite` en dépendance de développement |
+
+## Contrats d'API
+
+### `POST /api/voice-session`
+
+```jsonc
+// requête
+{ "sdp": "v=0…", "voice": "brise", "history": [{ "role": "user", "content": "…" }] }
+
+// 201
+{
+  "sessionId": "…",                 // identifiant serveur, pas celui d'OpenAI
+  "sdp": "v=0…",                    // réponse SDP à appliquer
+  "voice": { "id": "brise", "label": "Brise", "replacedInvalidRequest": false },
+  "quota": { "limitMinutes": 10, "remainingSeconds": 540, "usedSeconds": 60 }
+}
+```
+
+Erreurs : `invalid_offer` 400 · `voice_not_in_plan` 403 · **`voice_session_open` 409** · `voice_minutes_exhausted` / `rate_limited` 429 (+`Retry-After`) · `invalid_api_key` / `voice_unavailable` / `provider_error` 502 · `timeout` 504 · `identity_unavailable` / `missing_api_key` / `not_configured` / **`voice_store_unavailable`** 503.
+
+Un identifiant de voix inconnu **n'est jamais transmis** : il est remplacé par
+`brise` et `replacedInvalidRequest: true` permet au client de corriger la
+préférence enregistrée.
+
+### `POST /api/voice-end`
+
+```jsonc
+{ "sessionId": "…" }
+// 200
+{ "settledWith": "duration" | "never-started" | "already-closed" | "already-released" | "unknown-session",
+  "chargedSeconds": 42, "measuredSeconds": 42, "usedSeconds": 42,
+  "clientReportedSeconds": 0 }
+```
+
+La durée vient de la base (`now() - started_at`), **jamais du client**.
+`clientReportedSeconds` n'est qu'un renseignement de support.
+Fermer deux fois ne facture pas deux fois. Une session inconnue ne facture rien
+et renvoie `clientReportedSeconds` pour le diagnostic seulement.
+
+### `GET | PUT /api/voice-profiles`
+
+`GET` renvoie le catalogue même à un visiteur non connecté (`selected: null`) ;
+pour un compte, `selected` est la voix enregistrée si elle existe encore dans le
+catalogue, sinon `brise`. `PUT { voice }` valide puis écrit
+`data.veyvro_voice` via `PUT /auth/v1/user` avec le jeton de l'utilisateur, qui
+**fusionne** les métadonnées — c'est ce qui préserve `avatar_url` et
+`avatar_path`.
+
+## Quota vocal — persistant, partagé, facturé au temps réel
+
+Le compteur vivait dans un `Map` par instance : perdu au redémarrage, et non
+partagé — 30 minutes **par instance** au lieu de 30 minutes par jour. Il vit
+désormais dans Postgres (`0004_voice_usage.sql`).
+
+Formules : Découverte **0**, Plus **10**, Pro **30** minutes par jour UTC.
+
+### Deux phases, et c'est ce qui protège la facturation
+
+Une session n'est pas une seule ligne droite. Elle a deux états :
+
+| État | `started_at` | Facturable | Ce qui s'y passe |
+| --- | --- | --- | --- |
+| `pending` | `NULL` | **non** | la réservation est posée, l'offre SDP voyage |
+| `active` | posé par `voice_activate` | oui | la conversation a commencé |
+
+`started_at` est écrit **après** la réponse réussie du fournisseur. Les 20
+secondes de préparation de la connexion ne sont donc pas facturées.
+
+### La durée est calculée par PostgreSQL, pas reçue
+
+`voice_settle` **n'accepte aucun paramètre de durée**. Elle calcule
+`now() - started_at`, puis borne à **la réservation** — qui est elle-même le
+plafond de la session (voir la section suivante).
+
+C'est une correction, pas un détail : la version précédente recevait
+`p_actual_seconds`, c'est-à-dire le `durationSeconds` du navigateur. Un client
+envoyant `0` ne payait rien. Le paramètre a été **supprimé** — on ne peut pas
+transmettre par accident ce qui n'existe pas. La valeur du client est renvoyée
+sous `clientReportedSeconds`, pour le diagnostic uniquement.
+
+### La réservation est le plafond, et c'est ce qui protège le quota
+
+La version précédente réservait **60 s** alors qu'une session pouvait être
+facturée jusqu'à **3600 s**. Un compte Pro avec une minute restante ouvrait donc
+20 minutes et dépassait son quota de 19 minutes. Réserver un forfait ne
+protège rien : seule une réservation qui couvre **tout ce que la session peut
+consommer** protège.
+
+`voice_reserve` réserve désormais **tout le crédit restant**, borné par trois
+limites — la plus petite gagne :
+
+```
+réservation = min(plafond de session, crédit restant, temps avant minuit UTC)
+```
+
+Le plafond de session est `LIVE_MAX_SESSION_SECONDS`, dérivé de
+`LIVE_MAX_SESSION_MINUTES = 60` (`server/ai/voiceCatalog.ts`) — la limite
+documentée d'une session GPT-Live. Il est **transmis en paramètre** ; le SQL n'a
+**aucun défaut**, parce qu'un défaut serait une seconde source de vérité.
+
+Et puisque la réservation est le plafond, le dépassement de quota devient
+structurellement impossible :
+
+- `voice_settle` borne la facture à la réservation ;
+- `voice_close_overdue` clôt à `started_at + réservation` ;
+- une session n'est jamais facturée au-delà de ce qui a été réservé.
+
+Ce qui est réservé mais non consommé est **rendu au règlement**. Sur une
+réservation de 600 s fermée après 45 s, 555 s redeviennent disponibles
+immédiatement.
+
+### Minuit UTC : une session ne traverse pas le jour
+
+La réservation est bornée par le temps restant avant minuit UTC, donc une
+session appartient toujours à un seul jour et le crédit d'un jour n'est jamais
+entamé par la veille. Une conversation commencée à 23:58 s'arrête à minuit et
+doit être relancée ; moins d'une minute avant minuit, la réservation est refusée
+en `voice_curfew` plutôt que d'ouvrir une session de quelques secondes.
+
+C'est un choix assumé, pas un oubli : un comptage non ambigu vaut mieux qu'une
+conversation facturée à cheval sur deux jours.
+
+### Les huit opérations
+
+1. **Réserver** (`voice_reserve`) — tout le crédit restant, borné par les trois
+   limites ci-dessus. Condition d'autorisation dans le `UPDATE ... WHERE` :
+   atomique sous concurrence.
+2. **Refuser une deuxième session** — un index unique partiel interdit deux
+   lignes `pending` **ou** `active` par compte. Deux appareils sont refusés en
+   `409 voice_session_open`, sans aucune facturation.
+3. **Activer** (`voice_activate`) — pose `started_at`, allonge le bail.
+4. **Régulariser** (`voice_settle`) — durée mesurée, idempotent.
+5. **Rembourser** (`voice_refund`) — rend la réservation, idempotent.
+6. **Balayer** (`voice_expire_stale`, `voice_close_overdue`) — voir ci-dessous.
+7. **Surveiller** (`voice_touch`, via `/api/voice-heartbeat`) — toutes les 15 s,
+   calcule le temps restant et **arrête et facture** au plafond.
+8. **Relire** (`voice_session_state`) — l'état réel, sans effet de bord, quand un
+   résultat réseau est incertain.
+
+### Le bail ne libère jamais une conversation active
+
+C'est la réponse au scénario « deux appareils » :
+
+- `voice_expire_stale` ne regarde **que** les réservations `pending`. Une
+  session `active` n'est jamais libérée par expiration, même si son bail est
+  ancien. Un bail de réservation dure 5 minutes ; le bail d'une session active
+  en dure 65.
+- Une session `active` ne peut se terminer que par un règlement, un
+  remboursement, ou **sa réservation épuisée** : `voice_close_overdue` clôt et
+  facture à `started_at + réservation`. Elle le fait **avant** d'autoriser une
+  nouvelle session, sur le même calcul que le règlement manuel — même
+  `started_at`, même borne, donc même montant.
+
+Conséquence : une conversation qui épuise sa réservation est close et facturée,
+puis la place se libère — ou le quota bloque, si la facture l'épuise.
+
+### Ce que le client ne peut pas faire
+
+Il ne peut pas fournir la durée, ni la réduire, ni la gonfler au-delà du
+plafond. Il ne peut pas ouvrir deux sessions. Il ne peut pas écrire les
+compteurs (RLS : lecture seule de ses propres lignes).
+
+Si Supabase est injoignable, la route répond `503 voice_store_unavailable` :
+elle **échoue fermé**, sans jamais retomber sur un compteur en mémoire.
+
+### Un remboursement ne libère jamais une session activée
+
+`voice_activate` réussir en base et sa réponse HTTP se perdre sont deux choses
+différentes. Quand la réponse se perdait, la route concluait « activation
+échouée » et remboursait — et `voice_refund` acceptait `active`, donc la
+réservation d'une conversation **déjà activée** était rendue en entier, sans
+facturation.
+
+Trois garde-fous, du plus profond au plus visible :
+
+1. **La base refuse.** `voice_refund` n'accepte plus que `pending`. Sur une
+   session `active`, elle répond `active_not_refundable` avec
+   `released: false`. La règle n'est pas dans l'appelant.
+2. **La route ne devine pas.** Après une erreur réseau à l'activation, elle
+   relit l'état réel (`voice_session_state`) et décide sur ce fait :
+   `settle` → la session est active, on ne rembourse pas ; `refundable` → elle
+   est restée `pending`, le remboursement est légitime ; lecture impossible →
+   **rien n'est décidé**, et le bail de réservation rend le crédit tout seul.
+3. **Le type le dit.** `refundVoiceReservation` renvoie `released` et
+   `refundable` : un refus ne peut plus être confondu avec un succès.
+
+### Le plafond arrête la conversation, pas seulement le compteur
+
+Le plafond de réservation bornait ce qui est **facturé** sans arrêter ce qui est
+**diffusé** : seul un `setTimeout` du navigateur terminait la session. Un onglet
+suspendu, un timer throttlé ou un client modifié continuaient après le plafond,
+et le fournisseur était payé pour du temps que PostgreSQL avait cessé de
+facturer.
+
+- `POST /api/voice-heartbeat` est appelé toutes les 15 s pendant la session. Il
+  ne transporte **aucune durée** : uniquement l'identifiant de session.
+- `voice_touch` calcule `remaining_seconds` et clôt **et facture** la session
+  au plafond, dans la même transaction. `should_stop` est une instruction, pas
+  un conseil : le client ferme le peer connection dessus.
+- Un client qui l'ignorerait ne consomme plus rien : la session n'est plus
+  `active`, donc `voice_touch` répond `not_active` et `should_stop: true`.
+- Le minuteur local subsiste, mais seulement comme **secours** quand le réseau
+  est coupé ; il s'appuie sur `maxSessionSeconds`, la réservation accordée par
+  la base, jamais sur un chiffre inventé côté client.
+
+### Fermeture du fournisseur : ce qui est possible, et ce qui ne l'est pas
+
+À la fermeture, le client envoie l'événement `session.close` sur le canal de
+données (`oai-events`) avant de le fermer. C'est le seul mécanisme documenté :
+une session GPT-Live se termine par un **événement client**, pas par un appel
+REST. `v1/live/sessions` n'expose aucun endpoint de fermeture côté serveur, et
+le `hangup` que documente OpenAI appartient à l'API Realtime
+(`/v1/realtime/calls`), que ce projet n'utilise pas.
+
+Conséquence assumée : si le navigateur ne reçoit jamais le SDP, le serveur
+**ne peut pas** couper la session chez le fournisseur — elle expire d'elle-même,
+sans être facturée par VEYVRO. Ce qui est couvert en revanche : la route règle
+immédiatement si la livraison du 201 échoue, et `voice_close_overdue` clôt toute
+session active arrivée à sa réservation. Un test vérifie ce chemin.
+
+### Migration rejouable, sans perte
+
+Une migration qui commence par `DROP TABLE IF EXISTS` n'est pas idempotente :
+elle **détruit** l'historique au second passage. `0004_voice_usage.sql` a été
+réécrite pour ne plus rien supprimer :
+
+- `create table if not exists` pour les deux tables ;
+- colonnes manquantes ajoutées par `alter table ... add column if not exists`,
+  données existantes reprises par `coalesce` (une valeur présente n'est jamais
+  écrasée) ;
+- contraintes et index créés seulement s'ils manquent, en `not valid`, pour ne
+  jamais exiger la suppression d'une ligne ;
+- fonctions remplacées : c'est du code, pas des données ;
+- une structure **incompatible** n'est jamais écrasée : la migration s'arrête
+  par un `raise exception` explicite, sans avoir modifié une seule ligne.
+
+Le rejeu est vérifié par un test, pas par une intention : le fichier de tests SQL
+insère des sessions dans plusieurs états, rejoue la migration **deux fois**, et
+compare ligne par ligne. Le compte, les états, les secondes facturées et les
+jours d'usage sont identiques. Le test vérifie aussi que le SQL exécutable ne
+contient aucune instruction destructive (`DROP TABLE`, `DROP COLUMN`,
+`TRUNCATE`, `DELETE`).
+
+## Contexte vocal — conservé lors d'un changement de voix
+
+Une voix est figée dans une session GPT-Live : changer de voix ferme la session
+et en ouvre une nouvelle. Sans mémoire, VEYVRO repartait de zéro.
+
+- La session demande maintenant la **transcription de l'entrée audio**
+  (`audio.input.transcription`, modèle `whisper-1`). Sans elle, le seul texte
+  disponible serait celui de l'assistant : l'historique ne contiendrait que ses
+  propres réponses.
+- `useVoiceLive` tient une **mémoire vocale** (`voiceHistoryRef`), alimentée par
+  les transcriptions finalisées — jamais par les fragments de streaming, qui
+  produiraient un historique haché.
+- À chaque ouverture, `mergeVoiceHistory` fusionne le fil **écrit** (fourni par
+  `App`) et le fil **vocal**, sans doublon consécutif. Bornes : 12 messages et
+  4 000 caractères.
+- La mémoire survit aux **changements de voix**, et est effacée par `stop()` :
+  une conversation terminée ne pollue pas la suivante.
+- `restartWithVoice` appelle la version **la plus récente** de `start` via une
+  ref. Sans cela, le second changement de voix serait reparti avec la voix
+  capturée au premier clic — un bug silencieux.
+
+## Corrections apportées après la revue du 2026-11-22
+
+Sept défauts réels ont été trouvés en confrontant le code à la documentation
+officielle, puis corrigés dans la même PR. Chacun a un test qui échoue si on le
+réintroduit.
+
+| # | Défaut | Conséquence | Correction |
+| --- | --- | --- | --- |
+| 1 | Catalogue de 21 voix | **Sept voix réelles manquaient, dont les cinq espagnoles.** L'espagnol fait partie des langues exigées : un utilisateur hispanophone ne voyait que des voix françaises et allemandes. | Les 28 voix de la documentation, à l'identique. |
+| 2 | Garde-fou de longueur des consignes mal calibré | Un prompt dépassant la limite réelle de 16 384 tokens aurait été accepté par le garde-fou puis refusé par OpenAI : **toutes les sessions vocales auraient échoué**, avec un message d'erreur opaque. | Garde-fou ramené à `16 384 × 3` caractères (~49 000), volontairement **sous** la limite réelle estimée (~65 000 caractères à 4 car/token) : il échoue avant OpenAI. Prompt actuel : 5 636 caractères, soit ~1 400 tokens. |
+| 3 | La délégation recevait le prompt de *conversation* | Le backend aurait répondu en phrases courtes au lieu de raisonner. Ce sont deux canaux distincts dans la documentation. | `delegation.responses.instructions` = prompt VEYVRO + bloc « backend » ; `instructions` = prompt VEYVRO + bloc « conversation ». |
+| 4 | Aucune salutation | L'utilisateur ouvrait le micro et **entendait le silence** : une session Live écoute d'abord. | Message `developer` de salutation dans `session.input`, selon la recette documentée « Greet before the caller speaks ». |
+| 5 | Session inconnue à la fermeture : rien n'était réglé | Sur plusieurs instances serverless, **la réservation restait consommée** à chaque session : fuite de quota, utilisateur bloqué sans avoir parlé. | Réservation rendue si la session n'a jamais été activée ; sinon durée mesurée par PostgreSQL, **plafonnée à la réservation**. |
+| 6 | Préférence écrite via l'endpoint **admin** Supabase | `PUT /auth/v1/admin/users/{id}` remplace tout `raw_user_meta_data` : **la photo de profil aurait été effacée** au premier changement de voix. | Écriture via `PUT /auth/v1/user` avec le jeton de l'utilisateur — la même mécanique que `client.auth.updateUser` de l'avatar. Aucune clé de service nécessaire. |
+| 7 | Interface | Les minutes restantes d'une session **terminée** étaient affichées (chiffre périmé) ; une voix remplacée par le serveur n'était pas signalée ; le composeur transmettait l'événement de clic comme identifiant de voix au redémarrage. | Quota affiché seulement pendant la session ; substitution signalée et préférence réparée ; identifiant de voix validé avant redémarrage. |
+
+### Un test qui masquait un vrai problème
+
+`scripts/access.test.mjs` échouait sur `main` (`'decouverte' == 'pro'`). Ce n'était
+pas un bug de `server/access.ts` — vérifié en l'exécutant isolément. La fixture
+« abonnement Pro en cours » construisait son échéance à partir d'une constante
+`NOW` fixée au **1er novembre 2026 à midi** ; une fois cette date passée, un
+abonnement « valable 20 jours » était expiré, et le test comparait un refus
+légitime. La fixture utilise maintenant l'horloge réelle pour les cas qui
+passent par `authorizeRequest`. Le test passe, et `/api/voice-session` conserve
+donc sa couverture des trois formules.
+
+## Ce qui n'a pas pu être vérifié ici
+
+Ces points ne sont **pas** des tests passés. Ils sont bloqués dans cet
+environnement, pas dans le code :
+
+- **Aucun appel réseau réel à OpenAI.** `VEYVRO_AI_API_KEY` n'est pas disponible
+  ici et `api.openai.com` est injoignable (échec TLS depuis le bac à sable).
+  Toutes les routes ont été testées contre un `fetch` simulé, jamais contre le
+  vrai service.
+- **Aucune poignée de main WebRTC réelle**, donc aucun son, aucune mesure de
+  latence.
+- **Aucun aperçu audio livré.** Les 28 voix sont marquées
+  `previewAvailable: false` : un aperçu doit être enregistré depuis une vraie
+  session GPT-Live, et l'API TTS d'OpenAI ne partage qu'une seule voix avec
+  Live (`marin`). Jouer un échantillon qui n'est pas la voix annoncée serait
+  pire que de n'en avoir aucun. Le sélecteur l'annonce explicitement à
+  l'utilisateur. La génération est prévue par `scripts/voice-samples.mjs`, qui
+  nécessite une clé réelle.
+- **Comportement multi-instance réel.** Il est désormais **prouvé par le SQL**,
+  pas par un déploiement : `scripts/sql/voice-usage.sql.test.mjs` exécute la
+  migration dans un PostgreSQL 16 réel (PGlite) et lance deux réservations et
+  quatre fermetures **simultanées**. Ce n'est pas deux instances Vercel : c'est
+  deux sessions Postgres concurrentes sur les mêmes lignes. C'est le niveau de
+  preuve disponible ici, et il est honnête de le dire ainsi.
+- **La migration n'est pas appliquée.** `0004_voice_usage.sql` est proposée,
+  testée sur PostgreSQL 16, **jamais exécutée sur Supabase**. Tant qu'elle ne
+  l'est pas, les routes renvoient `503 voice_store_unavailable` (le message
+  nomme la migration).
+- **Le plafond dur est une supposition raisonnée.** `LIVE_MAX_SESSION_SECONDS`
+  (3600 s) correspond à la limite documentée d'une session GPT-Live, mais aucune
+  session réelle n'a été observée au-delà de quelques minutes : la valeur n'est
+  pas confirmée par l'expérience. Elle est en revanche définie à **un seul
+  endroit** et transmise en paramètre, sans défaut SQL — deux chiffres distincts
+  sur ce chemin (3600 au règlement, 3900 à la route) permettaient de facturer
+  deux montants pour une même session.
+- **`voice_touch` n'est pas appelé par l'interface.** Le bail d'une session
+  active est posé à l'activation et n'a pas besoin d'être prolongé (65 min de
+  bail pour 60 min de plafond). La fonction existe pour le diagnostic, pas pour
+  la facturation.
+
+## Notes d'exploitation
+
+- Aucune variable d'environnement nouvelle : `VEYVRO_AI_API_KEY`,
+  `VEYVRO_AI_BASE_URL`, et les trois clés Supabase existantes.
+- **Une migration SQL devient nécessaire** : `0004_voice_usage.sql`. Non
+  exécutée. Sans elle, la voix répond `503 voice_store_unavailable`, elle ne
+  retombe pas silencieusement sur l'ancien comportement.
+- La voix est figée pour la durée d'une session GPT-Live : changer de voix
+  ferme la session et en ouvre une nouvelle avec le même contexte. C'est la
+  seule façon honnête de le faire, et c'est ce que fait l'interface.
+- Un utilisateur Découverte peut **choisir** une voix (elle reste enregistrée)
+  mais ne peut pas ouvrir de session : le refus intervient avant tout appel
+  fournisseur.

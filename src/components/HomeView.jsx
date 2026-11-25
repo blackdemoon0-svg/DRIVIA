@@ -7,7 +7,7 @@ const ACTION_ICONS = { quote: QuoteIcon, alert: AlertIcon, car: CarIcon }
 
 // Écran d'accueil : logo central, accroche, trois points de départ (fonctionnalités
 // gratuites existantes), suggestions, et la barre de chat centrale.
-export default function HomeView({ value, onChange, onSubmit, onStop, isLoading, onOpenQuote, onAction, textareaRef, disabled }) {
+export default function HomeView({ value, onChange, onSubmit, onStop, isLoading, onOpenQuote, onAction, textareaRef, disabled, voiceSlot }) {
   return (
     <div className="home-view">
       <div className="home-intro">
@@ -67,6 +67,7 @@ export default function HomeView({ value, onChange, onSubmit, onStop, isLoading,
           }}
           textareaRef={textareaRef}
           disabled={disabled}
+          voiceSlot={voiceSlot}
         />
       </div>
 

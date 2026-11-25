@@ -38,6 +38,14 @@ export type PlanLimits = {
   quoteAnalysis: boolean;
   /** Requests allowed in a rolling minute, per account. */
   requestsPerMinute: number;
+  /**
+   * Voice Live minutes per UTC day. `0` means the feature is not part of the
+   * plan at all: the route refuses it before contacting the provider.
+   *
+   * Minutes, not sessions: a Live session is billed by duration (0.05 $/min
+   * active), so the allowance has to be expressed in the same unit as the cost.
+   */
+  voiceMinutesPerDay: number;
 };
 
 /**
@@ -53,6 +61,7 @@ export const PLAN_LIMITS: Record<PlanId, PlanLimits> = {
     attachments: false,
     quoteAnalysis: true,
     requestsPerMinute: 10,
+    voiceMinutesPerDay: 0,
   },
   plus: {
     messagesPerDay: 200,
@@ -60,6 +69,7 @@ export const PLAN_LIMITS: Record<PlanId, PlanLimits> = {
     attachments: true,
     quoteAnalysis: true,
     requestsPerMinute: 20,
+    voiceMinutesPerDay: 10,
   },
   pro: {
     messagesPerDay: 600,
@@ -67,6 +77,7 @@ export const PLAN_LIMITS: Record<PlanId, PlanLimits> = {
     attachments: true,
     quoteAnalysis: true,
     requestsPerMinute: 30,
+    voiceMinutesPerDay: 30,
   },
 };
 

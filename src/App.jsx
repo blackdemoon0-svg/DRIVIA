@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import { useAuth } from './lib/auth'
 import { useChat } from './lib/useChat'
 import Scene from './components/scene/Scene'
@@ -12,11 +12,12 @@ import AuthView from './components/AuthView'
 import ProfileView from './components/ProfileView'
 import SettingsView from './components/SettingsView'
 import HelpView from './components/HelpView'
+import VoiceLiveButton from './components/VoiceLiveButton'
 import QuoteDialog from './components/QuoteDialog'
 import AboutDialog from './components/AboutDialog'
 
 export default function App() {
-  const { user, isDemo, status } = useAuth()
+  const { user, isDemo, status, session } = useAuth()
   const chat = useChat()
   const [view, setView] = useState('chat')
   const [authMode, setAuthMode] = useState('signin')
@@ -25,6 +26,29 @@ export default function App() {
   const [aboutOpen, setAboutOpen] = useState(false)
   const [input, setInput] = useState('')
   const textareaRef = useRef(null)
+  const accessToken = session?.access_token ?? null
+  const composerDisabled = status === 'loading'
+
+  // Le bouton vocal vit dans la barre de saisie. Il n'est monté que pour une
+  // session authentifiée : la clé OpenAI reste côté serveur, et les invités n'ont
+  // pas de quota vocal. Une seule instance partagée entre les deux écrans, sinon
+  // passer de l'accueil à la conversation couperait la session en cours.
+  const voiceHistory = useMemo(
+    () =>
+      chat.messages
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .map((m) => ({ role: m.role, content: m.content || '' }))
+        .filter((m) => m.content.trim().length > 0),
+    [chat.messages]
+  )
+
+  const voiceSlot = useMemo(
+    () =>
+      user ? (
+        <VoiceLiveButton session={session} accessToken={accessToken} history={voiceHistory} disabled={composerDisabled} />
+      ) : null,
+    [user, session, accessToken, voiceHistory, composerDisabled]
+  )
 
   const hasMessages = chat.messages.length > 0
   const isChatSurface = view === 'chat'
@@ -121,8 +145,6 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [newChat])
 
-  const composerDisabled = status === 'loading'
-
   return (
     <div className={`app-shell${hasMessages && isChatSurface ? ' is-chatting' : ''}`}>
       <Scene />
@@ -152,6 +174,7 @@ export default function App() {
               onAction={handleAction}
               textareaRef={textareaRef}
               disabled={composerDisabled}
+              voiceSlot={voiceSlot}
             />
           )}
           {isChatSurface && hasMessages && (
@@ -169,6 +192,7 @@ export default function App() {
               onDismissError={chat.clearError}
               textareaRef={textareaRef}
               disabled={composerDisabled}
+              voiceSlot={voiceSlot}
             />
           )}
           {view === 'conversations' && (
